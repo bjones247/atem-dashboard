@@ -8,6 +8,7 @@ staticfiles/
 db.sqlite3
 .pytest_cache/
 *.egg-info/
+.venv/
 
 # Frontend build
 node_modules/
