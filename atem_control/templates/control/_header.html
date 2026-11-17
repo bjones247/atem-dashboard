@@ -28,6 +28,12 @@
                          (tooltips remain) below 2xl so the row never overlaps the
                          title or the connect controls at laptop widths. -->
                     <div class="flex justify-center flex-wrap items-center gap-3">
+                        <a class="btn bg-base-300 hover:bg-base-content hover:text-base-100 border-0 gap-2 shadow-md"
+                           :href="'{% url 'atem_control:dashboard' %}' + ($store.atem.currentIP ? '?ip=' + encodeURIComponent($store.atem.currentIP) : '')"
+                           title="Switch to 3-Output Production Dashboard">
+                            <i class="bi bi-grid-3x3-gap text-lg"></i>
+                            <span class="font-semibold hidden 2xl:inline">Dashboard</span>
+                        </a>
                         <button class="btn bg-base-300 hover:bg-base-content hover:text-base-100 border-0 gap-2 shadow-md"
                             @click="mediaPoolOpen = true; ATEMControl.cmd && ATEMControl.cmd('media_pool_refresh')"
                             :class="!$store.atem.connected ? 'btn-disabled opacity-50' : ''"

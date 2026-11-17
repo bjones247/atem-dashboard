@@ -75,6 +75,16 @@ def atem_control(request):
     })
 
 
+@ensure_csrf_cookie
+@access_required
+def atem_dashboard(request):
+    """Production Dashboard (3 physical outputs)."""
+    return render(request, 'dashboard.html', {
+        'initial_ip': request.GET.get('ip', ''),
+        **_page_context(request),
+    })
+
+
 @access_required
 def atem_status(request):
     """Check ATEM instance statuses. Optionally filter by ?ip= for a single instance."""

@@ -127,21 +127,24 @@ For Phase 1, the Production Dashboard displays **three panels associated with ph
 | OUT 3 | Output 3 | Discovered from its current hardware routing |
 
 - Internal Settings lets an operator assign a friendly name to each output; these names exist only in this app.
-- Determine which configured physical output currently carries **M/E Program** by reading the ATEM's routing. That panel becomes the **Hardware M/E** output; remaining panels are **Virtual AUX** outputs.
-- If no configured output (or multiple configured outputs) carries the relevant M/E Program source, show a configuration warning and require the operator to resolve the assignment instead of assuming a designated output.
-- The selected M/E destination may be reassigned through an explicitly confirmed hardware-route action that reuses WebATEM's routing controls (or a narrowly scoped UPDATE ATEM view if needed); this changes a physical output's source, not the location or quantity of M/E engines.
+- Determine which configured physical outputs currently carry **M/E Program** by reading the ATEM's routing.
+- Support **zero, one, or multiple** physical outputs carrying M/E Program:
+  - **Single M/E output:** That panel becomes the **Hardware M/E** output; remaining panels are **Virtual AUX** outputs.
+  - **Multiple M/E outputs (Mirrored/Linked):** Multiple physical outputs (e.g., OUT 1 and OUT 2) may legitimately carry the same M/E Program feed. The dashboard recognizes them as linked/mirrored destinations sharing the same underlying M/E Program, Preview, CUT behavior, and upstream keyers. One output is designated as the primary M/E control panel (defaulting to the lowest-numbered M/E output, operator-selectable locally), while other M/E-fed outputs are clearly labeled as linked/mirrored. Neither maintains an independent virtual Preview queue, because their true preview is the shared hardware M/E Preview.
+  - **Zero M/E outputs:** If no configured output among OUT 1–3 carries M/E Program, all three panels operate as independent Virtual AUX destinations. The dashboard displays an informational status note, and upstream keyer status remains visible in a switcher status strip.
+- Physical output routing is **never automatically changed** to satisfy the dashboard's configuration. Reassignment requires an explicit confirmed operator action.
 
 ### 2.3 Header naming rule
 
 Each heading MUST be generated dynamically from the **saved local friendly name**, **physical output number**, and **confirmed hardware M/E assignment**:
 
 ```text
-OUTPUT: <Friendly Name> (OUT 1)
-OUTPUT: <Friendly Name> (OUT 2, M/E)
+OUTPUT: <Friendly Name> (OUT 1, M/E)
+OUTPUT: <Friendly Name> (OUT 2, M/E Linked)
 OUTPUT: <Friendly Name> (OUT 3)
 ```
 
-The example above shows the possible formatting when OUT 2 happens to carry M/E Program; it is **not a default M/E assignment**. A different output may carry M/E Program, so the suffix must move accordingly. On a clean install, local friendly names start as `Output 1`, `Output 2`, and `Output 3` until the user names them.
+The example above shows the formatting when OUT 1 and OUT 2 both carry M/E Program, with OUT 1 designated as primary and OUT 2 linked/mirrored; it is **not a hardcoded assignment**. If only OUT 2 carries M/E Program, the suffixes are `(OUT 1)`, `(OUT 2, M/E)`, and `(OUT 3)`. On a clean install, local friendly names start as `Output 1`, `Output 2`, and `Output 3` until the user names them.
 
 ---
 
@@ -172,10 +175,10 @@ The example above shows the possible formatting when OUT 2 happens to carry M/E 
 ```
 
 - This is **one shared switcher session**, not three independent ATEM connections.
-- Exactly one managed *dashboard panel* owns the M/E interaction in Phase 1, if hardware routing permits an unambiguous assignment. More than one output may physically carry M/E Program; see ambiguity handling in §2.2 and §14.
-- The other two panels represent direct routable AUX destinations, with Preview in server/application state rather than physical ATEM Preview buses.
+- Managed dashboard panels mirror discovered hardware routing: physical outputs routed to M/E Program share genuine hardware M/E state, Preview, and upstream keyers. When multiple outputs mirror M/E Program, one is designated primary control while others reflect linked status without duplicate commands.
+- Physical outputs routed to independent sources represent direct routable AUX destinations, with independent Preview in server/application state rather than physical ATEM Preview buses.
 - Do not accidentally alter an upstream key's on-air state during dashboard background CUT. Verify interaction with ATEM next-transition/tie selection on hardware.
-- Master CUT is best-effort across one M/E command and two AUX commands; report partial success accurately.
+- Master CUT is best-effort and command-deduplicated: it issues at most one M/E command for the shared M/E engine, plus individual commands for genuine AUX destinations; report per-destination outcomes accurately.
 
 ### 3.2 Existing stack, reused services, and extension layers
 
@@ -289,9 +292,9 @@ Do not infer input availability from a name or from whether a cable is connected
 
 **Default: Preview + CUT Only.** This is **unique to our Production Dashboard**, not an ATEM-wide lockout. External ATEM Software Control or physical-panel operations remain unrestricted. The setting persists across app restarts and applies to all three output panels.
 
-### 4.4 Upstream keyer strip (M/E output only)
+### 4.4 Upstream keyer strip
 
-Only the selected managed M/E panel shows this **additional compact keyer strip**. All existing WebATEM keyer configuration/control screens remain available:
+The **compact keyer strip** displays discovered upstream keyers on the designated primary M/E panel (or in a persistent switcher status section if no managed output currently routes M/E Program). All existing WebATEM keyer configuration/control screens remain available:
 
 ```text
 UPSTREAM KEYERS (<discovered count>)
@@ -306,14 +309,15 @@ UPSTREAM KEYERS (<discovered count>)
 - Show the keyer's **fill source** name (from the ATEM input catalog) beneath the key number. The key/cut source, if different, may be available in tooltip/details; don't confuse it with fill.
 - Updates to keyer fill source assignments made in ATEM Software Control must change the displayed name automatically.
 - Key configuration (chroma color, clip/gain, masks, pattern, etc.) remains in ATEM Software Control; read if discoverable, but do not edit in Phase 1.
-- If M/E ownership changes to a different output, the keyer strip follows the **new M/E panel**, not the old physical connector.
+- If multiple outputs carry M/E Program, the keyer strip resides on the designated primary M/E panel, reflecting shared keyer status across all linked outputs.
+- If M/E ownership changes to a different output, the keyer strip follows the **new primary M/E panel**, not the old physical connector.
 - Downstream keyers are discovered, but Phase 1 does not surface control buttons for them.
 
 ### 4.5 Master CUT
 
 - One prominent **CUT ALL OUTPUTS** button.
 - Command target: each output's current Preview selection.
-- M/E output: use a hardware M/E background CUT.
+- Deduplication: When multiple outputs carry M/E Program (mirrored outputs), Master CUT issues **exactly one** hardware M/E background CUT command for that shared engine. It never sends duplicate M/E CUT commands for linked outputs.
 - Virtual outputs: set each assigned AUX's live source to its queued Preview source.
 - The application must **pre-validate all three destinations** before starting. If any output is disconnected, unconfigured, invalid, or in a conflicting hardware state, do not attempt an all-output transition. Show the reason.
 - Switching commands execute as closely together as practical but are **not guaranteed frame-synchronous**.
@@ -500,9 +504,9 @@ These are conceptual Python/web state models; reuse the equivalent existing WebA
 2. If auto-reconnect is enabled and an address was saved, connect; otherwise show Connect screen/status.
 3. Use existing WebATEM/bmdwire connection through selected IP; verify that the switcher is responsive.
 4. Discover capabilities, input catalog, output routes, M/E state, keyer state, and media player metadata.
-5. Identify which of physical OUT 1–3 currently routes M/E Program. Detect **none** or **multiple** assignments and show a clear configuration warning instead of guessing the intended M/E owner.
+5. Identify which of physical OUT 1–3 currently route M/E Program. Support zero, one, or multiple M/E-routed outputs cleanly without guessing or treating multiple outputs as an error. If multiple outputs route M/E Program, designate one primary panel and label linked/mirrored outputs accordingly.
 6. Initialize each virtual output's live source from the actual AUX assignment.
-7. Initialize virtual Preview conservatively: if a valid previous session selection exists for the **same device and output**, it may be restored as a **queued selection only**; otherwise set Preview equal to current live source so the first CUT is a no-op until the operator makes a deliberate Preview choice.
+7. Initialize Preview: for M/E-fed outputs, reflect the authoritative hardware M/E Preview; for virtual AUX outputs, revalidate queued selection conservatively (if a valid selection exists in operator session state for this output and source is available, restore as queued; otherwise default to current live source so CUT is a no-op until an explicit choice is made).
 8. Subscribe to WebATEM's existing state broadcasts, callbacks/polling, and WebSocket events for relevant source, route, M/E and keyer changes; add only missing state propagation.
 9. Only enable live dashboard controls once the relevant device snapshot is consistent and current.
 
@@ -511,10 +515,9 @@ Never issue ATEM routing commands automatically just because the app started or 
 ### 7.2 External changes
 
 - A source name changes outside the app: update button labels immediately.
-- An AUX route changes externally: update that output's red ON AIR selection. Preserve the queued virtual Preview if still valid; revalidate on next CUT.
-- The M/E Preview or Program changes externally: update the genuine M/E panel from hardware.
+- An AUX route changes externally: update that output's red ON AIR selection and re-evaluate whether it carries M/E Program or independent AUX. If it switched to M/E Program, sync its Preview to hardware M/E Preview; if it switched to AUX, restore or initialize its independent virtual Preview.
+- The M/E Preview or Program changes externally: update all M/E-fed panels (primary and linked/mirrored) from hardware simultaneously.
 - Upstream keyer fill source or on-air state changes externally: update key buttons and labels.
-- The M/E Program feed moves to a different configured physical output externally: move the M/E role and keyer strip after confirming the new routing. If routing is ambiguous, block control and display `M/E assignment needs review`.
 - A source is removed, disabled, or becomes unavailable: disable pending actions referencing it, without silently replacing it.
 
 ### 7.3 Disconnection and recovery
@@ -615,8 +618,9 @@ CutAll():
   ensure connected, no unresolved output conflict, all three previews valid
   apply persistent safety setting (PROTECTED confirmation or INSTANT)
   capture target Preview IDs and observed live IDs for all panels
-  dispatch two virtual AUX routes + one ME background CUT
-  using the discovered M/E assignment (not fixed output numbers)
+  dispatch at most one ME background CUT (if one or more outputs carry M/E Program)
+  plus independent virtual AUX routes for outputs routed to AUX (deduplicating mirrored M/E destinations)
+  using the discovered assignments (not fixed output numbers)
   dispatch in tight sequence without unnecessary UI waits between commands
   collect independent confirmations for each output
   if all succeed: update virtual Preview swap states + ME observed state
@@ -777,7 +781,7 @@ Tests must run through WebATEM's **existing fake-protocol/test facilities first*
 | A18 | Master CUT | All three routes reach queued sources; no false simultaneity claim |
 | A19 | Protected/Instant slider | Choice persists across restarts; behavior matches selected mode |
 | A20 | External AUX switch | Dashboard live source updates without attempting to override change |
-| A21 | External M/E reassignment | M/E panel designation follows confirmed hardware state or warns |
+| A21 | External M/E reassignment | Multiple outputs carrying M/E Program are recognized as linked/mirrored with synchronized M/E state; primary panel follows designation |
 | A22 | Network outage | Controls disabled; stale status visible; reconnect resyncs hardware |
 | A23 | Restart | Local settings retained; no automatic hardware routing commands |
 | A24 | Unsupported sources | Cannot route to sources unavailable for that destination |
@@ -911,7 +915,7 @@ Keep an `UPSTREAM_NOTES.md` or similar short file listing local changes to WebAT
 
 | Topic | Requirement / interpretation | Verification |
 |---|---|---|
-| M/E ownership | One managed **dashboard panel** represents the M/E, even if several physical outputs carry its feed | Inspect live routing, handle none/multiple without guessing |
+| M/E ownership | Physical outputs carrying M/E Program are recognized as linked/mirrored sharing hardware M/E state; one designated primary | Inspect live routing, handle zero, one, or multiple outputs cleanly |
 | Hardware vs virtual Preview | Only the M/E has a true hardware Preview | Confirm in application state model |
 | Background-only CUT | Do not flip USKs accidentally when next-transition keys are tied | **Critical hardware test** |
 | Program direct mode | Software UI mode only, not an ATEM-wide restriction | Confirm ATEM panel remains independent |
@@ -927,7 +931,7 @@ Keep an `UPSTREAM_NOTES.md` or similar short file listing local changes to WebAT
 ### Questions intentionally deferred rather than silently decided
 
 1. The **MASTER safety slider** can be shown as `Protected` (confirmation on each MASTER CUT) versus `Instant`; this is the current proposal. Test usability before locking it in.
-2. If the switcher routes M/E Program to more than one physical output, Phase 1 defaults to **configuration warning / blocked M/E control** until one of OUT 1–3 is chosen as the managed M/E panel. It must not guess.
+2. When multiple physical outputs carry M/E Program, the dashboard identifies them as linked/mirrored destinations sharing hardware Program/Preview/CUT, designating one as primary control without changing hardware routing.
 3. Source visibility for empty media players should favor consistency (disabled over disappearing). Verify available metadata on the target firmware.
 4. When manually moving M/E Program to a different output, the user must explicitly select the old destination's replacement source. Do not infer it.
 
