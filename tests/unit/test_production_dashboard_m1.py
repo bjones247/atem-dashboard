@@ -36,8 +36,8 @@ def test_dashboard_endpoint_renders_ok(client):
 
 
 @pytest.mark.django_db
-def test_dashboard_template_contains_three_panels_and_disabled_cut(client):
-    """Template contains the 3 physical output panels and disabled CUT buttons."""
+def test_dashboard_template_contains_three_panels_and_cut_controls(client):
+    """Template contains the 3 physical output panels and required CUT controls."""
     response = client.get('/atem/dashboard/', {'ip': '192.168.1.114'})
     content = response.content.decode('utf-8')
 
@@ -56,9 +56,10 @@ def test_dashboard_template_contains_three_panels_and_disabled_cut(client):
     # Check for Upstream Keyers sections (primary M/E panel + fallback)
     assert 'Upstream Keyers' in content
 
-    # Check that CUT buttons are visibly disabled in Milestone 1
-    assert 'CUT disabled in M1' in content or 'Disabled in M1' in content
+    # Check that individual CUT controls exist and Master CUT is guarded/disabled in M2
+    assert '@click="cut(panel)"' in content
     assert 'CUT ALL OUTPUTS' in content
+    assert 'Milestone 3' in content
 
 
 @pytest.mark.django_db
@@ -206,24 +207,35 @@ def test_zero_me_outputs_all_virtual_aux():
         assert p['is_mirrored'] is False
 
 
-def test_zero_hardware_writes_in_milestone_1_code():
-    """Verify production_dashboard.js contains zero hardware command sends for Milestone 1 interactions."""
+def test_aux_preview_and_master_cut_safety_in_js():
+    """Verify that AUX preview selection and Master CUT emit zero hardware commands."""
     js_path = HERE.parent.parent / 'atem_control' / 'static' / 'js' / 'production_dashboard.js'
     js_content = js_path.read_text(encoding='utf-8')
 
-    # Ensure selectPreview, selectProgramDirect, cut, cutAll, toggleUSK send NO WebSocket messages
-    # The only ws.send calls allowed are the initial handshake: 'connect' and 'refresh'
+    # Ensure selectPreview for AUX does not send any hardware command (it must only store in sessionStorage)
+    # Check function selectPreview definition
     import re
+    select_preview_body = re.search(r'selectPreview\(panel,\s*sourceId\)\s*\{(.*?)\n\s*\},', js_content, re.DOTALL)
+    assert select_preview_body is not None
+    body_text = select_preview_body.group(1)
+    # For !panel.isME, it must touch sessionStorage and queuedPreviewSourceId without sending aux command
+    assert 'sessionStorage.setItem' in body_text
+    assert 'panel.queuedPreviewSourceId = sourceId' in body_text
+    assert 'set_aux_output' not in body_text
+
+    # Ensure cutAll (Master CUT) does not send any hardware command in Milestone 2
+    cut_all_body = re.search(r'cutAll\(\)\s*\{(.*?)\n\s*\},', js_content, re.DOTALL)
+    assert cut_all_body is not None
+    assert 'dispatchCommand' not in cut_all_body.group(1)
+    assert 'this.ws.send' not in cut_all_body.group(1)
+
+    # All dispatched commands must belong strictly to WebATEM's sanctioned protocol
     send_calls = re.findall(r'this\.ws\.send\((.*?)\)', js_content, re.DOTALL)
-    
     sent_commands = []
     for call in send_calls:
         match = re.search(r"command:\s*['\"]([^'\"]+)['\"]", call)
         if match:
             sent_commands.append(match.group(1))
 
-    assert set(sent_commands).issubset({'connect', 'refresh'})
-    assert 'cut' not in sent_commands
-    assert 'set_aux_output' not in sent_commands
-    assert 'set_program' not in sent_commands
-    assert 'toggle_usk' not in sent_commands
+    sanctioned = {'connect', 'refresh', 'cut', 'set_aux_output', 'set_preview', 'set_program', 'toggle_usk'}
+    assert set(sent_commands).issubset(sanctioned)

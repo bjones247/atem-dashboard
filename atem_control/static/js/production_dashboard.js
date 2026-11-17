@@ -1,11 +1,15 @@
 /**
  * production_dashboard.js — Production Dashboard (3-Output) Client Controller
- * Milestone 1 (Revised):
- * - Support zero, one, or multiple physical outputs carrying M/E Program.
- * - Linked/mirrored M/E outputs share hardware M/E Program, Preview, and Upstream Keyers.
- * - Operators can designate one M/E-fed output as primary without altering hardware routing.
- * - Independent virtual Preview for direct AUX destinations.
- * - Read-only live state with ZERO live hardware writes.
+ * Milestone 2: Individual Output Switching and Upstream Keyer Control.
+ *
+ * Core capabilities:
+ * 1. Independent AUX Preview (software-only until CUT).
+ * 2. Independent AUX CUT with confirmed swap (previous live becomes preview).
+ * 3. Hardware M/E Preview selection and guarded M/E background CUT.
+ * 4. Fails safe: Blocks M/E CUT if any upstream keyer is tied to next transition.
+ * 5. Linked/mirrored M/E outputs share Program, Preview, and single deduplicated CUT.
+ * 6. Independent on-air toggles for discovered upstream keyers with pending guards.
+ * 7. Hardware-confirmed state reconciliation, timeouts (2500ms), and error reporting.
  */
 
 document.addEventListener('alpine:init', () => {
@@ -18,6 +22,11 @@ document.addEventListener('alpine:init', () => {
         ws: null,
         reconnectTimer: null,
         reconnectAttempts: 0,
+
+        // Feedback / Alerts
+        actionError: '',
+        actionNotice: '',
+        actionNoticeTimer: null,
 
         // Authoritative ATEM state
         state: null,
@@ -33,16 +42,61 @@ document.addEventListener('alpine:init', () => {
 
         // 3 Managed Output Panels (OUT 1, OUT 2, OUT 3)
         panels: [
-            { outNumber: 1, auxKey: 'aux1', friendlyName: 'Output 1', role: 'VirtualAux', isME: false, isMEPrimary: false, isMEMirrored: false, onAirSourceId: null, queuedPreviewSourceId: null, editingName: false },
-            { outNumber: 2, auxKey: 'aux2', friendlyName: 'Output 2', role: 'VirtualAux', isME: false, isMEPrimary: false, isMEMirrored: false, onAirSourceId: null, queuedPreviewSourceId: null, editingName: false },
-            { outNumber: 3, auxKey: 'aux3', friendlyName: 'Output 3', role: 'VirtualAux', isME: false, isMEPrimary: false, isMEMirrored: false, onAirSourceId: null, queuedPreviewSourceId: null, editingName: false }
+            {
+                outNumber: 1,
+                auxKey: 'aux1',
+                friendlyName: 'Output 1',
+                role: 'VirtualAux',
+                isME: false,
+                isMEPrimary: false,
+                isMEMirrored: false,
+                onAirSourceId: null,
+                queuedPreviewSourceId: null,
+                pending: false,
+                pendingTimeoutId: null,
+                pendingTarget: null,
+                pendingPrevLive: null,
+                editingName: false
+            },
+            {
+                outNumber: 2,
+                auxKey: 'aux2',
+                friendlyName: 'Output 2',
+                role: 'VirtualAux',
+                isME: false,
+                isMEPrimary: false,
+                isMEMirrored: false,
+                onAirSourceId: null,
+                queuedPreviewSourceId: null,
+                pending: false,
+                pendingTimeoutId: null,
+                pendingTarget: null,
+                pendingPrevLive: null,
+                editingName: false
+            },
+            {
+                outNumber: 3,
+                auxKey: 'aux3',
+                friendlyName: 'Output 3',
+                role: 'VirtualAux',
+                isME: false,
+                isMEPrimary: false,
+                isMEMirrored: false,
+                onAirSourceId: null,
+                queuedPreviewSourceId: null,
+                pending: false,
+                pendingTimeoutId: null,
+                pendingTarget: null,
+                pendingPrevLive: null,
+                editingName: false
+            }
         ],
 
         // Discovered Upstream Keyers on M/E 1
         upstreamKeyers: [],
 
         // Settings / Display preferences
-        labelStyle: 'both', // 'short', 'long', 'both'
+        labelStyle: 'both',
         programSelectionMode: 'preview_cut_only', // 'preview_cut_only' vs 'direct'
         masterSafetyMode: 'protected', // 'protected' vs 'instant'
 
@@ -80,6 +134,7 @@ document.addEventListener('alpine:init', () => {
 
             window.addEventListener('beforeunload', () => {
                 if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+                this.clearAllPendingTimeouts();
                 if (this.ws) {
                     try { this.ws.close(); } catch (e) {}
                 }
@@ -119,6 +174,9 @@ document.addEventListener('alpine:init', () => {
                 this.connected = false;
                 this.reconnecting = true;
                 this.statusMessage = 'Disconnected. Reconnecting...';
+                this.clearAllPendingTimeouts();
+                this.panels.forEach(p => p.pending = false);
+                this.upstreamKeyers.forEach(k => k.pending = false);
                 this.scheduleReconnect();
             };
 
@@ -163,7 +221,16 @@ document.addEventListener('alpine:init', () => {
                     } else {
                         this.connected = false;
                         this.statusMessage = data.message || 'Connection failed.';
+                        this.clearAllPendingTimeouts();
+                        this.panels.forEach(p => p.pending = false);
                     }
+                    break;
+
+                case 'error':
+                    this.showError(data.message || 'ATEM command rejected');
+                    this.clearAllPendingTimeouts();
+                    this.panels.forEach(p => p.pending = false);
+                    this.upstreamKeyers.forEach(k => k.pending = false);
                     break;
 
                 case 'atem_state':
@@ -188,11 +255,11 @@ document.addEventListener('alpine:init', () => {
             // 2. Discover M/E assignment among OUT 1–3 (zero, one, or multiple linked outputs)
             this.mapManagedOutputRoles();
 
-            // 3. Update panel live sources and preview queues
-            this.updatePanelSources();
+            // 3. Update panel live sources, reconcile pending actions, and update preview
+            this.reconcilePanelSources();
 
             // 4. Update discovered Upstream Keyers on M/E 1
-            this.updateUpstreamKeyers();
+            this.reconcileUpstreamKeyers();
         },
 
         discoverMeProgramSource() {
@@ -215,7 +282,6 @@ document.addEventListener('alpine:init', () => {
         },
 
         mapManagedOutputRoles() {
-            // Find which managed outputs (OUT 1..3) route M/E 1 Program
             const meMatches = [];
             if (this.me1ProgramSourceId !== null) {
                 this.panels.forEach(p => {
@@ -228,16 +294,19 @@ document.addEventListener('alpine:init', () => {
 
             this.meOutputCount = meMatches.length;
 
-            // Resolve designated primary M/E panel
+            // Resolve designated primary M/E panel (prefers OUT 1 if carrying M/E)
             let primaryOut = null;
             if (meMatches.length > 0) {
                 if (this.primaryMeOutNumber && meMatches.includes(this.primaryMeOutNumber)) {
                     primaryOut = this.primaryMeOutNumber;
+                } else if (meMatches.includes(1)) {
+                    primaryOut = 1;
+                    this.primaryMeOutNumber = 1;
                 } else {
                     primaryOut = meMatches[0];
                     this.primaryMeOutNumber = primaryOut;
-                    try { localStorage.setItem('webatem_primary_me_out', String(primaryOut)); } catch (e) {}
                 }
+                try { localStorage.setItem('webatem_primary_me_out', String(primaryOut)); } catch (e) {}
             } else {
                 this.primaryMeOutNumber = null;
             }
@@ -261,19 +330,59 @@ document.addEventListener('alpine:init', () => {
             });
         },
 
-        updatePanelSources() {
+        reconcilePanelSources() {
+            const me0 = this.mes[0] || {};
+            const meProgram = me0.program ?? null;
+            const mePreview = me0.preview ?? null;
+
             this.panels.forEach(p => {
                 const routedAuxSource = this.auxOutputs[p.auxKey] ?? null;
 
                 if (p.isME) {
-                    // Hardware M/E feed (both primary and linked/mirrored)
-                    const me0 = this.mes[0] || {};
-                    p.onAirSourceId = me0.program ?? routedAuxSource;
-                    // Both primary and linked outputs share real hardware Preview!
-                    // Do NOT maintain misleading independent virtual Preview for M/E-fed outputs.
-                    p.queuedPreviewSourceId = me0.preview ?? p.onAirSourceId;
+                    // M/E Output (Primary or Mirrored)
+                    // Check if pending M/E CUT has completed
+                    if (p.pending && meProgram !== null) {
+                        if (p.pendingTarget !== null && meProgram === p.pendingTarget) {
+                            // Hardware confirmed new program source
+                            this.clearPendingTimeout(p);
+                            p.pending = false;
+                            p.pendingTarget = null;
+                            p.pendingPrevLive = null;
+                        } else if (p.pendingPrevLive !== null && meProgram !== p.pendingPrevLive) {
+                            // Program changed away from previous live
+                            this.clearPendingTimeout(p);
+                            p.pending = false;
+                            p.pendingTarget = null;
+                            p.pendingPrevLive = null;
+                        }
+                    }
+
+                    p.onAirSourceId = meProgram ?? routedAuxSource;
+                    p.queuedPreviewSourceId = mePreview ?? p.onAirSourceId;
+
                 } else {
-                    // Independent Virtual AUX output
+                    // Virtual AUX Output
+                    if (p.pending && routedAuxSource !== null) {
+                        if (p.pendingTarget !== null && routedAuxSource === p.pendingTarget) {
+                            // Hardware confirmed AUX switch! Perform verified SWAP:
+                            const prevLive = p.pendingPrevLive;
+                            this.clearPendingTimeout(p);
+                            p.pending = false;
+                            p.pendingTarget = null;
+                            p.pendingPrevLive = null;
+
+                            p.onAirSourceId = routedAuxSource;
+                            if (prevLive !== null && this.sources.some(s => s.source === prevLive && s.available_aux !== false)) {
+                                p.queuedPreviewSourceId = prevLive;
+                                try {
+                                    sessionStorage.setItem(`webatem_pvw_${this.ipAddress}_out_${p.outNumber}`, String(prevLive));
+                                } catch (e) {}
+                            }
+                            return;
+                        }
+                    }
+
+                    // Normal state sync or external switch
                     p.onAirSourceId = routedAuxSource;
 
                     // Revalidate virtual Preview queue for this browser session
@@ -295,7 +404,7 @@ document.addEventListener('alpine:init', () => {
             });
         },
 
-        updateUpstreamKeyers() {
+        reconcileUpstreamKeyers() {
             const me0 = this.mes[0];
             if (!me0 || !me0.usk) {
                 this.upstreamKeyers = [];
@@ -315,17 +424,55 @@ document.addEventListener('alpine:init', () => {
                 const fillSource = this.sources.find(s => s.source === fillSourceId);
                 const fillLabel = fillSource ? (fillSource.short || fillSource.long || `IN ${fillSourceId}`) : (fillSourceId !== null ? `Src ${fillSourceId}` : 'None');
 
+                // Preserve pending state across reconcile
+                const existing = this.upstreamKeyers.find(k => k.keyIndex === i);
+                let pending = existing ? existing.pending : false;
+                let pendingTimeoutId = existing ? existing.pendingTimeoutId : null;
+
+                // If state flipped to target, clear pending
+                if (pending && existing && existing.onAir !== onAir) {
+                    if (pendingTimeoutId) clearTimeout(pendingTimeoutId);
+                    pending = false;
+                    pendingTimeoutId = null;
+                }
+
                 keyers.push({
                     keyIndex: i,
                     label: `KEY ${i + 1}`,
                     onAir: onAir,
                     statusText: onAir ? 'ON AIR' : 'OFF',
                     fillSourceId: fillSourceId,
-                    fillLabel: fillLabel
+                    fillLabel: fillLabel,
+                    pending: pending,
+                    pendingTimeoutId: pendingTimeoutId
                 });
             }
 
             this.upstreamKeyers = keyers;
+        },
+
+        // ---------------------------------------------------------------------
+        // Safety & Guard Checks
+        // ---------------------------------------------------------------------
+        get meKeyTied() {
+            const sel = this.mes?.[0]?.transition?.selection;
+            if (!sel) return false;
+            return !!(sel.key1 || sel.key2 || sel.key3 || sel.key4);
+        },
+
+        get meTiedKeyList() {
+            const sel = this.mes?.[0]?.transition?.selection;
+            if (!sel) return [];
+            const tied = [];
+            if (sel.key1) tied.push('KEY 1');
+            if (sel.key2) tied.push('KEY 2');
+            if (sel.key3) tied.push('KEY 3');
+            if (sel.key4) tied.push('KEY 4');
+            return tied;
+        },
+
+        get meInTransition() {
+            return !!(this.mes?.[0]?.transition?.in_transition);
         },
 
         // Designate which M/E-fed output is primary dashboard control panel without altering hardware
@@ -341,7 +488,191 @@ document.addEventListener('alpine:init', () => {
         },
 
         // ---------------------------------------------------------------------
-        // Source Catalog Filtering & Categorization
+        // Milestone 2 Switching Controls
+        // ---------------------------------------------------------------------
+
+        selectPreview(panel, sourceId) {
+            if (!this.connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+            if (!this.isSourceUsable(panel, this.sources.find(s => s.source === sourceId))) return;
+
+            if (panel.isME) {
+                // Real hardware M/E Preview command!
+                this.ws.send(JSON.stringify({
+                    command: 'set_preview',
+                    source: parseInt(sourceId, 10),
+                    me: 0
+                }));
+            } else {
+                // Independent Virtual AUX output: software-only queue (no hardware write)
+                panel.queuedPreviewSourceId = sourceId;
+                try {
+                    sessionStorage.setItem(`webatem_pvw_${this.ipAddress}_out_${panel.outNumber}`, String(sourceId));
+                } catch (e) {}
+            }
+        },
+
+        selectProgramDirect(panel, sourceId) {
+            if (this.programSelectionMode !== 'direct') return;
+            if (!this.connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+            if (!this.isSourceUsable(panel, this.sources.find(s => s.source === sourceId))) return;
+
+            if (panel.isME) {
+                this.ws.send(JSON.stringify({
+                    command: 'set_program',
+                    source: parseInt(sourceId, 10),
+                    me: 0
+                }));
+            } else {
+                this.ws.send(JSON.stringify({
+                    command: 'set_aux_output',
+                    aux_channel: panel.outNumber - 1,
+                    input_source: parseInt(sourceId, 10)
+                }));
+            }
+        },
+
+        cut(panel) {
+            if (!this.connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+                this.showError('Switcher disconnected. CUT unavailable.');
+                return;
+            }
+
+            if (panel.pending) return;
+
+            if (panel.isME) {
+                // Guarded M/E Background CUT
+                if (this.meKeyTied) {
+                    const tied = this.meTiedKeyList.join(', ');
+                    this.showError(`M/E CUT blocked: ${tied} tied to next transition. Background-only CUT cannot be guaranteed.`);
+                    return;
+                }
+
+                if (this.meInTransition) {
+                    this.showError('M/E CUT blocked: Transition already in progress.');
+                    return;
+                }
+
+                // Deduplicated M/E CUT across all linked outputs
+                const mePanels = this.panels.filter(p => p.isME);
+                const targetProgram = panel.queuedPreviewSourceId;
+                const prevLive = panel.onAirSourceId;
+
+                mePanels.forEach(p => {
+                    p.pending = true;
+                    p.pendingTarget = targetProgram;
+                    p.pendingPrevLive = prevLive;
+                    this.armPendingTimeout(p, 'M/E CUT');
+                });
+
+                // Send EXACTLY ONE cut command for the shared M/E 1 engine
+                this.ws.send(JSON.stringify({ command: 'cut', me: 0 }));
+
+            } else {
+                // Virtual AUX CUT
+                const target = panel.queuedPreviewSourceId;
+                const prevLive = panel.onAirSourceId;
+
+                if (target === null || target === undefined) {
+                    this.showError(`No preview source queued for ${panel.friendlyName}`);
+                    return;
+                }
+
+                if (target === prevLive) {
+                    this.showNotice(`Source already live on ${panel.friendlyName}`);
+                    return;
+                }
+
+                panel.pending = true;
+                panel.pendingTarget = target;
+                panel.pendingPrevLive = prevLive;
+                this.armPendingTimeout(panel, `AUX CUT (${panel.friendlyName})`);
+
+                this.ws.send(JSON.stringify({
+                    command: 'set_aux_output',
+                    aux_channel: panel.outNumber - 1,
+                    input_source: parseInt(target, 10)
+                }));
+            }
+        },
+
+        toggleUSK(keyIndex) {
+            if (!this.connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+                this.showError('Switcher disconnected. Keyer toggle unavailable.');
+                return;
+            }
+
+            const keyer = this.upstreamKeyers.find(k => k.keyIndex === keyIndex);
+            if (!keyer || keyer.pending) return;
+
+            keyer.pending = true;
+            if (keyer.pendingTimeoutId) clearTimeout(keyer.pendingTimeoutId);
+            keyer.pendingTimeoutId = setTimeout(() => {
+                keyer.pending = false;
+                keyer.pendingTimeoutId = null;
+                this.showError(`KEY ${keyIndex + 1} toggle timed out. Hardware did not confirm.`);
+            }, 2500);
+
+            this.ws.send(JSON.stringify({
+                command: 'toggle_usk',
+                key_index: keyIndex,
+                me: 0
+            }));
+        },
+
+        // Master CUT remains disabled in Milestone 2
+        cutAll() {
+            this.showNotice('Master CUT is scheduled for Milestone 3.');
+        },
+
+        // ---------------------------------------------------------------------
+        // Pending Timeout Management & Feedback
+        // ---------------------------------------------------------------------
+        armPendingTimeout(panel, actionLabel) {
+            this.clearPendingTimeout(panel);
+            panel.pendingTimeoutId = setTimeout(() => {
+                panel.pending = false;
+                panel.pendingTarget = null;
+                panel.pendingPrevLive = null;
+                panel.pendingTimeoutId = null;
+                this.showError(`${actionLabel} timed out. Hardware did not confirm state change.`);
+            }, 2500);
+        },
+
+        clearPendingTimeout(panel) {
+            if (panel.pendingTimeoutId) {
+                clearTimeout(panel.pendingTimeoutId);
+                panel.pendingTimeoutId = null;
+            }
+        },
+
+        clearAllPendingTimeouts() {
+            this.panels.forEach(p => this.clearPendingTimeout(p));
+            this.upstreamKeyers.forEach(k => {
+                if (k.pendingTimeoutId) {
+                    clearTimeout(k.pendingTimeoutId);
+                    k.pendingTimeoutId = null;
+                }
+            });
+        },
+
+        showError(msg) {
+            this.actionError = msg;
+            if (this.actionNoticeTimer) clearTimeout(this.actionNoticeTimer);
+            this.actionNoticeTimer = setTimeout(() => {
+                this.actionError = '';
+            }, 5000);
+        },
+
+        showNotice(msg) {
+            this.actionNotice = msg;
+            if (this.actionNoticeTimer) clearTimeout(this.actionNoticeTimer);
+            this.actionNoticeTimer = setTimeout(() => {
+                this.actionNotice = '';
+            }, 3000);
+        },
+
+        // ---------------------------------------------------------------------
+        // Source Catalog Filtering & Helpers
         // ---------------------------------------------------------------------
         get categorizedSources() {
             const physical = [];
@@ -382,48 +713,6 @@ document.addEventListener('alpine:init', () => {
             const s = this.sources.find(src => src.source === sourceId);
             if (!s) return `Source ${sourceId}`;
             return s.long || s.short || `Source ${sourceId}`;
-        },
-
-        // ---------------------------------------------------------------------
-        // Milestone 1 Interactions: Read-Only & Preview Selection
-        // ZERO hardware switching commands sent!
-        // ---------------------------------------------------------------------
-        selectPreview(panel, sourceId) {
-            if (!this.isSourceUsable(panel, this.sources.find(s => s.source === sourceId))) {
-                return;
-            }
-
-            if (panel.isME) {
-                // Linked M/E outputs share Preview: update all M/E panels synchronously
-                this.panels.forEach(p => {
-                    if (p.isME) {
-                        p.queuedPreviewSourceId = sourceId;
-                    }
-                });
-                // In Milestone 1: software tracking, 0 hardware commands sent.
-            } else {
-                // Virtual AUX output: strictly independent per-output preview
-                panel.queuedPreviewSourceId = sourceId;
-                try {
-                    sessionStorage.setItem(`webatem_pvw_${this.ipAddress}_out_${panel.outNumber}`, String(sourceId));
-                } catch (e) {}
-            }
-        },
-
-        selectProgramDirect(panel, sourceId) {
-            // Milestone 1: Direct switching is disabled to prevent accidental live commands.
-        },
-
-        cut(panel) {
-            // Milestone 1: CUT is disabled.
-        },
-
-        cutAll() {
-            // Milestone 1: Master CUT is disabled.
-        },
-
-        toggleUSK(keyIndex) {
-            // Milestone 1: USK toggle is read-only.
         },
 
         saveFriendlyName(panel, newName) {
