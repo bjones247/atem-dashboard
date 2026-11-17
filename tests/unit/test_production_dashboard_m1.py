@@ -237,5 +237,7 @@ def test_aux_preview_and_master_cut_safety_in_js():
         if match:
             sent_commands.append(match.group(1))
 
-    sanctioned = {'connect', 'refresh', 'cut', 'set_aux_output', 'set_preview', 'set_program', 'toggle_usk'}
+    sanctioned = {'connect', 'refresh', 'cut', 'set_aux_output', 'set_preview', 'set_program',
+                  'toggle_usk', 'dashboard_cut_me', 'dashboard_cut_aux',
+                  'dashboard_review_me', 'dashboard_review_aux'}
     assert set(sent_commands).issubset(sanctioned)

@@ -22,6 +22,7 @@ from atemwire.messages.system_info import device_name
 from atemwire.pool import ATEMInstanceManager
 from atemwire.transport import NoFreeConnection
 from atem_control.control.commands import dispatch as dispatch_command
+from atem_control.control import dashboard_switching
 from atem_control.control.logging import ATEMConnectionLoggingMixin
 from atem_control import hooks
 from atem_control.activity import ActivityLog
@@ -376,17 +377,40 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
         # thread-sensitive lane so one slow call elsewhere can't queue
         # every operator's commands behind it. The audio verbs go to the
         # mixer the last pushed state named (Fairlight or classic).
-        ok, err = await sync_to_async(dispatch_command, thread_sensitive=False)(
-            self.connection, command, data, self._audio_mixer())
+        if command in ('dashboard_review_me', 'dashboard_review_aux'):
+            kind = 'me' if command == 'dashboard_review_me' else 'aux'
+            ok, err = await sync_to_async(dashboard_switching.review_unconfirmed, thread_sensitive=False)(
+                self.connection, kind, data.get('aux_channel', 0))
+            if ok:
+                await self.send_json({'type': 'dashboard_reviewed', 'kind': kind,
+                                      'aux_channel': data.get('aux_channel', 0)})
+                await self.send_current_state()
+            else:
+                await self.send_json({'type': 'error', 'message': err})
+            return
+        if command == 'dashboard_cut_me':
+            ok, err = await sync_to_async(dashboard_switching.dispatch_me_cut, thread_sensitive=False)(
+                self.connection, data)
+            logged_command = 'cut'
+        elif command == 'dashboard_cut_aux':
+            ok, err = await sync_to_async(dashboard_switching.dispatch_aux_cut, thread_sensitive=False)(
+                self.connection, data)
+            logged_command = 'set_aux_output'
+        else:
+            ok, err = await sync_to_async(dispatch_command, thread_sensitive=False)(
+                self.connection, command, data, self._audio_mixer())
+            logged_command = command
 
         if not ok:
             logger.warning(f"Command {command} failed: {err}")
-            await self.send_json({'type': 'error', 'message': err or f'Failed to execute {command}'})
+            await self.send_json({'type': 'error', 'command': command,
+                                  'aux_channel': data.get('aux_channel'),
+                                  'message': err or f'Failed to execute {command}'})
             return
 
         # Activity log: discrete actions immediately, slider drags coalesced
         # into one settled row (see _record_atem_command).
-        self._record_atem_command(command, data)
+        self._record_atem_command(logged_command, data)
 
     # ---- Activity logging of control commands ----
 
@@ -767,6 +791,7 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
                 # Get current state
                 t0 = time.monotonic()
                 current_state = await sync_to_async(self.build_full_state, thread_sensitive=False)(self.connection)
+                current_state['dashboardSafety'] = dashboard_switching.safety_snapshot(self.connection)
                 t_build = time.monotonic() - t0
 
                 # ATEM-side reachability transition: atemwire's protocol clears
@@ -948,6 +973,7 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
                 return
 
             state = await sync_to_async(self.build_full_state, thread_sensitive=False)(self.connection)
+            state['dashboardSafety'] = dashboard_switching.safety_snapshot(self.connection)
 
             if state.get('is_connected'):
                 await self.send_json({

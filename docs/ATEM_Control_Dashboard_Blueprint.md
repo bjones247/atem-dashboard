@@ -159,7 +159,7 @@ Preserve stock `/atem/control/`, existing WebATEM hosting/authentication assumpt
 | **3B New interface** | Three switcher columns, Other Outputs, assignment-dialog staging, live Program/Preview and status presentation; TAKE ALL disabled | Review rendered/offline interaction behavior before 3C |
 | **3C Assignment and individual control** | Primary assign/release, AUX assign/release, Other Outputs direct route, group CUT, M/E Program/Preview/CUT/AUTO/style, USK/DSK, per-output confirmation, fail-closed guards | Review fake-protocol results and plan controlled hardware rehearsal before 3D |
 | **3D TAKE ALL** | Coordinated readiness, deduplicated dispatch, partial outcomes, controlled device validation | Separate implementation authorization after 3A–3C; explicit operator approval for hardware tests |
-| Later | Advanced settings, operational refinements, release hardening, optional packaging, SDI multiview capture/video thumbnails | Separate scope |
+| Milestone 4+ / Later | Advanced settings, operational refinements, release hardening, optional packaging, SDI multiview capture/video thumbnails, and optional ATEM protocol simulator integration (evaluate pyAtemSim or equivalent for hardware-independent development and testing) | Separately scoped and authorized; simulator testing supplements, never replaces, physical hardware validation |
 
 This document update authorizes **no Milestone 3 code**. Review each checkpoint before the next. Do not spend significant effort polishing the outgoing three-physical-output UI. Reuse Milestone 2's transport and tested behaviors where safe; replace assumptions tied to `panels[0..2]`, `aux1..aux3`, `outNumber - 1`, per-output session queues, and UI-only preflight.
 
@@ -218,6 +218,7 @@ Every test that could send a command must run against a fake connection unless t
 | Automatically changing next-transition settings to force BKGD-only CUT | **Superseded**; missing or unsafe selection blocks ordinary CUT, and intentional keyed transitions need explicit intent |
 | Protected/Instant Master safety slider | **Deferred** UX choice for TAKE ALL; no implied permission to enable it now |
 | Live SDI multiview/video thumbnails | **Deferred** to independent video phase |
+| Local ATEM protocol simulator for hardware-independent testing | **Deferred (Milestone 4+)**. Evaluate pyAtemSim or comparable simulators as optional development/testing infrastructure when physical hardware is unavailable. Not required for Milestones 2.1 or 3; simulator testing supplements rather than replaces physical hardware validation. |
 
 The earlier architecture required an explicit replacement source on an output losing M/E Program. This revision resolves that conflict with a **specific, conditional** replacement: the current confirmed M/E Program background input, after routability and transition checks and operator approval. It cannot preserve key overlays; if that result is unacceptable, the operation must be cancelled. The old OUT 1–3 hardware observation (OUT 1 and OUT 2 both on M/E Program, OUT 3 on AUX) remains a historical observation, not a default configuration.
 

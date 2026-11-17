@@ -1,12 +1,12 @@
 # ATEM Dashboard — AI Project Handoff
 
-**Updated November 17, 2026.** This summarizes the approved **documentation direction**. The authoritative target specification is [Blueprint v0.6](ATEM_Control_Dashboard_Blueprint.md), with the reason for the change in [ADR 0001](adr/0001-three-logical-switchers.md). Current code remains Milestone 2; no Milestone 3 implementation or physical hardware test has been authorized by this update.
+**Updated November 17, 2026.** The authoritative Milestone 3 target is [Blueprint v0.6](ATEM_Control_Dashboard_Blueprint.md), with the architectural decision in [ADR 0001](adr/0001-three-logical-switchers.md). Milestone 2.1 hardening is implemented and tested offline; no Milestone 3 implementation or physical hardware test is authorized.
 
 ## Immediate assignment and stop line
 
-The operator authorized **documentation and planning only**: revise the blueprint, handoff, agent instructions, architecture decision, roadmap, acceptance criteria, state/persistence/API plan, and open hardware questions. Stop after those changes and await review before implementing checkpoint 3A. Do not connect to the physical ATEM, send hardware commands, enable TAKE ALL, or start redesign code under this authorization.
+The operator separately authorized **focused Milestone 2.1 switching hardening**, offline regression tests, and a scoped commit. Review its results before authorizing checkpoint 3A. Do not connect to the physical ATEM, send hardware commands, enable TAKE ALL, or implement the redesigned interface under this authorization.
 
-The next deliverable after approval is **Milestone 3A: state and persistence architecture**. Each checkpoint 3A, 3B, 3C, and 3D requires review before proceeding. Hardware validation requires separate explicit operator approval with affected destinations isolated.
+The next proposed implementation checkpoint after review is **Milestone 3A: state and persistence architecture**. Each checkpoint 3A, 3B, 3C, and 3D requires review before proceeding. Hardware validation requires separate explicit operator approval with affected destinations isolated.
 
 ## Approved product model
 
@@ -30,11 +30,11 @@ Persist both logical AUX groups' assignments, queued Previews, Program targets, 
 
 ## Verified code findings and defects
 
-The current PROGRAM grid compares `panel.onAirSourceId` to a source ID, but Preview + CUT mode disables the buttons. A later-loaded brand CSS `:disabled` rule overrides the live red style. The source filter can omit some live source types. OUT 1's red CUT turns gray on hover because shared brand hover styling overrides `btn-error`. OUT 2 uses the same M/E CUT markup as OUT 1; its gray appearance may indicate tied keys, pending/disconnect, or the same CSS behavior, not an intentionally read-only secondary panel. OUT 3's `btn-primary` is styled gray even when enabled, and its disabled predicate omits no-queue/same-as-live readiness. These old-layout defects are documented for the 3B presentation work; avoid a large retroactive Milestone 2 UI polish.
+The outgoing PROGRAM grid originally lost its live red style to later-loaded disabled-button CSS. The source filter omitted some live source types. OUT 1's CUT hover lost red; OUT 2 shares the M/E engine and should use the same readiness; OUT 3 used gray `btn-primary` styling even when ready. Milestone 2.1 adds dashboard-scoped colors, live-source fallback text, shared M/E readiness, and visible AUX disabled reasons. These are focused validation repairs; the old panel model remains superseded.
 
-**Critical safety defect:** `meKeyTied` and `meInTransition` currently treat missing data as false, and the installed `atemwire` transition reader can synthesize BKGD-only defaults before receiving real settings. Source readers can also return ID `0` for absent bus/route fields, which is ambiguous with actual Black. The current frontend guard can fail open. Checkpoint 3A must represent raw field completeness; 3C must block hardware M/E CUT/AUTO/TAKE ALL when safety cannot be certified. The current `outNumber - 1` AUX-channel assumption and fixture source ID `10010` are also not universal authority. Verify the actual physical connector ↔ AUX-channel map before any reassignment command.
+**Milestone 2.1 safety correction:** `meKeyTied` and `meInTransition` still serve informational UI only; they previously treated missing data as false, while `atemwire` can synthesize BKGD-only defaults and source ID `0`. The dashboard now projects raw M/E bus, source catalog, transition selection/position, and receive freshness through `dashboardSafety`. Its new server-side `dashboard_cut_me` command rechecks that raw state, requires background-only with no tied keyers or active transition, validates expected buses, and serializes local preflight with dispatch. `dashboard_cut_aux` validates the discovered AUX channel, directly routable target, observed live baseline, freshness, and pending state. Both use the existing pooled connection and stock dispatcher. The browser keeps uncertain timeouts blocked until hardware state changes or an operator requests read-only review; it never retries automatically. The cross-process and external-controller race between preflight and ATEM command execution remains; these guards do not make switching atomic. M3A must replace per-process pending state and the old `outNumber - 1` mapping with verified device identity, output mapping, and shared coordination before assignment features. The fixture M/E source ID `10010` is not universal authority.
 
-The previous focused offline command passed **20 tests** after using a workspace-local pytest temp directory. These tests include Python simulations and text checks; they do not establish browser styling, actual JS behavior, full-suite health, or hardware validation. An earlier Antigravity report of 92 selected passing tests was not an independently verified full-suite or hardware result.
+The previous documentation review observed **20 passing tests**, mostly Python simulations and text checks. Milestone 2.1 adds tests of the real guard and consumer plus a Node harness exercising the actual Alpine controller. The focused dashboard and related consumer regressions passed offline; they do not establish browser rendering across themes, actual ATEM protocol behavior, or live hardware safety. An earlier Antigravity report of 92 selected passing tests was not independently verified as full-suite or hardware validation.
 
 ## Historical reference-hardware observation
 
@@ -45,7 +45,7 @@ During earlier validation, OUT 1 and OUT 2 both carried the **same** M/E Program
 | Stage | Work | Status |
 |---|---|---|
 | M1 | Read-only three-output foundation | Historical implementation; operator model superseded |
-| M2 | Individual switching infrastructure | Implemented; not hardware validated; known safety/UI defects |
+| M2 / 2.1 | Individual switching infrastructure and focused fail-closed hardening | Implemented and tested offline; not hardware validated; old panel model remains superseded |
 | **M3A** | Dynamic physical output/route projection, verified device identity, persistent group config with revisions, mixed/conflict detection, transition completeness | **Next proposed implementation checkpoint; await approval** |
 | M3B | Primary + two AUX group columns, Other Outputs, staged assignment dialogs, accurate indicators | Review after 3A |
 | M3C | Explicit assignment/release, group CUT, Other Outputs direct route, M/E Program/Preview/CUT/AUTO/style, USK/DSK, confirmation and fail-closed guards | Review after 3B; hardware rehearsal separately approved |
@@ -61,4 +61,4 @@ Blueprint §7 lists acceptance criteria A01–A27, with fake-state tests for out
 - Default `%LOCALAPPDATA%\WebATEM\db.sqlite3` was previously found invalid (1 byte). Do not delete a backup. A separate dev directory may be set with `$env:WEBATEM_DATA_DIR = "$env:LOCALAPPDATA\WebATEM-Dev-M1"` before launching; this has not been verified here.
 - Verify stable device identity; connector-to-AUX channel mapping; M/E Program feed ID; raw transition-settings completeness; AUTO/WIPE/keyer behavior; route confirmation under external races; and multi-worker coordination. No physical validation has been performed as part of this documentation change.
 
-**Next assistant:** Read `AGENTS.md`, this handoff, Blueprint v0.6, and ADR 0001; inspect code and working tree. Respect the operator's checkpoint approval boundary. Do not treat this planning update as authorization for 3A implementation or live-hardware commands.
+**Next assistant:** Read `AGENTS.md`, this handoff, Blueprint v0.6, and ADR 0001; inspect code and working tree. Review Milestone 2.1's guarded dashboard command path and offline test results. The next proposed development checkpoint is 3A, subject to explicit operator authorization. Physical ATEM validation remains separately gated.

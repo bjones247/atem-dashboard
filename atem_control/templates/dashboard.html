@@ -39,11 +39,31 @@
         border-color: #ef4444 !important;
         box-shadow: 0 0 8px rgba(220, 38, 38, 0.4);
     }
+    /* Extra CSS loads before the shared brand sheet. Scope stronger rules here
+       so read-only live indicators and ready CUTs retain their state color. */
+    .production-dashboard .btn.source-btn.btn-pgm-active:disabled,
+    .production-dashboard .btn.source-btn.btn-pgm-active:disabled:hover {
+        background-color: var(--pgm, #dc2626) !important;
+        color: #fff !important;
+        border-color: var(--pgm, #dc2626) !important;
+        opacity: 1 !important;
+    }
+    .production-dashboard .btn.dashboard-cut-ready,
+    .production-dashboard .btn.dashboard-cut-ready:hover {
+        background-color: var(--pgm, #dc2626) !important;
+        color: #fff !important;
+        border-color: var(--pgm, #dc2626) !important;
+    }
+    .production-dashboard .btn.dashboard-cut-blocked:disabled {
+        background-color: var(--surface-raised) !important;
+        color: var(--text-faint) !important;
+        border-color: var(--border) !important;
+    }
 </style>
 {% endblock %}
 
 {% block content %}
-<div x-data="productionDashboard" class="py-4 pb-12 space-y-4">
+<div x-data="productionDashboard" class="production-dashboard py-4 pb-12 space-y-4">
 
     <!-- Top Navigation & Status Bar -->
     <div class="card bg-base-200 shadow-md">
@@ -191,8 +211,10 @@
                     <!-- ON AIR / NEXT Source Status Banner -->
                     <div class="grid grid-cols-2 gap-2 mt-3 pt-2 border-t border-base-300/60 font-mono text-xs">
                         <div class="p-2 rounded bg-base-300/80 flex flex-col">
-                            <span class="text-[10px] text-base-content/60 uppercase font-semibold">ON AIR (Live)</span>
-                            <span class="font-bold truncate text-error flex items-center gap-1.5 mt-0.5">
+                            <span class="text-[10px] text-base-content/60 uppercase font-semibold"
+                                  x-text="hardwareReady ? 'ON AIR (Live)' : 'LAST OBSERVED (Stale)'"></span>
+                            <span class="font-bold truncate flex items-center gap-1.5 mt-0.5"
+                                  :class="hardwareReady ? 'text-error' : 'text-base-content/50'">
                                 <span class="w-2 h-2 rounded-full bg-error inline-block"></span>
                                 <span x-text="getSourceNameById(panel.onAirSourceId)"></span>
                             </span>
@@ -226,11 +248,11 @@
                                 <button type="button"
                                         class="btn btn-sm source-btn border border-base-content/10 truncate"
                                         :class="{
-                                            'btn-pvw-active': panel.queuedPreviewSourceId === src.source,
+                                            'btn-pvw-active': hardwareReady && panel.queuedPreviewSourceId === src.source,
                                             'bg-base-300 hover:bg-base-100': panel.queuedPreviewSourceId !== src.source,
                                             'opacity-30 cursor-not-allowed': !isSourceUsable(panel, src)
                                         }"
-                                        :disabled="!isSourceUsable(panel, src) || !connected"
+                                        :disabled="!isSourceUsable(panel, src) || !hardwareReady || panel.pending || panel.unconfirmed"
                                         @click="selectPreview(panel, src.source)"
                                         :title="src.long + ' (ID: ' + src.source + ')'">
                                     <div class="flex flex-col items-center justify-center w-full leading-tight">
@@ -257,12 +279,12 @@
                                 <button type="button"
                                         class="btn btn-sm source-btn border border-base-content/10 truncate"
                                         :class="{
-                                            'btn-pgm-active': panel.onAirSourceId === src.source,
+                                            'btn-pgm-active': hardwareReady && panel.onAirSourceId === src.source,
                                             'bg-base-300/60 hover:bg-base-100': panel.onAirSourceId !== src.source && programSelectionMode === 'direct',
                                             'bg-base-300/60 opacity-80 cursor-default': panel.onAirSourceId !== src.source && programSelectionMode !== 'direct',
-                                            'opacity-25 cursor-not-allowed': !isSourceUsable(panel, src)
+                                            'opacity-25 cursor-not-allowed': !isSourceUsable(panel, src) && panel.onAirSourceId !== src.source
                                         }"
-                                        :disabled="!isSourceUsable(panel, src) || !connected || programSelectionMode !== 'direct'"
+                                        :disabled="!isSourceUsable(panel, src) || !hardwareReady || panel.pending || panel.unconfirmed || programSelectionMode !== 'direct'"
                                         @click="selectProgramDirect(panel, src.source)"
                                         :title="src.long + (programSelectionMode === 'direct' ? ' (Click to cut live)' : ' (Live State)')">
                                     <div class="flex flex-col items-center justify-center w-full leading-tight">
@@ -272,6 +294,9 @@
                                 </button>
                             </template>
                         </div>
+                        <p x-show="hardwareReady && panel.onAirSourceId !== null && !categorizedSources.some(src => src.source === panel.onAirSourceId)"
+                           class="text-xs text-error font-semibold mt-1"
+                           x-text="'Live source outside grid: ' + getSourceNameById(panel.onAirSourceId)"></p>
                     </div>
 
                     <!-- UPSTREAM KEYERS STRIP (Rendered on Primary M/E Panel) -->
@@ -292,9 +317,9 @@
                                             :class="{
                                                 'btn-key-active': k.onAir,
                                                 'bg-base-300 border-base-content/10 hover:bg-base-100': !k.onAir,
-                                                'opacity-50 pointer-events-none': k.pending || !connected
+                                                'opacity-50 pointer-events-none': k.pending || !hardwareReady
                                             }"
-                                            :disabled="k.pending || !connected"
+                                            :disabled="k.pending || !hardwareReady"
                                             @click="toggleUSK(k.keyIndex)"
                                             :title="'Toggle ' + k.label + ' on-air status'">
                                         <div class="flex items-center justify-between w-full">
@@ -325,37 +350,42 @@
                         <div>
                             <button type="button"
                                     class="btn btn-block font-bold tracking-wider shadow-md"
-                                    :class="{
-                                        'btn-error': !meKeyTied && !panel.pending,
-                                        'btn-warning opacity-90': meKeyTied && !panel.pending,
-                                        'btn-disabled opacity-60': panel.pending || !connected
-                                    }"
-                                    :disabled="panel.pending || !connected || meKeyTied"
+                                    :class="meCutReason ? 'dashboard-cut-blocked' : 'dashboard-cut-ready'"
+                                    :disabled="!!meCutReason"
                                     @click="cut(panel)"
-                                    :title="meKeyTied ? ('M/E CUT blocked: ' + meTiedKeyList.join(', ') + ' tied to next transition') : ('CUT ' + panel.friendlyName.toUpperCase())">
+                                    :title="meCutReason || ('CUT ' + panel.friendlyName.toUpperCase())">
                                 <span x-show="panel.pending" class="loading loading-spinner loading-sm mr-2"></span>
                                 <i x-show="!panel.pending && !meKeyTied" class="bi bi-scissors mr-1.5"></i>
                                 <i x-show="!panel.pending && meKeyTied" class="bi bi-shield-lock-fill mr-1.5 text-warning-content"></i>
-                                <span x-text="meKeyTied ? 'M/E CUT BLOCKED (KEY TIED)' : ('CUT ' + panel.friendlyName.toUpperCase())"></span>
+                                <span x-text="meKeyTied && meCutReason ? 'M/E CUT BLOCKED (KEY TIED)' : ('CUT ' + panel.friendlyName.toUpperCase())"></span>
                             </button>
-                            <p x-show="meKeyTied" class="text-[10px] text-warning text-center mt-1">
-                                Untie keyer(s) in ATEM to enable background-only M/E CUT.
-                            </p>
+                            <p x-show="meCutReason" class="text-[10px] text-warning text-center mt-1" x-text="meCutReason"></p>
+                            <p x-show="meKeyTied" class="sr-only">Untie keyer(s) in ATEM to enable background-only M/E CUT.</p>
+                            <button x-show="panel.unconfirmed || meCutReason.includes('unconfirmed')" type="button"
+                                    class="btn btn-xs btn-outline mt-1" :disabled="!connected"
+                                    @click="reviewUnconfirmed(panel)">Review state</button>
                         </div>
                     </template>
 
                     <!-- AUX Panel CUT Button -->
                     <template x-if="!panel.isME">
-                        <button type="button"
-                                class="btn btn-block btn-primary font-bold tracking-wider shadow-md"
-                                :class="panel.pending || !connected ? 'btn-disabled opacity-60' : ''"
-                                :disabled="panel.pending || !connected"
-                                @click="cut(panel)"
-                                :title="'CUT ' + panel.friendlyName.toUpperCase() + ' to queued preview source'">
-                            <span x-show="panel.pending" class="loading loading-spinner loading-sm mr-2"></span>
-                            <i x-show="!panel.pending" class="bi bi-scissors mr-1.5"></i>
-                            <span x-text="'CUT ' + panel.friendlyName.toUpperCase()"></span>
-                        </button>
+                        <div>
+                            <button type="button"
+                                    class="btn btn-block font-bold tracking-wider shadow-md"
+                                    :class="auxCutReason(panel) ? 'dashboard-cut-blocked' : 'dashboard-cut-ready'"
+                                    :disabled="!!auxCutReason(panel)"
+                                    @click="cut(panel)"
+                                    :title="auxCutReason(panel) || ('CUT ' + panel.friendlyName.toUpperCase())">
+                                <span x-show="panel.pending" class="loading loading-spinner loading-sm mr-2"></span>
+                                <i x-show="!panel.pending" class="bi bi-scissors mr-1.5"></i>
+                                <span x-text="'CUT ' + panel.friendlyName.toUpperCase()"></span>
+                            </button>
+                            <p x-show="auxCutReason(panel)" class="text-[10px] text-warning text-center mt-1"
+                               x-text="auxCutReason(panel)"></p>
+                            <button x-show="panel.unconfirmed || auxCutReason(panel).includes('unconfirmed')" type="button"
+                                    class="btn btn-xs btn-outline mt-1" :disabled="!connected"
+                                    @click="reviewUnconfirmed(panel)">Review state</button>
+                        </div>
                     </template>
                 </div>
 
@@ -379,9 +409,9 @@
                         :class="{
                             'btn-key-active': k.onAir,
                             'bg-base-300 border-base-content/10 hover:bg-base-100': !k.onAir,
-                            'opacity-50 pointer-events-none': k.pending || !connected
+                            'opacity-50 pointer-events-none': k.pending || !hardwareReady
                         }"
-                        :disabled="k.pending || !connected"
+                        :disabled="k.pending || !hardwareReady"
                         @click="toggleUSK(k.keyIndex)">
                     <div class="flex items-center justify-between w-full">
                         <span class="font-bold text-xs" x-text="k.label"></span>

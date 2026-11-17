@@ -9,7 +9,7 @@
  * 4. Fails safe: Blocks M/E CUT if any upstream keyer is tied to next transition.
  * 5. Linked/mirrored M/E outputs share Program, Preview, and single deduplicated CUT.
  * 6. Independent on-air toggles for discovered upstream keyers with pending guards.
- * 7. Hardware-confirmed state reconciliation, timeouts (2500ms), and error reporting.
+ * 7. Hardware-confirmed state reconciliation, timeouts, and error reporting.
  */
 
 document.addEventListener('alpine:init', () => {
@@ -56,6 +56,8 @@ document.addEventListener('alpine:init', () => {
                 pendingTimeoutId: null,
                 pendingTarget: null,
                 pendingPrevLive: null,
+                pendingSwap: false,
+                unconfirmed: false,
                 editingName: false
             },
             {
@@ -72,6 +74,8 @@ document.addEventListener('alpine:init', () => {
                 pendingTimeoutId: null,
                 pendingTarget: null,
                 pendingPrevLive: null,
+                pendingSwap: false,
+                unconfirmed: false,
                 editingName: false
             },
             {
@@ -88,6 +92,8 @@ document.addEventListener('alpine:init', () => {
                 pendingTimeoutId: null,
                 pendingTarget: null,
                 pendingPrevLive: null,
+                pendingSwap: false,
+                unconfirmed: false,
                 editingName: false
             }
         ],
@@ -172,10 +178,13 @@ document.addEventListener('alpine:init', () => {
 
             this.ws.onclose = () => {
                 this.connected = false;
+                this.state = null;
                 this.reconnecting = true;
                 this.statusMessage = 'Disconnected. Reconnecting...';
+                this.panels.forEach(p => {
+                    if (p.pending) this.markUnconfirmed(p);
+                });
                 this.clearAllPendingTimeouts();
-                this.panels.forEach(p => p.pending = false);
                 this.upstreamKeyers.forEach(k => k.pending = false);
                 this.scheduleReconnect();
             };
@@ -220,17 +229,34 @@ document.addEventListener('alpine:init', () => {
                         }
                     } else {
                         this.connected = false;
+                        this.state = null;
                         this.statusMessage = data.message || 'Connection failed.';
+                        this.panels.forEach(p => {
+                            if (p.pending) this.markUnconfirmed(p);
+                        });
                         this.clearAllPendingTimeouts();
-                        this.panels.forEach(p => p.pending = false);
                     }
                     break;
 
                 case 'error':
                     this.showError(data.message || 'ATEM command rejected');
-                    this.clearAllPendingTimeouts();
-                    this.panels.forEach(p => p.pending = false);
+                    this.panels.forEach(p => {
+                        const affectsPending = !data.command ||
+                            (data.command === 'dashboard_cut_me' && p.isME) ||
+                            (data.command === 'dashboard_cut_aux' && !p.isME &&
+                                p.outNumber - 1 === data.aux_channel);
+                        if (p.pending && affectsPending) this.markUnconfirmed(p);
+                    });
                     this.upstreamKeyers.forEach(k => k.pending = false);
+                    break;
+
+                case 'dashboard_reviewed':
+                    this.panels.forEach(p => {
+                        if ((data.kind === 'me' && p.isME) ||
+                            (data.kind === 'aux' && !p.isME && p.outNumber - 1 === data.aux_channel)) {
+                            p.unconfirmed = false;
+                        }
+                    });
                     break;
 
                 case 'atem_state':
@@ -285,7 +311,7 @@ document.addEventListener('alpine:init', () => {
             const meMatches = [];
             if (this.me1ProgramSourceId !== null) {
                 this.panels.forEach(p => {
-                    const routedSource = this.auxOutputs[p.auxKey];
+                    const routedSource = this.state?.dashboardSafety?.aux?.[String(p.outNumber - 1)]?.live ?? null;
                     if (routedSource === this.me1ProgramSourceId) {
                         meMatches.push(p.outNumber);
                     }
@@ -331,12 +357,12 @@ document.addEventListener('alpine:init', () => {
         },
 
         reconcilePanelSources() {
-            const me0 = this.mes[0] || {};
-            const meProgram = me0.program ?? null;
-            const mePreview = me0.preview ?? null;
+            const meSafety = this.state?.dashboardSafety?.meCut;
+            const meProgram = meSafety?.program ?? null;
+            const mePreview = meSafety?.preview ?? null;
 
             this.panels.forEach(p => {
-                const routedAuxSource = this.auxOutputs[p.auxKey] ?? null;
+                const routedAuxSource = this.state?.dashboardSafety?.aux?.[String(p.outNumber - 1)]?.live ?? null;
 
                 if (p.isME) {
                     // M/E Output (Primary or Mirrored)
@@ -350,15 +376,17 @@ document.addEventListener('alpine:init', () => {
                             p.pendingPrevLive = null;
                         } else if (p.pendingPrevLive !== null && meProgram !== p.pendingPrevLive) {
                             // Program changed away from previous live
-                            this.clearPendingTimeout(p);
-                            p.pending = false;
-                            p.pendingTarget = null;
-                            p.pendingPrevLive = null;
+                            this.markUnconfirmed(p);
                         }
                     }
 
-                    p.onAirSourceId = meProgram ?? routedAuxSource;
-                    p.queuedPreviewSourceId = mePreview ?? p.onAirSourceId;
+                    if (p.unconfirmed && meProgram !== null && meProgram !== p.pendingPrevLive) {
+                        p.unconfirmed = false;
+                        p.pendingTarget = null;
+                        p.pendingPrevLive = null;
+                    }
+                    p.onAirSourceId = meProgram;
+                    p.queuedPreviewSourceId = mePreview;
 
                 } else {
                     // Virtual AUX Output
@@ -366,24 +394,36 @@ document.addEventListener('alpine:init', () => {
                         if (p.pendingTarget !== null && routedAuxSource === p.pendingTarget) {
                             // Hardware confirmed AUX switch! Perform verified SWAP:
                             const prevLive = p.pendingPrevLive;
+                            const shouldSwap = p.pendingSwap;
                             this.clearPendingTimeout(p);
                             p.pending = false;
                             p.pendingTarget = null;
                             p.pendingPrevLive = null;
+                            p.pendingSwap = false;
+                            p.unconfirmed = false;
 
                             p.onAirSourceId = routedAuxSource;
-                            if (prevLive !== null && this.sources.some(s => s.source === prevLive && s.available_aux !== false)) {
+                            if (shouldSwap && prevLive !== null && this.sources.some(s => s.source === prevLive && s.available_aux === true)) {
                                 p.queuedPreviewSourceId = prevLive;
                                 try {
                                     sessionStorage.setItem(`webatem_pvw_${this.ipAddress}_out_${p.outNumber}`, String(prevLive));
                                 } catch (e) {}
                             }
                             return;
+                        } else if (p.pendingPrevLive !== null && routedAuxSource !== p.pendingPrevLive) {
+                            // An external route diverged before our target appeared.
+                            // Never swap Preview based on a later ambiguous match.
+                            this.markUnconfirmed(p);
                         }
                     }
 
                     // Normal state sync or external switch
                     p.onAirSourceId = routedAuxSource;
+                    if (p.unconfirmed && routedAuxSource !== null && routedAuxSource !== p.pendingPrevLive) {
+                        p.unconfirmed = false;
+                        p.pendingTarget = null;
+                        p.pendingPrevLive = null;
+                    }
 
                     // Revalidate virtual Preview queue for this browser session
                     const storageKey = `webatem_pvw_${this.ipAddress}_out_${p.outNumber}`;
@@ -393,11 +433,11 @@ document.addEventListener('alpine:init', () => {
                         if (val !== null && val !== '') savedPvw = parseInt(val, 10);
                     } catch (e) {}
 
-                    const isSavedValid = (savedPvw !== null) && this.sources.some(s => s.source === savedPvw && s.available_aux !== false);
+                    const isSavedValid = (savedPvw !== null) && this.sources.some(s => s.source === savedPvw && s.available_aux === true);
 
                     if (isSavedValid) {
                         p.queuedPreviewSourceId = savedPvw;
-                    } else if (p.queuedPreviewSourceId === null || !this.sources.some(s => s.source === p.queuedPreviewSourceId)) {
+                    } else if (p.queuedPreviewSourceId === null || !this.sources.some(s => s.source === p.queuedPreviewSourceId && s.available_aux === true)) {
                         p.queuedPreviewSourceId = p.onAirSourceId;
                     }
                 }
@@ -475,6 +515,40 @@ document.addEventListener('alpine:init', () => {
             return !!(this.mes?.[0]?.transition?.in_transition);
         },
 
+        get meCutReason() {
+            if (!this.hardwareReady) return 'Switcher disconnected or hardware state stale.';
+            if (!this.state?.dashboardSafety?.meCut) return 'Waiting for confirmed M/E state.';
+            if (this.panels.some(p => p.isME && p.unconfirmed)) return 'Previous M/E CUT unconfirmed. Review hardware state.';
+            if (this.panels.some(p => p.isME && p.pending)) return 'M/E CUT awaiting hardware confirmation.';
+            return this.state.dashboardSafety.meCut.reason || '';
+        },
+
+        auxCutReason(panel) {
+            if (!this.hardwareReady) return 'Switcher disconnected or hardware state stale.';
+            const safety = this.state?.dashboardSafety?.aux?.[String(panel.outNumber - 1)];
+            if (!safety) return 'AUX destination state is unavailable.';
+            if (panel.unconfirmed) return 'Previous AUX CUT unconfirmed. Review hardware state.';
+            if (panel.pending) return 'AUX CUT awaiting hardware confirmation.';
+            if (safety.reason) return safety.reason;
+            const target = panel.queuedPreviewSourceId;
+            const source = this.sources.find(s => s.source === target);
+            if (!Number.isInteger(target) || !source || source.available_aux !== true) return 'Select a directly routable Preview source.';
+            if (target === panel.onAirSourceId) return 'Queued Preview source is already live.';
+            return '';
+        },
+
+        reviewUnconfirmed(panel) {
+            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+            this.ws.send(JSON.stringify(panel.isME ?
+                { command: 'dashboard_review_me' } :
+                { command: 'dashboard_review_aux', aux_channel: panel.outNumber - 1 }));
+        },
+
+        get hardwareReady() {
+            return !!(this.connected && this.ws && this.ws.readyState === WebSocket.OPEN &&
+                this.state?.is_connected && this.state?.dashboardSafety?.fresh);
+        },
+
         // Designate which M/E-fed output is primary dashboard control panel without altering hardware
         setPrimaryME(outNumber) {
             const target = this.panels.find(p => p.outNumber === outNumber);
@@ -492,7 +566,8 @@ document.addEventListener('alpine:init', () => {
         // ---------------------------------------------------------------------
 
         selectPreview(panel, sourceId) {
-            if (!this.connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+            if (!this.hardwareReady) return;
+            if (panel.pending || panel.unconfirmed) return;
             if (!this.isSourceUsable(panel, this.sources.find(s => s.source === sourceId))) return;
 
             if (panel.isME) {
@@ -513,8 +588,10 @@ document.addEventListener('alpine:init', () => {
 
         selectProgramDirect(panel, sourceId) {
             if (this.programSelectionMode !== 'direct') return;
-            if (!this.connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+            if (!this.hardwareReady) return;
+            if (panel.pending || panel.unconfirmed) return;
             if (!this.isSourceUsable(panel, this.sources.find(s => s.source === sourceId))) return;
+            if (sourceId === panel.onAirSourceId) return;
 
             if (panel.isME) {
                 this.ws.send(JSON.stringify({
@@ -523,10 +600,16 @@ document.addEventListener('alpine:init', () => {
                     me: 0
                 }));
             } else {
+                panel.pending = true;
+                panel.pendingTarget = sourceId;
+                panel.pendingPrevLive = panel.onAirSourceId;
+                panel.pendingSwap = false;
+                this.armPendingTimeout(panel, `AUX direct Program (${panel.friendlyName})`);
                 this.ws.send(JSON.stringify({
-                    command: 'set_aux_output',
+                    command: 'dashboard_cut_aux',
                     aux_channel: panel.outNumber - 1,
-                    input_source: parseInt(sourceId, 10)
+                    input_source: parseInt(sourceId, 10),
+                    expected_live: panel.onAirSourceId
                 }));
             }
         },
@@ -537,20 +620,9 @@ document.addEventListener('alpine:init', () => {
                 return;
             }
 
-            if (panel.pending) return;
-
             if (panel.isME) {
-                // Guarded M/E Background CUT
-                if (this.meKeyTied) {
-                    const tied = this.meTiedKeyList.join(', ');
-                    this.showError(`M/E CUT blocked: ${tied} tied to next transition. Background-only CUT cannot be guaranteed.`);
-                    return;
-                }
-
-                if (this.meInTransition) {
-                    this.showError('M/E CUT blocked: Transition already in progress.');
-                    return;
-                }
+                const reason = this.meCutReason;
+                if (reason) { this.showError(reason); return; }
 
                 // Deduplicated M/E CUT across all linked outputs
                 const mePanels = this.panels.filter(p => p.isME);
@@ -565,39 +637,37 @@ document.addEventListener('alpine:init', () => {
                 });
 
                 // Send EXACTLY ONE cut command for the shared M/E 1 engine
-                this.ws.send(JSON.stringify({ command: 'cut', me: 0 }));
+                this.ws.send(JSON.stringify({
+                    command: 'dashboard_cut_me', me: 0,
+                    expected_program: prevLive, expected_preview: targetProgram
+                }));
 
             } else {
                 // Virtual AUX CUT
                 const target = panel.queuedPreviewSourceId;
                 const prevLive = panel.onAirSourceId;
 
-                if (target === null || target === undefined) {
-                    this.showError(`No preview source queued for ${panel.friendlyName}`);
-                    return;
-                }
-
-                if (target === prevLive) {
-                    this.showNotice(`Source already live on ${panel.friendlyName}`);
-                    return;
-                }
+                const reason = this.auxCutReason(panel);
+                if (reason) { this.showError(reason); return; }
 
                 panel.pending = true;
                 panel.pendingTarget = target;
                 panel.pendingPrevLive = prevLive;
+                panel.pendingSwap = true;
                 this.armPendingTimeout(panel, `AUX CUT (${panel.friendlyName})`);
 
                 this.ws.send(JSON.stringify({
-                    command: 'set_aux_output',
+                    command: 'dashboard_cut_aux',
                     aux_channel: panel.outNumber - 1,
-                    input_source: parseInt(target, 10)
+                    input_source: target,
+                    expected_live: prevLive
                 }));
             }
         },
 
         toggleUSK(keyIndex) {
-            if (!this.connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
-                this.showError('Switcher disconnected. Keyer toggle unavailable.');
+            if (!this.hardwareReady) {
+                this.showError('Switcher disconnected or hardware state stale. Keyer toggle unavailable.');
                 return;
             }
 
@@ -630,12 +700,15 @@ document.addEventListener('alpine:init', () => {
         armPendingTimeout(panel, actionLabel) {
             this.clearPendingTimeout(panel);
             panel.pendingTimeoutId = setTimeout(() => {
-                panel.pending = false;
-                panel.pendingTarget = null;
-                panel.pendingPrevLive = null;
-                panel.pendingTimeoutId = null;
-                this.showError(`${actionLabel} timed out. Hardware did not confirm state change.`);
-            }, 2500);
+                this.markUnconfirmed(panel);
+                this.showError(`${actionLabel} timed out. Hardware result is unconfirmed; review current state.`);
+            }, 3200);
+        },
+
+        markUnconfirmed(panel) {
+            this.clearPendingTimeout(panel);
+            panel.pending = false;
+            panel.unconfirmed = true;
         },
 
         clearPendingTimeout(panel) {
@@ -704,7 +777,7 @@ document.addEventListener('alpine:init', () => {
             if (panel.isME) {
                 return source.available_me1 !== false;
             } else {
-                return source.available_aux !== false;
+                return source.available_aux === true;
             }
         },
 

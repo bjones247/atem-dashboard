@@ -35,6 +35,6 @@ This repository extends **WebATEM 2.6.0** with a production dashboard for a Blac
 
 ## Current task priority
 
-**Documentation and planning only for Milestone 3: Three-Switcher Architecture.** The operator authorized updating the blueprint, handoff, roadmap, acceptance criteria, and ADR. Do not implement the redesigned UI, switching logic, or TAKE ALL until a later explicit authorization. Milestone 1–2 code and its unresolved UI defects remain historical foundation; avoid polishing the old physical-output layout that will be replaced. The current M/E CUT guard can fail open when transition state is missing; Milestone 3 safety work must fail closed before any live-hardware validation. See `docs/AI_PROJECT_HANDOFF.md`.
+**Milestone 2.1 switching hardening is implemented offline and awaiting operator review and controlled hardware validation.** The dashboard now uses raw-state, fail-closed M/E CUT preflight at the command boundary and guarded individual AUX CUT, with focused PROGRAM/CUT presentation repairs. This does not authorize hardware testing or Milestone 3 implementation. Preserve the approved three-switcher target architecture; avoid further cosmetic work on the outgoing physical-output layout. See `docs/AI_PROJECT_HANDOFF.md` for remaining limits and the next review gate.
 
 Do not infer that automated tests or hardware validation succeeded merely because a prior assistant reported a passing suite. Verify relevant claims where feasible, and clearly distinguish tests from physical hardware observations.
