@@ -450,6 +450,79 @@ test('3C Primary Preview and AUTO use guarded server commands; keyed AUTO needs 
   assert.deepEqual(sent[1].expected_selection, { background: true, key1: true, key2: false, key3: false, key4: false });
 });
 
+function keyOnlyAutoState({ keyOnAir = false, inTransition = false } = {}) {
+  const state = hardware({ program: 1, preview: 2, usk: [keyOnAir, false] });
+  state.mes[0].transition.style = 0;
+  state.mes[0].transition.position = inTransition ? 500 : 0;
+  state.mes[0].transition.in_transition = inTransition;
+  state.mes[0].transition.selection = { background: false, key1: true, key2: false, key3: false, key4: false };
+  return state;
+}
+
+test('3C key-only Primary AUTO confirms from the observed keyer after M/E returns to rest', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d);
+  const initial = keyOnlyAutoState();
+  initial.dashboardRouting = threeCProjection();
+  d.updateState(initial);
+  sent.length = 0;
+
+  d.primaryAuto();
+  assert.equal(d.keyedAutoConfirmOpen, true);
+  d.dispatchPrimaryAuto(true);
+  assert.deepEqual(sent[0].expected_key_states, { '0': false });
+  assert.equal(JSON.stringify(d.primaryActionPending.keyTargets), JSON.stringify({ '0': true }));
+
+  const keyTransitioning = keyOnlyAutoState({ keyOnAir: true, inTransition: true });
+  keyTransitioning.dashboardRouting = threeCProjection();
+  d.updateState(keyTransitioning);
+  assert.ok(d.primaryActionPending, 'key state during an active transition is not completion');
+
+  const confirmed = keyOnlyAutoState({ keyOnAir: true });
+  confirmed.dashboardRouting = threeCProjection();
+  d.updateState(confirmed);
+  assert.equal(d.hardwareProgramSourceId, 1, 'key-only AUTO leaves the background unchanged');
+  assert.equal(d.primaryActionPending, null);
+  assert.equal(d.actionNotice, 'Primary key-only AUTO confirmed by observed keyer state.');
+});
+
+test('3C key-only AUTO with unknown key state is blocked before dispatch', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d);
+  const state = keyOnlyAutoState();
+  state.dashboardSafety.usk['0'].onAir = null;
+  state.dashboardRouting = threeCProjection();
+  d.updateState(state);
+  sent.length = 0;
+
+  assert.match(d.primaryAutoReason(), /keyer on-air state has not been observed/i);
+  d.primaryAuto();
+  assert.equal(sent.length, 0);
+});
+
+test('3C reviewed key-only AUTO with unchanged key state is not reported successful', () => {
+  const { dashboard: d, sent, timers } = controller();
+  configureThreeC(d);
+  const initial = keyOnlyAutoState();
+  initial.dashboardRouting = threeCProjection();
+  d.updateState(initial);
+  sent.length = 0;
+  d.dispatchPrimaryAuto(true);
+  timers.get(d.primaryActionTimer)();
+  assert.equal(d.primaryActionPending.unconfirmed, true);
+  d.reviewPrimaryOperation();
+  assert.equal(sent.at(-1).command, 'dashboard_review_me');
+  d.handleMessage({ type: 'dashboard_reviewed', kind: 'me' });
+  const unchanged = keyOnlyAutoState();
+  unchanged.dashboardRouting = threeCProjection();
+  d.updateState(unchanged);
+
+  assert.equal(d.primaryActionPending, null);
+  assert.match(d.actionError, /no transition was confirmed/i);
+  assert.notEqual(d.actionNotice, 'Primary key-only AUTO confirmed by observed keyer state.');
+  assert.equal(sent.filter(message => message.command === 'dashboard_auto_me').length, 1);
+});
+
 test('3C Preview is saved in revisioned configuration without a routing command', () => {
   const { dashboard: d, sent } = controller();
   configureThreeC(d);
@@ -520,6 +593,62 @@ test('3D keyed AUTO requires separate confirmation and uncertain results prevent
   d.takeAllOperation.status = 'unconfirmed';
   assert.match(d.takeAllReason(), /previous TAKE ALL/i);
   d.takeAll();
+  assert.equal(sent.filter(message => message.command === 'dashboard_take_all').length, 1);
+});
+
+test('3D TAKE ALL key-only AUTO reports Primary confirmed from observed keyer state', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d);
+  const initial = keyOnlyAutoState();
+  initial.dashboardRouting = threeCProjection();
+  d.updateState(initial);
+  d.takeAllPrimaryAction = 'auto';
+  sent.length = 0;
+
+  d.takeAll();
+  assert.equal(d.takeAllKeyedConfirmOpen, true);
+  d.dispatchTakeAll(true);
+  const command = sent.find(message => message.command === 'dashboard_take_all');
+  assert.deepEqual(command.expected_key_states, { '0': false });
+  d.handleMessage({ type: 'dashboard_take_all_started', device_id: 'a'.repeat(32),
+    primary: { ok: true, action: 'auto', command: 'auto', before: 1, target: 2, style: 0,
+      key_before: { '0': false }, key_targets: { '0': true } },
+    virtual: { virtual1: { status: 'skipped', outcomes: [] },
+      virtual2: { status: 'skipped', outcomes: [] } } });
+  const confirmed = keyOnlyAutoState({ keyOnAir: true });
+  confirmed.dashboardRouting = threeCProjection();
+  d.updateState(confirmed);
+
+  assert.equal(d.takeAllOperation.primary.status, 'confirmed');
+  assert.equal(d.takeAllOperation.status, 'complete');
+  assert.equal(d.hardwareProgramSourceId, 1);
+});
+
+test('3D key-only TAKE ALL stays unconfirmed when reviewed key state did not change', () => {
+  const { dashboard: d, sent, timers } = controller();
+  configureThreeC(d);
+  const initial = keyOnlyAutoState();
+  initial.dashboardRouting = threeCProjection();
+  d.updateState(initial);
+  d.takeAllPrimaryAction = 'auto';
+  sent.length = 0;
+  d.dispatchTakeAll(true);
+  d.handleMessage({ type: 'dashboard_take_all_started', device_id: 'a'.repeat(32),
+    primary: { ok: true, action: 'auto', command: 'auto', before: 1, target: 2, style: 0,
+      key_before: { '0': false }, key_targets: { '0': true } },
+    virtual: { virtual1: { status: 'skipped', outcomes: [] },
+      virtual2: { status: 'skipped', outcomes: [] } } });
+  timers.get(d.primaryActionTimer)();
+  assert.equal(d.takeAllOperation.status, 'unconfirmed');
+  assert.notEqual(d.takeAllOperation.status, 'complete');
+  d.reviewPrimaryOperation();
+  d.handleMessage({ type: 'dashboard_reviewed', kind: 'me' });
+  const unchanged = keyOnlyAutoState();
+  unchanged.dashboardRouting = threeCProjection();
+  d.updateState(unchanged);
+
+  assert.equal(d.takeAllOperation.primary.status, 'failed');
+  assert.equal(d.takeAllOperation.status, 'partial');
   assert.equal(sent.filter(message => message.command === 'dashboard_take_all').length, 1);
 });
 

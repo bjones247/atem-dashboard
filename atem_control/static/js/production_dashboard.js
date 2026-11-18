@@ -412,9 +412,13 @@ document.addEventListener('alpine:init', () => {
                         if (this.takeAllOperation?.primary?.status === 'unconfirmed') {
                             this.takeAllOperation.primary.reviewRequested = true;
                         }
-                        this.primaryActionPending = null;
-                        if (this.primaryActionTimer !== null) clearTimeout(this.primaryActionTimer);
-                        this.primaryActionTimer = null;
+                        if (this.primaryActionPending?.keyTargets) {
+                            this.primaryActionPending.reviewRequested = true;
+                        } else {
+                            this.primaryActionPending = null;
+                            if (this.primaryActionTimer !== null) clearTimeout(this.primaryActionTimer);
+                            this.primaryActionTimer = null;
+                        }
                     }
                     if (data.kind === 'me_preview') {
                         this.previewPending = false;
@@ -784,6 +788,34 @@ document.addEventListener('alpine:init', () => {
             if (sel.key3) tied.push('KEY 3');
             if (sel.key4) tied.push('KEY 4');
             return tied;
+        },
+
+        primaryKeyOnlyAutoState() {
+            const selection = this.hardwareMe?.transition?.selection;
+            if (!selection || selection.background !== false) return null;
+            const before = {};
+            const targets = {};
+            for (let keyIndex = 0; keyIndex < 4; keyIndex++) {
+                if (selection[`key${keyIndex + 1}`] !== true) continue;
+                const onAir = this.state?.dashboardSafety?.usk?.[String(keyIndex)]?.onAir;
+                if (typeof onAir !== 'boolean') return undefined;
+                before[String(keyIndex)] = onAir;
+                targets[String(keyIndex)] = !onAir;
+            }
+            return Object.keys(targets).length ? { before, targets } : undefined;
+        },
+
+        primaryKeyOnlyAutoOutcome(operation) {
+            if (!operation?.keyTargets) return 'not-key-only';
+            if (this.hardwareProgramSourceId !== operation.before) return 'unexpected';
+            const transition = this.hardwareMe?.transition;
+            if (!transition || transition.in_transition !== false || transition.position !== 0) return 'in-progress';
+            const values = Object.keys(operation.keyTargets).map(keyIndex =>
+                this.state?.dashboardSafety?.usk?.[keyIndex]?.onAir);
+            if (values.some(value => typeof value !== 'boolean')) return 'unknown';
+            if (values.every((value, index) => value === operation.keyTargets[Object.keys(operation.keyTargets)[index]])) return 'confirmed';
+            if (values.every((value, index) => value === operation.keyBefore[Object.keys(operation.keyTargets)[index]])) return 'unchanged';
+            return 'partial';
         },
 
         get meInTransition() {
@@ -1514,6 +1546,9 @@ document.addEventListener('alpine:init', () => {
             if (!selection || typeof selection.background !== 'boolean' ||
                 [1, 2, 3, 4].some(i => typeof selection[`key${i}`] !== 'boolean')) return 'Next-transition selection is unknown or incomplete.';
             if (!selection.background && ![1, 2, 3, 4].some(i => selection[`key${i}`])) return 'No M/E background or keyer is selected for the transition.';
+            if (!selection.background && this.primaryKeyOnlyAutoState() === undefined) {
+                return 'Key-only AUTO is unavailable because a selected keyer on-air state has not been observed.';
+            }
             return '';
         },
 
@@ -1527,14 +1562,17 @@ document.addEventListener('alpine:init', () => {
         dispatchPrimaryAuto(allowKeyed) {
             this.keyedAutoConfirmOpen = false;
             if (this.primaryAutoReason() || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+            const keyOnlyState = this.primaryKeyOnlyAutoState();
             this.primaryActionPending = { kind: 'auto', target: this.hardwarePreviewSourceId,
-                before: this.hardwareProgramSourceId };
+                before: this.hardwareProgramSourceId,
+                keyBefore: keyOnlyState?.before || null, keyTargets: keyOnlyState?.targets || null };
             this.armPrimaryOperationTimeout();
             this.ws.send(JSON.stringify({ command: 'dashboard_auto_me', me: 0,
                 expected_program: this.hardwareProgramSourceId, expected_preview: this.hardwarePreviewSourceId,
                 expected_selection: { background: this.hardwareMe.transition.selection.background,
                     key1: this.hardwareMe.transition.selection.key1, key2: this.hardwareMe.transition.selection.key2,
                     key3: this.hardwareMe.transition.selection.key3, key4: this.hardwareMe.transition.selection.key4 },
+                expected_key_states: keyOnlyState?.before,
                 allow_keyed: allowKeyed === true }));
         },
 
@@ -1895,15 +1933,19 @@ document.addEventListener('alpine:init', () => {
                 const group = this.routingProjection.groups[groupId];
                 groups[groupId] = { live: group.liveSourceId, preview: group.previewSourceId };
             }
+            const keyOnlyState = action === 'auto' ? this.primaryKeyOnlyAutoState() : null;
             const primary = { status: 'pending', action, before: this.hardwareProgramSourceId,
-                target: this.hardwarePreviewSourceId, style: transition.style, error: '' };
+                target: keyOnlyState ? this.hardwareProgramSourceId : this.hardwarePreviewSourceId,
+                style: transition.style, error: '',
+                keyBefore: keyOnlyState?.before || null, keyTargets: keyOnlyState?.targets || null };
             this.takeAllOperation = { id, status: 'preflight', action, primary,
                 virtual1: { status: groups.virtual1 ? 'pending' : 'failed', outputIds: this.routingProjection.groups.virtual1.outputIds.slice(), channels: [] },
                 virtual2: { status: groups.virtual2 ? 'pending' : 'failed', outputIds: this.routingProjection.groups.virtual2.outputIds.slice(), channels: [] },
                 started: false, configSaved: false, error: '' };
             this.assignmentBusy = true;
             this.primaryActionPending = { kind: 'take_all', takeAllId: id,
-                target: primary.target, before: primary.before };
+                target: primary.target, before: primary.before,
+                keyBefore: primary.keyBefore, keyTargets: primary.keyTargets };
             this.armPrimaryOperationTimeout();
             for (const groupId of ['virtual1', 'virtual2']) {
                 const participant = this.takeAllOperation[groupId];
@@ -1952,6 +1994,7 @@ document.addEventListener('alpine:init', () => {
                 expected_program: this.hardwareProgramSourceId, expected_preview: this.hardwarePreviewSourceId,
                 expected_selection: { background: selection.background, key1: selection.key1,
                     key2: selection.key2, key3: selection.key3, key4: selection.key4 },
+                expected_key_states: keyOnlyState?.before,
                 allow_keyed: allowKeyed === true, groups }));
         },
 
@@ -1990,6 +2033,14 @@ document.addEventListener('alpine:init', () => {
             operation.primary.before = primary.before;
             operation.primary.target = primary.target;
             operation.primary.style = primary.style;
+            if (primary.key_targets && typeof primary.key_targets === 'object') {
+                operation.primary.keyTargets = primary.key_targets;
+                operation.primary.keyBefore = primary.key_before || {};
+                if (this.primaryActionPending?.takeAllId === operation.id) {
+                    this.primaryActionPending.keyTargets = primary.key_targets;
+                    this.primaryActionPending.keyBefore = primary.key_before || {};
+                }
+            }
             operation.primary.status = primary.ok ? 'pending' : 'failed';
             operation.primary.error = primary.error || '';
             if (!primary.ok && this.primaryActionPending?.takeAllId === operation.id) {
@@ -2248,7 +2299,8 @@ document.addEventListener('alpine:init', () => {
                 this.stylePendingTimer = null;
             }
             const takeAllPrimary = this.takeAllOperation?.primary;
-            if (this.takeAllOperation?.started && takeAllPrimary?.status === 'unconfirmed' && takeAllPrimary.reviewRequested) {
+            if (this.takeAllOperation?.started && takeAllPrimary?.status === 'unconfirmed' &&
+                takeAllPrimary.reviewRequested && !takeAllPrimary.keyTargets) {
                 if (this.hardwareProgramSourceId === takeAllPrimary.target) {
                     takeAllPrimary.status = 'confirmed';
                     takeAllPrimary.error = '';
@@ -2263,7 +2315,43 @@ document.addEventListener('alpine:init', () => {
             }
             if (this.primaryActionPending) {
                 const op = this.primaryActionPending;
-                if (this.hardwareProgramSourceId === op.target && op.target !== op.before) {
+                if (op.keyTargets) {
+                    const outcome = this.primaryKeyOnlyAutoOutcome(op);
+                    if (outcome === 'confirmed') {
+                        if (op.takeAllId && this.takeAllOperation?.id === op.takeAllId) {
+                            this.takeAllOperation.primary.status = 'confirmed';
+                            this.takeAllOperation.primary.error = '';
+                        } else {
+                            this.showNotice('Primary key-only AUTO confirmed by observed keyer state.');
+                        }
+                        this.primaryActionPending = null;
+                        if (this.primaryActionTimer !== null) clearTimeout(this.primaryActionTimer);
+                        this.primaryActionTimer = null;
+                        if (op.takeAllId) this.tryFinalizeTakeAll();
+                    } else if (op.reviewRequested) {
+                        op.reviewRequested = false;
+                        if (outcome === 'unchanged') {
+                            if (op.takeAllId && this.takeAllOperation?.id === op.takeAllId) {
+                                this.takeAllOperation.primary.status = 'failed';
+                                this.takeAllOperation.primary.error = 'Key-only AUTO left the selected keyers unchanged after review.';
+                            } else {
+                                this.showError('Key-only AUTO left the selected keyers unchanged after review; no transition was confirmed.');
+                            }
+                            this.primaryActionPending = null;
+                            if (this.primaryActionTimer !== null) clearTimeout(this.primaryActionTimer);
+                            this.primaryActionTimer = null;
+                            if (op.takeAllId) this.tryFinalizeTakeAll();
+                        } else {
+                            op.unconfirmed = true;
+                            if (op.takeAllId && this.takeAllOperation?.id === op.takeAllId) {
+                                this.takeAllOperation.primary.status = 'unconfirmed';
+                                this.takeAllOperation.primary.error = 'Key-only AUTO remains unconfirmed; keyer state is partial, stale, or the M/E is not at rest.';
+                            } else {
+                                this.showError('Key-only AUTO remains unconfirmed; keyer state is partial, stale, or the M/E is not at rest.');
+                            }
+                        }
+                    }
+                } else if (this.hardwareProgramSourceId === op.target && op.target !== op.before) {
                     if (op.takeAllId && this.takeAllOperation?.id === op.takeAllId) {
                         this.takeAllOperation.primary.status = 'confirmed';
                         this.takeAllOperation.primary.error = '';

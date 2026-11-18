@@ -68,6 +68,28 @@ def _pending(connection, key, live):
     operation = operations.get(key)
     if not operation:
         return None
+    key_targets = operation.get('key_targets')
+    if key_targets is not None:
+        if live != operation['before']:
+            operation['uncertain'] = True
+            return 'M/E background changed during key-only AUTO; review current hardware state before another action.'
+        mx = getattr(connection, 'mixerstate', None)
+        keys_confirmed = isinstance(mx, dict) and all(
+            _usk_on_air(mx, int(index)) is target
+            for index, target in key_targets.items()
+        )
+        position = _entry(mx, 'transition-position', 0) if isinstance(mx, dict) else None
+        transition_at_rest = (type(getattr(position, 'in_transition', None)) is bool and
+                              position.in_transition is False and
+                              _integer(getattr(position, 'position', None)) and
+                              position.position == 0)
+        if keys_confirmed and transition_at_rest:
+            operations.pop(key, None)
+            return None
+        if time.monotonic() - operation['since'] >= PENDING_SECONDS:
+            operation['uncertain'] = True
+            return 'Key-only AUTO is unconfirmed. Review current keyer and M/E state before another action.'
+        return 'Key-only AUTO is awaiting observed keyer and transition confirmation.'
     if live == operation['target']:
         operations.pop(key, None)
         return None
@@ -252,9 +274,10 @@ def state_is_fresh(connection):
         return reason is None
 
 
-def _record(connection, key, before, target):
+def _record(connection, key, before, target, key_targets=None):
     operations = _operations.setdefault(connection, {})
-    operations[key] = {'before': before, 'target': target, 'since': time.monotonic(), 'uncertain': False}
+    operations[key] = {'before': before, 'target': target, 'since': time.monotonic(),
+                       'uncertain': False, 'key_targets': key_targets}
 
 
 def dispatch_me_cut(connection, data):
@@ -423,7 +446,8 @@ def dispatch_me_auto(connection, data):
             return False, reason
         ok, error = dispatch(connection, 'auto', {'me': 0})
         if ok:
-            _record(connection, ('me', 0), state['program'], state['preview'])
+            _record(connection, ('me', 0), state['program'], state['preview'],
+                    key_targets=state.get('key_targets'))
         return ok, error
 
 
@@ -457,6 +481,22 @@ def me_auto_readiness(connection, data):
         tied = [index + 1 for index, selected in enumerate(keys) if selected]
         if tied and data.get('allow_keyed') is not True:
             return 'Keyed AUTO requires explicit confirmation for: ' + ', '.join(f'KEY {i}' for i in tied), None
+        if not background:
+            key_before = {}
+            key_targets = {}
+            for key_index, selected in enumerate(keys):
+                if not selected:
+                    continue
+                on_air = _usk_on_air(mx, key_index)
+                if on_air is None:
+                    return f'Key-only AUTO cannot be confirmed because KEY {key_index + 1} on-air state is unknown.', None
+                key_before[str(key_index)] = on_air
+                key_targets[str(key_index)] = not on_air
+            expected_key_states = data.get('expected_key_states')
+            if not isinstance(expected_key_states, dict) or expected_key_states != key_before:
+                return 'Key-only AUTO keyer state changed or is unavailable; review keyer state before AUTO.', None
+            state['key_before'] = key_before
+            state['key_targets'] = key_targets
         style = getattr(state['settings'], 'style', None)
         if type(style) is not int or style not in (0, 1, 2, 3, 4):
             return 'Selected M/E transition style is unknown or unsupported.', None
@@ -809,15 +849,19 @@ def take_all_readiness(connection, data, config_snapshot, require_current_revisi
                         'expected_preview': me['preview'],
                         'expected_selection': observed_selection,
                         'allow_keyed': data.get('allow_keyed') is True,
-                        'expected_style': getattr(me['settings'], 'style', None)}
+                        'expected_style': getattr(me['settings'], 'style', None),
+                        'expected_key_states': data.get('expected_key_states')}
         if action == 'cut':
             reason, _program, _preview = me_cut_readiness(connection)
             if reason:
                 return reason, None
         else:
-            reason, _state = me_auto_readiness(connection, primary_data)
+            reason, auto_state = me_auto_readiness(connection, primary_data)
             if reason:
                 return reason, None
+            if auto_state.get('key_targets') is not None:
+                primary_data['key_before'] = auto_state['key_before']
+                primary_data['key_targets'] = auto_state['key_targets']
 
         from atem_control.control.dashboard_ownership import project_routes
         projection = project_routes(mx, config_snapshot, revision, state_fresh=True)
@@ -860,7 +904,8 @@ def take_all_readiness(connection, data, config_snapshot, require_current_revisi
             virtual[group_id] = group_plan
         return None, {'device_id': device_id, 'revision': revision,
                       'primary_action': action, 'primary': primary_data,
-                      'primary_before': me['program'], 'primary_target': me['preview'],
+                      'primary_before': me['program'],
+                      'primary_target': (me['preview'] if me['selection'][0] else me['program']),
                       'primary_style': primary_data['expected_style'], 'virtual': virtual}
 
 
@@ -881,6 +926,8 @@ def dispatch_take_all(connection, data, config_snapshot, require_current_revisio
         primary = {'ok': primary_ok, 'action': plan['primary_action'],
                    'command': primary_command, 'before': plan['primary_before'],
                    'target': plan['primary_target'], 'style': plan['primary_style'],
+                   'key_before': plan['primary'].get('key_before'),
+                   'key_targets': plan['primary'].get('key_targets'),
                    'error': primary_error if not primary_ok else ''}
 
         virtual = {}

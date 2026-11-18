@@ -124,6 +124,107 @@ def _take_all_request(action='cut'):
                        'virtual2': {'live': 2, 'preview': 1}}}
 
 
+def _key_only_auto_payload():
+    return {'me': 0, 'expected_program': 1, 'expected_preview': 2,
+            'expected_selection': {'background': False, 'key1': True, 'key2': False,
+                                   'key3': False, 'key4': False},
+            'expected_key_states': {'0': False}, 'allow_keyed': True,
+            'expected_style': 0}
+
+
+def test_key_only_auto_confirms_from_observed_key_state_and_transition_rest(monkeypatch):
+    c = FakeConnection()
+    c.mixerstate['transition-settings'][0].style = 0
+    c.mixerstate['transition-settings'][0].next_transition_bkgd = False
+    c.mixerstate['transition-settings'][0].next_transition_key1 = True
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda _c, command, data: sent.append(command) or (True, None))
+
+    assert switching.dispatch_me_auto(c, _key_only_auto_payload()) == (True, None)
+    assert sent == ['auto']
+    operation = switching._operations[c][('me', 0)]
+    assert operation['key_targets'] == {'0': True}
+    # A key-on observation while the M/E transition is still running is not
+    # enough to confirm completion.
+    c.mixerstate['key-on-air'][0][0].enabled = True
+    c.mixerstate['transition-position'][0].in_transition = True
+    reason, _state = switching.me_auto_readiness(c, _key_only_auto_payload())
+    assert 'active or not at rest' in reason
+    assert ('me', 0) in switching._operations.get(c, {})
+
+    c.mixerstate['transition-position'][0].in_transition = False
+    reason, _state = switching.me_auto_readiness(c, _key_only_auto_payload())
+    assert 'keyer state changed' in reason  # the prior AUTO was confirmed and its guard cleared
+    assert ('me', 0) not in switching._operations.get(c, {})
+    assert sent == ['auto']
+
+
+def test_key_only_auto_requires_observed_key_state_and_times_out_unconfirmed(monkeypatch):
+    c = FakeConnection()
+    c.mixerstate['transition-settings'][0].style = 0
+    c.mixerstate['transition-settings'][0].next_transition_bkgd = False
+    c.mixerstate['transition-settings'][0].next_transition_key1 = True
+    c.mixerstate['key-on-air'][0][0].enabled = None
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda *args: sent.append(args) or (True, None))
+    assert 'on-air state is unknown' in switching.dispatch_me_auto(c, _key_only_auto_payload())[1]
+    assert sent == []
+
+    c.mixerstate['key-on-air'][0][0].enabled = False
+    assert switching.dispatch_me_auto(c, _key_only_auto_payload()) == (True, None)
+    switching._operations[c][('me', 0)]['since'] -= switching.PENDING_SECONDS + 1
+    reason, _state = switching.me_auto_readiness(c, _key_only_auto_payload())
+    assert 'Key-only AUTO is unconfirmed' in reason
+    assert ('me', 0) in switching._operations.get(c, {})
+    assert len(sent) == 1
+
+
+def test_background_auto_keeps_program_source_confirmation(monkeypatch):
+    c = FakeConnection()
+    c.mixerstate['transition-settings'][0].style = 0
+    payload = {'me': 0, 'expected_program': 1, 'expected_preview': 2,
+               'expected_selection': {'background': True, 'key1': False, 'key2': False,
+                                      'key3': False, 'key4': False},
+               'allow_keyed': False, 'expected_style': 0}
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda _c, command, data: sent.append(command) or (True, None))
+
+    assert switching.dispatch_me_auto(c, payload) == (True, None)
+    assert sent == ['auto']
+    assert switching._operations[c][('me', 0)]['key_targets'] is None
+    c.mixerstate['program-bus-input'][0].source = 2
+    c.mixerstate['preview-bus-input'][0].source = 1
+    assert switching.me_auto_readiness(c, {**payload, 'expected_program': 2, 'expected_preview': 1})[0] is None
+    assert ('me', 0) not in switching._operations.get(c, {})
+
+
+def test_take_all_key_only_auto_returns_observed_key_confirmation_targets(monkeypatch):
+    c = _three_c_connection()
+    c.mixerstate['transition-settings'][0].style = 0
+    c.mixerstate['transition-settings'][0].next_transition_bkgd = False
+    c.mixerstate['transition-settings'][0].next_transition_key1 = True
+    config = _three_c_config()
+    request = _take_all_request('auto')
+    request.update({
+        'expected_selection': {'background': False, 'key1': True, 'key2': False,
+                               'key3': False, 'key4': False},
+        'expected_key_states': {'0': False}, 'allow_keyed': True,
+    })
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda _c, command, data: sent.append(command) or (True, None))
+
+    ok, result = switching.dispatch_take_all(c, request, config)
+
+    assert ok
+    assert result['primary']['command'] == 'auto'
+    assert result['primary']['before'] == result['primary']['target'] == 1
+    assert result['primary']['key_before'] == {'0': False}
+    assert result['primary']['key_targets'] == {'0': True}
+    assert result['virtual']['virtual1']['status'] == 'skipped'
+    assert result['virtual']['virtual2']['status'] == 'skipped'
+    assert sent == ['auto']
+
+
 def test_take_all_dispatches_primary_and_both_virtual_groups_once(monkeypatch):
     c = _three_c_connection()
     config = _three_c_config(
