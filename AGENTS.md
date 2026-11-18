@@ -23,7 +23,7 @@ This repository extends **WebATEM 2.6.0** with a production dashboard for a Blac
 - If disconnected or device state is stale, disable dangerous actions. Do not optimistically claim success on command transmit.
 - Do not run commands/tests that **transmit to the physical ATEM** without explicit approval from the operator. Tests should use fake/offline states by default.
 - Preserve the original `/atem/control/` functionality and all existing WebATEM capabilities.
-- **TAKE ALL stays disabled** through Milestone 3A–3C. Its later 3D implementation requires separate review and authorization.
+- **TAKE ALL is Milestone 3D.** Keep it fail-closed, use only the shared WebATEM connection, and preserve per-switcher confirmation. Never call the device from tests or run physical validation without explicit operator approval.
 
 ## Development environment
 
@@ -35,6 +35,6 @@ This repository extends **WebATEM 2.6.0** with a production dashboard for a Blac
 
 ## Current task priority
 
-**Current checkpoint: Milestone 3C implementation is ready for review.** It adds explicit output assignment/release, virtual group CUT and mixed-route alignment, Other Outputs routing, and guarded Primary/virtual controls. Do not implement TAKE ALL; that remains 3D and requires separate authorization. Physical validation of any routing or switching command requires explicit operator approval and isolated destinations. The configured deployment is single-worker; do not deploy multiple workers until shared notification and hardware-operation coordination are implemented. The fixed installation convention maps protocol AUX indices 0–5 to OUT 1–6 only when exactly six AUX channels are reported. Keep AUX IDs internal and show physical OUT labels. See `docs/AI_PROJECT_HANDOFF.md` and the Blueprint.
+**Current checkpoint: Milestone 3D software implementation complete; stop for review.** TAKE ALL coordinates the selected Primary CUT/AUTO with Virtual Switcher 1 and 2 CUTs, with all-participant preflight and independent observed confirmation. Do not weaken readiness checks, retry uncertain operations, or claim frame-synchronous behavior. Hardware validation requires explicit operator approval and isolated destinations. The configured deployment is single-worker; do not deploy multiple workers until shared notification and hardware-operation coordination are implemented. The fixed installation convention maps protocol AUX indices 0–5 to OUT 1–6 only when exactly six AUX channels are reported. Keep AUX IDs internal and show physical OUT labels. See `docs/AI_PROJECT_HANDOFF.md` and the Blueprint.
 
 Do not infer that automated tests or hardware validation succeeded merely because a prior assistant reported a passing suite. Verify relevant claims where feasible, and clearly distinguish tests from physical hardware observations.

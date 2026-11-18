@@ -248,5 +248,5 @@ def test_aux_preview_and_master_cut_safety_in_js():
                   'dashboard_auto_me', 'dashboard_set_transition_style',
                   'dashboard_output_route', 'dashboard_cut_virtual_group',
                   'dashboard_align_virtual_group', 'dashboard_review_me_preview',
-                  'dashboard_review_style'}
+                  'dashboard_review_style', 'dashboard_take_all'}
     assert set(sent_commands).issubset(sanctioned)

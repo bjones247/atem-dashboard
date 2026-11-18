@@ -429,6 +429,33 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
             else:
                 await self.send_json({'type': 'error', 'message': err})
             return
+        if command == 'dashboard_take_all':
+            try:
+                saved_config = await self._ensure_dashboard_config(force_reload=True)
+            except dashboard_config.DashboardConfigError as error:
+                await self.send_json({'type': 'error', 'command': command, 'message': str(error)})
+                return
+            if not saved_config:
+                await self.send_json({'type': 'error', 'command': command,
+                                      'message': 'Verified switcher settings are unavailable.'})
+                return
+            ok, result = await sync_to_async(
+                dashboard_switching.dispatch_take_all, thread_sensitive=True)(
+                    self.connection, data, saved_config, require_current_revision=True)
+            if not ok:
+                await self.send_json({'type': 'error', 'command': command, 'message': result})
+                return
+            primary = result['primary']
+            if primary['ok']:
+                self._record_atem_command(primary['command'], {'me': 0})
+            for group in result['virtual'].values():
+                for outcome in group.get('outcomes', []):
+                    if outcome['ok']:
+                        self._record_atem_command('set_aux_output', {
+                            'aux_channel': outcome['channel'],
+                            'input_source': group['target']})
+            await self.send_json({'type': 'dashboard_take_all_started', **result})
+            return
         if command in ('dashboard_output_route', 'dashboard_cut_virtual_group', 'dashboard_align_virtual_group'):
             try:
                 saved_config = await self._ensure_dashboard_config(force_reload=True)
@@ -443,8 +470,8 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
                 return
             if command == 'dashboard_output_route':
                 ok, result = await sync_to_async(
-                    dashboard_switching.dispatch_output_route, thread_sensitive=False)(
-                        self.connection, data, saved_config)
+                    dashboard_switching.dispatch_output_route, thread_sensitive=True)(
+                        self.connection, data, saved_config, require_current_revision=True)
                 if not ok:
                     await self.send_json({'type': 'error', 'command': command,
                                           'output_id': data.get('output_id'),
@@ -464,8 +491,8 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
             group_dispatch = (dashboard_switching.dispatch_virtual_group_align
                               if command == 'dashboard_align_virtual_group'
                               else dashboard_switching.dispatch_virtual_group_cut)
-            ok, result = await sync_to_async(group_dispatch, thread_sensitive=False)(
-                self.connection, data, saved_config)
+            ok, result = await sync_to_async(group_dispatch, thread_sensitive=True)(
+                self.connection, data, saved_config, require_current_revision=True)
             if not ok:
                 await self.send_json({'type': 'error', 'command': command,
                                       'group_id': data.get('group_id'),

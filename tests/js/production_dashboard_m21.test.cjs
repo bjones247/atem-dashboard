@@ -464,6 +464,123 @@ test('3C Preview is saved in revisioned configuration without a routing command'
   assert.equal(sent.some(item => item.command === 'set_aux_output' || item.command === 'dashboard_cut_aux'), false);
 });
 
+test('3D TAKE ALL sends selected Primary action once and reports each participant after confirmation', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d, { routes: [90010, 1, 2, 1, 2, 1], virtual1: [1], virtual2: [2] });
+  d.dashboardConfig.config.virtualSwitchers.virtual1 = { outputs: [1], previewSource: 3, programTarget: 1 };
+  d.dashboardConfig.config.virtualSwitchers.virtual2 = { outputs: [2], previewSource: 3, programTarget: 1 };
+  sent.length = 0;
+  assert.equal(d.takeAllReason(), '');
+  d.takeAll();
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].command, 'dashboard_take_all');
+  assert.equal(sent[0].primary_action, 'cut');
+  assert.deepEqual(sent[0].groups, { virtual1: { live: 1, preview: 3 }, virtual2: { live: 2, preview: 3 } });
+  d.handleMessage({ type: 'dashboard_take_all_started', device_id: 'a'.repeat(32),
+    primary: { ok: true, action: 'cut', command: 'cut', before: 1, target: 2, style: 0 },
+    virtual: {
+      virtual1: { status: 'pending', target: 3, previous: 1, outcomes: [{ channel: 1, ok: true }] },
+      virtual2: { status: 'pending', target: 3, previous: 2, outcomes: [{ channel: 2, ok: true }] },
+    } });
+  const confirmed = hardware({ program: 2, preview: 1, aux3: 3 });
+  confirmed.dashboardRouting = threeCProjection({ routes: [90010, 3, 3, 1, 2, 1], virtual1: [1], virtual2: [2] });
+  d.updateState(confirmed);
+  const save = sent.find(message => message.command === 'dashboard_config_update');
+  assert.ok(save, 'confirmed group CUTs are saved together once');
+  assert.equal(save.config.virtualSwitchers.virtual1.programTarget, 3);
+  assert.equal(save.config.virtualSwitchers.virtual2.programTarget, 3);
+  d.handleMessage({ type: 'dashboard_config', deviceId: 'a'.repeat(32), revision: 8, config: save.config });
+  assert.equal(d.takeAllOperation.status, 'complete');
+  assert.equal(d.takeAllOperation.primary.status, 'confirmed');
+  assert.equal(d.takeAllOperation.virtual1.status, 'confirmed');
+  assert.equal(d.takeAllOperation.virtual2.status, 'confirmed');
+  assert.equal(sent.filter(message => message.command === 'dashboard_take_all').length, 1);
+});
+
+test('3D keyed AUTO requires separate confirmation and uncertain results prevent retries', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d, { routes: [90010, 1, 2, 1, 2, 1], virtual1: [1], virtual2: [2] });
+  d.dashboardConfig.config.virtualSwitchers.virtual1 = { outputs: [1], previewSource: 3, programTarget: 1 };
+  d.dashboardConfig.config.virtualSwitchers.virtual2 = { outputs: [2], previewSource: 3, programTarget: 1 };
+  const state = hardware();
+  state.mes[0].transition.position = 0;
+  state.mes[0].transition.style = 2;
+  state.mes[0].transition.selection.key1 = true;
+  state.dashboardRouting = threeCProjection({ routes: [90010, 1, 2, 1, 2, 1], virtual1: [1], virtual2: [2] });
+  d.updateState(state);
+  d.takeAllPrimaryAction = 'auto';
+  sent.length = 0;
+  d.takeAll();
+  assert.equal(d.takeAllKeyedConfirmOpen, true);
+  assert.equal(sent.length, 0);
+  d.dispatchTakeAll(true);
+  assert.equal(sent[0].command, 'dashboard_take_all');
+  assert.equal(sent[0].primary_action, 'auto');
+  assert.equal(sent[0].allow_keyed, true);
+  d.takeAllOperation.status = 'unconfirmed';
+  assert.match(d.takeAllReason(), /previous TAKE ALL/i);
+  d.takeAll();
+  assert.equal(sent.filter(message => message.command === 'dashboard_take_all').length, 1);
+});
+
+test('3D an empty virtual group with an unavailable saved source does not block other participants', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d);
+  d.dashboardConfig.config.virtualSwitchers.virtual1.previewSource = 999;
+  d.state.dashboardRouting.conflicts = [{ type: 'invalid_saved_source', group: 'virtual1', field: 'previewSource' }];
+  assert.equal(d.takeAllReason(), '');
+  d.takeAll();
+  assert.equal(sent.at(-1).command, 'dashboard_take_all');
+});
+
+test('3D Primary timeout resolves only after explicit read-only review and fresh observed state', () => {
+  const { dashboard: d, sent, timers } = controller();
+  configureThreeC(d);
+  sent.length = 0;
+  d.takeAll();
+  d.handleMessage({ type: 'dashboard_take_all_started', device_id: 'a'.repeat(32),
+    primary: { ok: true, action: 'cut', command: 'cut', before: 1, target: 2, style: 0 },
+    virtual: { virtual1: { status: 'skipped', outcomes: [] }, virtual2: { status: 'skipped', outcomes: [] } } });
+  timers.get(d.primaryActionTimer)();
+  assert.equal(d.takeAllOperation.primary.status, 'unconfirmed');
+  assert.match(d.takeAllReason(), /previous TAKE ALL/i);
+  d.takeAll();
+  assert.equal(sent.filter(message => message.command === 'dashboard_take_all').length, 1);
+  d.reviewPrimaryOperation();
+  assert.equal(sent.at(-1).command, 'dashboard_review_me');
+  d.handleMessage({ type: 'dashboard_reviewed', kind: 'me' });
+  const confirmed = hardware({ program: 2, preview: 1 });
+  confirmed.dashboardRouting = threeCProjection();
+  d.updateState(confirmed);
+  assert.equal(d.takeAllOperation.primary.status, 'confirmed');
+  assert.equal(d.takeAllOperation.status, 'complete');
+});
+
+test('3D partial result stays partial and never automatically retries a failed destination', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d, { routes: [90010, 1, 2, 1, 2, 1], virtual1: [1], virtual2: [2] });
+  d.dashboardConfig.config.virtualSwitchers.virtual1 = { outputs: [1], previewSource: 3, programTarget: 1 };
+  d.dashboardConfig.config.virtualSwitchers.virtual2 = { outputs: [2], previewSource: 3, programTarget: 1 };
+  sent.length = 0;
+  d.takeAll();
+  d.handleMessage({ type: 'dashboard_take_all_started', device_id: 'a'.repeat(32),
+    primary: { ok: true, action: 'cut', command: 'cut', before: 1, target: 2, style: 0 },
+    virtual: {
+      virtual1: { status: 'pending', target: 3, previous: 1, outcomes: [{ channel: 1, ok: true }] },
+      virtual2: { status: 'partial', target: 3, previous: 2, outcomes: [{ channel: 2, ok: false, error: 'not acknowledged' }] },
+    } });
+  const confirmed = hardware({ program: 2, preview: 1, aux3: 3 });
+  confirmed.dashboardRouting = threeCProjection({ routes: [90010, 3, 2, 1, 2, 1], virtual1: [1], virtual2: [2] });
+  d.updateState(confirmed);
+  const save = sent.find(message => message.command === 'dashboard_config_update');
+  assert.ok(save);
+  d.handleMessage({ type: 'dashboard_config', deviceId: 'a'.repeat(32), revision: 8, config: save.config });
+  assert.equal(d.takeAllOperation.virtual1.status, 'confirmed');
+  assert.equal(d.takeAllOperation.virtual2.status, 'partial');
+  assert.equal(d.takeAllOperation.status, 'partial');
+  assert.equal(sent.filter(message => message.command === 'dashboard_take_all').length, 1);
+});
+
 test('3C virtual output assignment waits for observed route before revisioned ownership save', () => {
   const { dashboard: d, sent } = controller();
   configureThreeC(d, { routes: [90010, 1, 2, 1, 2, 1], virtual1: [1] });
@@ -481,6 +598,31 @@ test('3C virtual output assignment waits for observed route before revisioned ow
   d.updateState(next);
   assert.equal(sent[1].command, 'dashboard_config_update');
   assert.ok(sent[1].config.virtualSwitchers.virtual1.outputs.includes(2));
+});
+
+test('3C partial assignment preserves the failed-output warning after confirmed ownership is saved', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d, { routes: [90010, 1, 2, 2, 2, 1], virtual1: [1] });
+  sent.length = 0;
+  d.openAssignmentDialog('virtual1');
+  d.assignmentSelection['3'] = true;
+  d.assignmentSelection['4'] = true;
+  d.applyAssignmentChanges();
+  assert.equal(sent[0].output_id, 3);
+  d.handleMessage({ type: 'error', command: 'dashboard_output_route', output_id: 3, message: 'OUT 3 route failed.' });
+  assert.equal(sent[1].command, 'dashboard_output_route');
+  assert.equal(sent[1].output_id, 4);
+  d.handleMessage({ type: 'dashboard_output_route_accepted', output_id: 4, input_source: 1 });
+  const confirmed = hardware({ program: 1, preview: 2, aux3: 2 });
+  confirmed.dashboardRouting = threeCProjection({ routes: [90010, 1, 2, 1, 2, 1], virtual1: [1] });
+  confirmed.dashboardRouting.outputs[3].liveSourceId = 1;
+  confirmed.dashboardRouting.outputs[3].observedRouteOwner = 'other';
+  d.updateState(confirmed);
+  const save = sent.find(item => item.command === 'dashboard_config_update');
+  assert.ok(save);
+  d.handleMessage({ type: 'dashboard_config', deviceId: 'a'.repeat(32), revision: 8, config: save.config });
+  assert.match(d.actionError, /some output operations failed: OUT 3 route failed/i);
+  assert.notEqual(d.actionNotice, 'Output ownership changes saved.');
 });
 
 test('3C Primary release routes only the selected destination to current M/E background', () => {
@@ -571,6 +713,30 @@ test('3C mixed routing requires explicit alignment review and saves target only 
   confirmed.dashboardRouting = threeCProjection({ routes: [90010, 1, 1, 1, 2, 1], virtual1: [1, 2] });
   d.updateState(confirmed);
   assert.equal(sent.find(item => item.command === 'dashboard_config_update').config.virtualSwitchers.virtual1.programTarget, 1);
+});
+
+test('3C partial group CUT requires per-output confirmation or review before unlocking', () => {
+  const { dashboard: d, sent, timers } = controller();
+  configureThreeC(d, { routes: [90010, 1, 1, 1, 2, 1], virtual1: [1, 2] });
+  sent.length = 0;
+  d.cutVirtualGroup('virtual1');
+  d.handleMessage({ type: 'dashboard_group_cut_started', group_id: 'virtual1', target: 3, previous: 1,
+    outcomes: [{ channel: 1, ok: true }, { channel: 2, ok: false, error: 'OUT 3 dispatch failed.' }] });
+  assert.equal(d.groupCutOperations.virtual1.status, 'partial');
+  assert.match(d.groupCutReason('virtual1'), /incomplete/i);
+
+  const resolved = hardware({ program: 1, preview: 2, aux3: 1 });
+  resolved.dashboardRouting = threeCProjection({ routes: [90010, 1, 1, 1, 2, 1], virtual1: [1, 2] });
+  d.updateState(resolved);
+  assert.equal(d.groupCutOperations.virtual1.status, 'partial');
+  assert.match(d.groupCutReason('virtual1'), /incomplete/i);
+
+  timers.get(d.groupCutOperations.virtual1.timer)();
+  d.reviewOutputOperation(2);
+  d.handleMessage({ type: 'dashboard_reviewed', kind: 'aux', aux_channel: 1 });
+  d.updateState(resolved);
+  assert.equal(d.groupCutOperations.virtual1.status, 'resolved');
+  assert.equal(d.groupCutReason('virtual1'), '');
 });
 
 test('3C a competing configuration broadcast is not mistaken for this session save', () => {

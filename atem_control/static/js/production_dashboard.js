@@ -69,6 +69,10 @@ document.addEventListener('alpine:init', () => {
         groupAlignOperations: {},
         groupAlignDraft: null,
         keyedAutoConfirmOpen: false,
+        takeAllKeyedConfirmOpen: false,
+        takeAllPrimaryAction: 'cut',
+        takeAllOperation: null,
+        takeAllSequence: 0,
         configSavePurpose: null,
 
         // Discovered M/E program source ID and multi-output status
@@ -317,6 +321,10 @@ document.addEventListener('alpine:init', () => {
                                 operation.status = 'confirmed_config_failed';
                                 operation.error = 'Hardware routes changed, but the saved Program target was not updated.';
                             }
+                        } else if (typeof this.configSavePurpose === 'string' && this.configSavePurpose.startsWith('take-all:') && this.takeAllOperation) {
+                            this.takeAllOperation.status = 'confirmed_config_failed';
+                            this.takeAllOperation.error = data.message || 'Hardware changes were confirmed, but switcher state was not saved.';
+                            this.assignmentBusy = false;
                         }
                         this.configSavePurpose = null;
                         this.configSaveExpected = null;
@@ -340,6 +348,7 @@ document.addEventListener('alpine:init', () => {
                             operation.error = data.message || 'Mixed-route alignment was blocked.';
                         }
                     }
+                    if (data.command === 'dashboard_take_all') this.rejectTakeAll(data.message || 'TAKE ALL was blocked. No commands were dispatched.');
                     if (data.command === 'dashboard_set_preview_me') {
                         this.previewPending = false;
                         this.previewUnconfirmed = false;
@@ -400,6 +409,9 @@ document.addEventListener('alpine:init', () => {
                         }
                     }
                     if (data.kind === 'me') {
+                        if (this.takeAllOperation?.primary?.status === 'unconfirmed') {
+                            this.takeAllOperation.primary.reviewRequested = true;
+                        }
                         this.primaryActionPending = null;
                         if (this.primaryActionTimer !== null) clearTimeout(this.primaryActionTimer);
                         this.primaryActionTimer = null;
@@ -422,7 +434,7 @@ document.addEventListener('alpine:init', () => {
                         if (routeOperation?.status === 'unconfirmed') routeOperation.reviewRequested = true;
                         for (const operation of Object.values(this.groupCutOperations)) {
                             const item = operation.channels?.find(channel => channel.channel === data.aux_channel);
-                            if (item?.status === 'unconfirmed') item.reviewRequested = true;
+                            if (item?.status === 'unconfirmed' || (operation.takeAllId && item?.status === 'failed')) item.reviewRequested = true;
                         }
                         for (const operation of Object.values(this.groupAlignOperations)) {
                             const item = operation.channels?.find(channel => channel.channel === data.aux_channel);
@@ -452,6 +464,10 @@ document.addEventListener('alpine:init', () => {
 
                 case 'dashboard_group_align_started':
                     this.acceptGroupAlign(data);
+                    break;
+
+                case 'dashboard_take_all_started':
+                    this.acceptTakeAll(data);
                     break;
             }
         },
@@ -1217,13 +1233,19 @@ document.addEventListener('alpine:init', () => {
                 const matchesPendingSave = JSON.stringify(this.configSaveExpected) === JSON.stringify(data.config);
                 if (matchesPendingSave) {
                     if (this.routeBatch?.savingConfig) {
+                        const batchError = this.routeBatch.error;
                         this.routeBatch = null;
                         this.assignmentBusy = false;
                         this.assignmentDialogOpen = false;
-                        this.showNotice('Output ownership changes saved.');
+                        if (batchError) {
+                            this.showError(`Confirmed ownership changes were saved, but some output operations failed: ${batchError}`);
+                        } else {
+                            this.showNotice('Output ownership changes saved.');
+                        }
                     }
                     if (this.configSavePurpose.startsWith('group-cut:')) this.finishGroupCutConfig(data);
                     else if (this.configSavePurpose.startsWith('group-align:')) this.finishGroupAlignConfig(data);
+                    else if (this.configSavePurpose.startsWith('take-all:')) this.finishTakeAllConfig(data);
                     else this.configSavePurpose = null;
                     this.configSaveExpected = null;
                 } else {
@@ -1247,6 +1269,10 @@ document.addEventListener('alpine:init', () => {
                             operation.status = 'confirmed_config_failed';
                             operation.error = message;
                         }
+                    } else if (this.configSavePurpose.startsWith('take-all:') && this.takeAllOperation) {
+                        this.takeAllOperation.status = 'confirmed_config_failed';
+                        this.takeAllOperation.error = message;
+                        this.assignmentBusy = false;
                     }
                     this.dashboardConfigError = message;
                     this.configSavePurpose = null;
@@ -1341,6 +1367,10 @@ document.addEventListener('alpine:init', () => {
                         operation.status = 'confirmed_config_failed';
                         operation.error = 'Output routes are confirmed, but the saved Program target result is unknown.';
                     }
+                } else if (typeof this.configSavePurpose === 'string' && this.configSavePurpose.startsWith('take-all:') && this.takeAllOperation) {
+                    this.takeAllOperation.status = 'confirmed_config_failed';
+                    this.takeAllOperation.error = this.dashboardConfigError;
+                    this.assignmentBusy = false;
                 }
                 this.configSavePurpose = null;
                 this.configSaveExpected = null;
@@ -1460,6 +1490,11 @@ document.addEventListener('alpine:init', () => {
             this.primaryActionTimer = setTimeout(() => {
                 if (this.primaryActionPending) {
                     this.primaryActionPending.unconfirmed = true;
+                    if (this.primaryActionPending.takeAllId && this.takeAllOperation?.id === this.primaryActionPending.takeAllId) {
+                        this.takeAllOperation.primary.status = 'unconfirmed';
+                        this.takeAllOperation.primary.error = 'Primary result is unconfirmed; review current M/E state.';
+                        this.takeAllOperation.status = 'unconfirmed';
+                    }
                     this.showError('Primary operation timed out; hardware result is unconfirmed. Review current state.');
                 }
             }, 3500);
@@ -1539,9 +1574,25 @@ document.addEventListener('alpine:init', () => {
             return this.projectedOutputs.slice().sort((a, b) => a.outputId - b.outputId);
         },
 
+        assignmentChangeReason() {
+            if (!this.connected || !this.state?.is_connected) return 'Connect to the ATEM before changing output assignments.';
+            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return 'Dashboard connection is not ready.';
+            if (this.state?.dashboardSafety?.fresh !== true) return 'Hardware state is stale; wait for a fresh ATEM update.';
+            if (this.outputMappingError) return this.outputMappingError;
+            if (this.dashboardConfigError) return `Switcher configuration unavailable: ${this.dashboardConfigError}`;
+            if (this.dashboardConfigSaving) return 'Switcher configuration update is still pending.';
+            if (!this.dashboardConfig || this.dashboardConfigDeviceId !== this.routingProjection?.deviceId) {
+                return this.routingProjection?.deviceId
+                    ? 'Verified switcher configuration is still loading.'
+                    : 'Verified switcher identity/configuration is unavailable.';
+            }
+            if (this.assignmentBusy) return 'An output assignment or route confirmation is still pending.';
+            return '';
+        },
+
         openAssignmentDialog(owner) {
             if (!['primary', 'virtual1', 'virtual2'].includes(owner) || !this.dashboardConfig ||
-                this.outputMappingError || !this.hardwareReady || this.assignmentBusy) return;
+                this.outputMappingError || !this.hardwareReady || this.dashboardConfigSaving || this.assignmentBusy) return;
             this.assignmentOwner = owner;
             const selected = {};
             for (const output of this.physicalOutputs) {
@@ -1777,6 +1828,279 @@ document.addEventListener('alpine:init', () => {
             return '';
         },
 
+        takeAllReason() {
+            if (!this.hardwareReady || !this.dashboardConfig) return 'ATEM connection or saved configuration is unavailable.';
+            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return 'Dashboard connection is not ready.';
+            if (this.outputMappingError) return this.outputMappingError;
+            if (this.dashboardConfigDeviceId !== this.routingProjection?.deviceId) return 'Verified switcher identity/configuration is unavailable.';
+            if (this.takeAllOperation && ['preflight', 'pending', 'unconfirmed', 'saving'].includes(this.takeAllOperation.status)) {
+                return 'A previous TAKE ALL is still pending or unconfirmed; review its results first.';
+            }
+            if (this.dashboardConfigSaving || this.assignmentBusy) return 'A configuration or output operation is already in progress.';
+            const conflicts = this.routingProjection?.conflicts || [];
+            const blockingConflicts = conflicts.filter(conflict =>
+                !(conflict.type === 'invalid_saved_source' &&
+                    ['virtual1', 'virtual2'].includes(conflict.group) &&
+                    this.routingProjection?.groups?.[conflict.group]?.outputIds?.length === 0));
+            if (blockingConflicts.length) return 'Output ownership or routing conflicts must be resolved before TAKE ALL.';
+            if (this.previewPending || this.previewUnconfirmed || this.stylePending || this.styleUnconfirmed) {
+                return 'A Primary Preview or transition-style change is pending or unconfirmed.';
+            }
+            const style = this.hardwareMe?.transition?.style;
+            if (this.takeAllPrimaryAction === 'auto' &&
+                (!Number.isInteger(style) || !this.transitionStyleSupported(style))) {
+                return 'The selected Primary AUTO transition style is unavailable or unknown.';
+            }
+            const primaryReason = this.takeAllPrimaryAction === 'auto'
+                ? this.primaryAutoReason() : this.primaryCutReason();
+            if (primaryReason) return primaryReason;
+            for (const groupId of ['virtual1', 'virtual2']) {
+                const group = this.routingProjection?.groups?.[groupId];
+                if (!group || !Array.isArray(group.outputIds)) return `${this.switcherName(groupId, groupId)} routing state is unavailable.`;
+                if (group.outputIds.length === 0) continue;
+                const operation = this.groupCutOperations[groupId];
+                if (operation && ['pending', 'partial', 'unconfirmed', 'saving'].includes(operation.status)) {
+                    return `${this.switcherName(groupId, groupId)} has a pending or unresolved route operation.`;
+                }
+                const reason = this.groupCutReason(groupId);
+                if (reason) return `${this.switcherName(groupId, groupId)}: ${reason}`;
+            }
+            return '';
+        },
+
+        takeAll() {
+            const reason = this.takeAllReason();
+            if (reason) { this.showError(reason); return; }
+            if (this.takeAllPrimaryAction === 'auto' && this.meTiedKeyList.length) {
+                this.takeAllKeyedConfirmOpen = true;
+                return;
+            }
+            this.dispatchTakeAll(false);
+        },
+
+        dispatchTakeAll(allowKeyed) {
+            this.takeAllKeyedConfirmOpen = false;
+            const reason = this.takeAllReason();
+            if (reason || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+                if (reason) this.showError(reason);
+                return;
+            }
+            const action = this.takeAllPrimaryAction;
+            const transition = this.hardwareMe?.transition;
+            const selection = transition?.selection;
+            if (!selection) { this.showError('M/E next-transition selection is unavailable.'); return; }
+            const id = ++this.takeAllSequence;
+            const groups = {};
+            for (const groupId of ['virtual1', 'virtual2']) {
+                const group = this.routingProjection.groups[groupId];
+                groups[groupId] = { live: group.liveSourceId, preview: group.previewSourceId };
+            }
+            const primary = { status: 'pending', action, before: this.hardwareProgramSourceId,
+                target: this.hardwarePreviewSourceId, style: transition.style, error: '' };
+            this.takeAllOperation = { id, status: 'preflight', action, primary,
+                virtual1: { status: groups.virtual1 ? 'pending' : 'failed', outputIds: this.routingProjection.groups.virtual1.outputIds.slice(), channels: [] },
+                virtual2: { status: groups.virtual2 ? 'pending' : 'failed', outputIds: this.routingProjection.groups.virtual2.outputIds.slice(), channels: [] },
+                started: false, configSaved: false, error: '' };
+            this.assignmentBusy = true;
+            this.primaryActionPending = { kind: 'take_all', takeAllId: id,
+                target: primary.target, before: primary.before };
+            this.armPrimaryOperationTimeout();
+            for (const groupId of ['virtual1', 'virtual2']) {
+                const participant = this.takeAllOperation[groupId];
+                if (!participant.outputIds.length) { participant.status = 'skipped'; continue; }
+                const group = this.routingProjection.groups[groupId];
+                const operation = this.groupCutOperations[groupId] = {
+                    status: 'pending', target: group.previewSourceId, previous: group.liveSourceId,
+                    takeAllId: id,
+                    channels: group.outputIds.map(outputId => ({ channel: outputId - 1, status: 'dispatching', error: '' })),
+                    configSaved: false, timer: null,
+                };
+                operation.timer = setTimeout(() => {
+                    if (!['pending', 'partial'].includes(operation.status)) return;
+                    for (const item of operation.channels) {
+                        if (['pending', 'dispatching'].includes(item.status)) item.status = 'unconfirmed';
+                    }
+                    operation.status = operation.channels.some(item => item.status === 'failed') ? 'partial' : 'unconfirmed';
+                    operation.timer = null;
+                    participant.status = 'unconfirmed';
+                    this.takeAllOperation.status = 'unconfirmed';
+                    this.showError(`${this.switcherName(groupId, groupId)} TAKE ALL result is unconfirmed; review each output route.`);
+                }, 5000);
+            }
+            this.takeAllOperation.timer = setTimeout(() => {
+                if (this.takeAllOperation?.id === id && !this.takeAllOperation.started) {
+                    this.takeAllOperation.status = 'unconfirmed';
+                    this.takeAllOperation.error = 'TAKE ALL response timed out; all participants require hardware review.';
+                    for (const participantId of ['virtual1', 'virtual2']) {
+                        if (this.takeAllOperation[participantId].status === 'pending') {
+                            this.takeAllOperation[participantId].status = 'unconfirmed';
+                            for (const channel of this.groupCutOperations[participantId]?.channels || []) {
+                                if (['pending', 'dispatching'].includes(channel.status)) channel.status = 'unconfirmed';
+                            }
+                        }
+                    }
+                    if (this.primaryActionPending?.takeAllId === id) {
+                        this.primaryActionPending.unconfirmed = true;
+                        this.takeAllOperation.primary.status = 'unconfirmed';
+                        this.takeAllOperation.primary.error = 'Primary result is unconfirmed; review current M/E state.';
+                    }
+                    this.showError(this.takeAllOperation.error);
+                }
+            }, 5500);
+            this.ws.send(JSON.stringify({ command: 'dashboard_take_all', device_id: this.dashboardConfigDeviceId,
+                config_revision: this.dashboardConfig.revision, primary_action: action,
+                expected_program: this.hardwareProgramSourceId, expected_preview: this.hardwarePreviewSourceId,
+                expected_selection: { background: selection.background, key1: selection.key1,
+                    key2: selection.key2, key3: selection.key3, key4: selection.key4 },
+                allow_keyed: allowKeyed === true, groups }));
+        },
+
+        rejectTakeAll(message) {
+            const operation = this.takeAllOperation;
+            if (!operation || operation.started) return;
+            if (operation.timer !== null) clearTimeout(operation.timer);
+            if (this.primaryActionPending?.takeAllId === operation.id) this.primaryActionPending = null;
+            if (this.primaryActionTimer !== null) clearTimeout(this.primaryActionTimer);
+            this.primaryActionTimer = null;
+            for (const groupId of ['virtual1', 'virtual2']) {
+                const groupOperation = this.groupCutOperations[groupId];
+                if (groupOperation?.takeAllId === operation.id) {
+                    if (groupOperation.timer !== null) clearTimeout(groupOperation.timer);
+                    delete this.groupCutOperations[groupId];
+                }
+                operation[groupId].status = 'failed';
+                operation[groupId].error = 'Not dispatched: TAKE ALL preflight failed.';
+            }
+            operation.primary.status = 'failed';
+            operation.primary.error = 'Not dispatched: ' + message;
+            operation.status = 'failed';
+            operation.error = message;
+            this.assignmentBusy = false;
+            this.showError(message);
+        },
+
+        acceptTakeAll(data) {
+            const operation = this.takeAllOperation;
+            if (!operation || operation.started || data.device_id !== this.dashboardConfigDeviceId) return;
+            if (operation.timer !== null) clearTimeout(operation.timer);
+            operation.timer = null;
+            operation.started = true;
+            const primary = data.primary || {};
+            operation.primary.action = primary.action || operation.action;
+            operation.primary.before = primary.before;
+            operation.primary.target = primary.target;
+            operation.primary.style = primary.style;
+            operation.primary.status = primary.ok ? 'pending' : 'failed';
+            operation.primary.error = primary.error || '';
+            if (!primary.ok && this.primaryActionPending?.takeAllId === operation.id) {
+                this.primaryActionPending = null;
+                if (this.primaryActionTimer !== null) clearTimeout(this.primaryActionTimer);
+                this.primaryActionTimer = null;
+            }
+            for (const groupId of ['virtual1', 'virtual2']) {
+                const participant = operation[groupId];
+                const result = data.virtual?.[groupId] || {};
+                if (result.status === 'skipped') {
+                    participant.status = 'skipped';
+                    const groupOperation = this.groupCutOperations[groupId];
+                    if (groupOperation?.takeAllId === operation.id) {
+                        if (groupOperation.timer !== null) clearTimeout(groupOperation.timer);
+                        delete this.groupCutOperations[groupId];
+                    }
+                    continue;
+                }
+                if (result.status === 'failed') {
+                    participant.status = 'failed'; participant.error = result.error || 'Not dispatched.';
+                    const groupOperation = this.groupCutOperations[groupId];
+                    if (groupOperation?.takeAllId === operation.id) {
+                        if (groupOperation.timer !== null) clearTimeout(groupOperation.timer);
+                        groupOperation.status = 'blocked'; groupOperation.error = participant.error;
+                    }
+                    continue;
+                }
+                const groupOperation = this.groupCutOperations[groupId];
+                if (!groupOperation || groupOperation.takeAllId !== operation.id) continue;
+                groupOperation.target = result.target;
+                groupOperation.previous = result.previous;
+                groupOperation.status = result.status === 'partial' ? 'partial' : 'pending';
+                participant.status = result.status === 'partial' ? 'partial' : 'pending';
+                participant.target = result.target;
+                participant.previous = result.previous;
+                participant.channels = groupOperation.channels;
+                for (const outcome of result.outcomes || []) {
+                    const item = groupOperation.channels.find(channel => channel.channel === outcome.channel);
+                    if (!item) continue;
+                    item.status = outcome.ok ? 'pending' : 'failed';
+                    item.error = outcome.error || '';
+                }
+            }
+            this.reconcileThreeC();
+        },
+
+        tryFinalizeTakeAll() {
+            const operation = this.takeAllOperation;
+            if (!operation?.started || ['complete', 'failed', 'confirmed_config_failed'].includes(operation.status)) return;
+            for (const groupId of ['virtual1', 'virtual2']) {
+                const groupOperation = this.groupCutOperations[groupId];
+                if (groupOperation?.takeAllId === operation.id && groupOperation.channels?.some(item =>
+                    ['pending', 'dispatching', 'unconfirmed'].includes(item.status))) {
+                    operation[groupId].status = groupOperation.channels.some(item => item.status === 'unconfirmed') ? 'unconfirmed' : 'pending';
+                }
+            }
+            const participants = [operation.primary, operation.virtual1, operation.virtual2];
+            if (participants.some(item => ['preflight', 'pending', 'unconfirmed'].includes(item.status))) {
+                operation.status = participants.some(item => item.status === 'unconfirmed') ? 'unconfirmed' : 'pending';
+                return;
+            }
+            const confirmedGroups = ['virtual1', 'virtual2'].filter(groupId =>
+                operation[groupId].status === 'confirmed' && !operation[groupId].configSaved);
+            if (confirmedGroups.length) {
+                const config = JSON.parse(JSON.stringify(this.dashboardConfig.config));
+                for (const groupId of confirmedGroups) {
+                    const participant = operation[groupId];
+                    const group = config.virtualSwitchers[groupId];
+                    group.programTarget = participant.target;
+                    const prior = this.sources.find(source => source.source === participant.previous);
+                    if (prior?.available_aux === true) group.previewSource = participant.previous;
+                }
+                operation.status = 'saving';
+                operation.configSaveGroups = confirmedGroups;
+                this.configSavePurpose = `take-all:${operation.id}`;
+                if (!this.sendDashboardConfig(config, this.configSavePurpose)) {
+                    operation.status = 'confirmed_config_failed';
+                    operation.error = 'Hardware changes were confirmed, but the saved virtual switcher state could not be updated.';
+                    this.assignmentBusy = false;
+                    this.showError(operation.error);
+                }
+                return;
+            }
+            this.finishTakeAll();
+        },
+
+        finishTakeAllConfig() {
+            this.configSavePurpose = null;
+            if (this.takeAllOperation) {
+                this.takeAllOperation.configSaved = true;
+                for (const groupId of this.takeAllOperation.configSaveGroups || []) this.takeAllOperation[groupId].configSaved = true;
+                this.takeAllOperation.configSaveGroups = [];
+            }
+            this.configSaveExpected = null;
+            this.finishTakeAll();
+        },
+
+        finishTakeAll() {
+            const operation = this.takeAllOperation;
+            if (!operation) return;
+            const successful = [operation.primary, operation.virtual1, operation.virtual2]
+                .every(item => ['confirmed', 'skipped'].includes(item.status));
+            operation.status = successful ? 'complete' : 'partial';
+            if (operation.timer !== null) clearTimeout(operation.timer);
+            operation.timer = null;
+            this.assignmentBusy = false;
+            if (successful) this.showNotice('TAKE ALL confirmed for every participating switcher.');
+            else this.showError('TAKE ALL finished with partial results. Review each switcher and output status before another action.');
+        },
+
         cutVirtualGroup(groupId) {
             const reason = this.groupCutReason(groupId);
             if (reason) { this.showError(reason); return; }
@@ -1787,8 +2111,12 @@ document.addEventListener('alpine:init', () => {
                 configSaved: false, timer: null,
             };
             operation.timer = setTimeout(() => {
-                if (operation.status === 'pending') {
-                    operation.status = 'unconfirmed';
+                if (['pending', 'partial'].includes(operation.status)) {
+                    for (const item of operation.channels) {
+                        if (['pending', 'dispatching'].includes(item.status)) item.status = 'unconfirmed';
+                    }
+                    operation.status = operation.channels.some(item => item.status === 'failed') ? 'partial' : 'unconfirmed';
+                    operation.timer = null;
                     this.showError(`${this.switcherName(groupId, groupId)} CUT timed out; review each output route.`);
                 }
             }, 5000);
@@ -1919,14 +2247,36 @@ document.addEventListener('alpine:init', () => {
                 if (this.stylePendingTimer !== null) clearTimeout(this.stylePendingTimer);
                 this.stylePendingTimer = null;
             }
+            const takeAllPrimary = this.takeAllOperation?.primary;
+            if (this.takeAllOperation?.started && takeAllPrimary?.status === 'unconfirmed' && takeAllPrimary.reviewRequested) {
+                if (this.hardwareProgramSourceId === takeAllPrimary.target) {
+                    takeAllPrimary.status = 'confirmed';
+                    takeAllPrimary.error = '';
+                } else if (this.hardwareProgramSourceId === takeAllPrimary.before) {
+                    takeAllPrimary.status = 'failed';
+                    takeAllPrimary.error = 'Primary remains on its previous source after review; no change was confirmed.';
+                } else if (this.hardwareProgramSourceId !== null) {
+                    takeAllPrimary.error = 'Primary is on an unexpected source; result remains unconfirmed.';
+                }
+                takeAllPrimary.reviewRequested = false;
+                if (takeAllPrimary.status !== 'unconfirmed') this.tryFinalizeTakeAll();
+            }
             if (this.primaryActionPending) {
                 const op = this.primaryActionPending;
                 if (this.hardwareProgramSourceId === op.target && op.target !== op.before) {
+                    if (op.takeAllId && this.takeAllOperation?.id === op.takeAllId) {
+                        this.takeAllOperation.primary.status = 'confirmed';
+                        this.takeAllOperation.primary.error = '';
+                    }
                     this.primaryActionPending = null;
                     if (this.primaryActionTimer !== null) clearTimeout(this.primaryActionTimer);
                     this.primaryActionTimer = null;
                 } else if (this.hardwareProgramSourceId !== null && this.hardwareProgramSourceId !== op.before && this.hardwareProgramSourceId !== op.target) {
                     op.unconfirmed = true;
+                    if (op.takeAllId && this.takeAllOperation?.id === op.takeAllId) {
+                        this.takeAllOperation.primary.status = 'unconfirmed';
+                        this.takeAllOperation.primary.error = 'Primary changed to an unexpected source; inspect the M/E before proceeding.';
+                    }
                 }
             }
             for (const [id, operation] of Object.entries(this.routeOperations)) {
@@ -1952,15 +2302,62 @@ document.addEventListener('alpine:init', () => {
             for (const [groupId, operation] of Object.entries(this.groupCutOperations)) {
                 if (!['pending', 'unconfirmed', 'partial'].includes(operation.status) || !Array.isArray(operation.channels)) continue;
                 for (const item of operation.channels) {
-                    if (!['pending', 'unconfirmed', 'dispatching'].includes(item.status)) continue;
+                    if (!['pending', 'unconfirmed', 'dispatching'].includes(item.status) &&
+                        !(operation.takeAllId && item.status === 'failed' && item.reviewRequested)) continue;
                     const output = this.projectedOutputs.find(route => route.auxIndex === item.channel);
                     if (output?.routeStatus === 'observed' && output.liveSourceId === operation.target) item.status = 'confirmed';
                     else if (item.reviewRequested && output?.routeStatus === 'observed' && output.liveSourceId === operation.previous) {
-                        item.status = 'failed'; item.error = `OUT ${output.outputId} remains on its previous route after review.`;
+                        item.status = 'failed'; item.reviewed = true; item.error = `OUT ${output.outputId} remains on its previous route after review.`;
                     }
                     else if (output?.routeStatus === 'observed' && output.liveSourceId !== operation.previous) {
                         item.status = 'unconfirmed'; item.error = `OUT ${output.outputId} changed to an unexpected source.`;
                     }
+                }
+                if (operation.status === 'partial' &&
+                    operation.channels.every(item => ['confirmed', 'failed'].includes(item.status)) &&
+                    (!operation.takeAllId || operation.channels.every(item => item.status === 'confirmed' || item.reviewed))) {
+                    // A uniform route alone does not prove a timed-out write
+                    // settled: require per-output confirmation or read-only
+                    // review before unlocking a later group operation.
+                    operation.status = 'resolved';
+                    operation.error = '';
+                    if (operation.timer !== null) clearTimeout(operation.timer);
+                    operation.timer = null;
+                    if (operation.takeAllId && this.takeAllOperation?.id === operation.takeAllId) {
+                        this.takeAllOperation[groupId].status = operation.channels.some(item => item.status === 'failed') ? 'partial' : 'confirmed';
+                        this.takeAllOperation[groupId].error = operation.channels.filter(item => item.status === 'failed').map(item => item.error).filter(Boolean).join(' ');
+                        this.tryFinalizeTakeAll();
+                    }
+                    continue;
+                }
+                if (operation.takeAllId && this.takeAllOperation?.id === operation.takeAllId) {
+                    const participant = this.takeAllOperation[groupId];
+                    const unresolved = operation.channels.some(item => ['pending', 'dispatching', 'unconfirmed'].includes(item.status));
+                    const failed = operation.channels.some(item => item.status === 'failed');
+                    const allConfirmed = operation.channels.length > 0 && operation.channels.every(item => item.status === 'confirmed');
+                    if (allConfirmed) {
+                        operation.status = 'confirmed';
+                        participant.status = 'confirmed';
+                        participant.error = '';
+                        if (operation.timer !== null) clearTimeout(operation.timer);
+                        operation.timer = null;
+                        this.tryFinalizeTakeAll();
+                        continue;
+                    }
+                    if (failed) {
+                        participant.status = 'partial';
+                        participant.error = operation.channels.filter(item => item.status === 'failed' || item.status === 'unconfirmed').map(item => item.error).filter(Boolean).join(' ') || 'One or more output routes did not confirm.';
+                    } else if (operation.channels.some(item => item.status === 'unconfirmed')) {
+                        participant.status = 'unconfirmed';
+                        participant.error = 'One or more output routes are unconfirmed; review each output.';
+                    }
+                    if (failed && !unresolved) {
+                        operation.status = 'partial';
+                        if (operation.timer !== null) clearTimeout(operation.timer);
+                        operation.timer = null;
+                    }
+                    this.tryFinalizeTakeAll();
+                    if (operation.status !== 'pending' && operation.status !== 'partial') continue;
                 }
                 if (operation.channels.length && operation.channels.every(item => item.status === 'confirmed') && !operation.configSaved) {
                     operation.status = 'saving';
@@ -1977,7 +2374,10 @@ document.addEventListener('alpine:init', () => {
                     }
                 } else if (operation.channels.some(item => ['failed', 'unconfirmed'].includes(item.status))) {
                     operation.status = 'partial';
-                    if (operation.timer !== null) clearTimeout(operation.timer);
+                    if (!operation.channels.some(item => ['pending', 'dispatching'].includes(item.status))) {
+                        if (operation.timer !== null) clearTimeout(operation.timer);
+                        operation.timer = null;
+                    }
                     this.showError('Group CUT partially completed or was diverted. Actual routes are shown; Preview was not swapped.');
                 }
             }
@@ -2037,6 +2437,10 @@ document.addEventListener('alpine:init', () => {
                         operation.status = 'confirmed_config_failed';
                         operation.error = this.dashboardConfigError;
                     }
+                } else if (typeof this.configSavePurpose === 'string' && this.configSavePurpose.startsWith('take-all:') && this.takeAllOperation) {
+                    this.takeAllOperation.status = 'confirmed_config_failed';
+                    this.takeAllOperation.error = this.dashboardConfigError;
+                    this.assignmentBusy = false;
                 }
                 this.configSavePurpose = null;
                 this.configSaveExpected = null;
@@ -2057,6 +2461,11 @@ document.addEventListener('alpine:init', () => {
             }
             if (this.primaryActionPending) {
                 this.primaryActionPending.unconfirmed = true;
+                    if (this.primaryActionPending.takeAllId && this.takeAllOperation?.id === this.primaryActionPending.takeAllId) {
+                        this.takeAllOperation.primary.status = 'unconfirmed';
+                        this.takeAllOperation.primary.error = 'Connection closed before Primary confirmation.';
+                        this.takeAllOperation.status = 'unconfirmed';
+                    }
                 if (this.primaryActionTimer !== null) clearTimeout(this.primaryActionTimer);
                 this.primaryActionTimer = null;
             }
@@ -2065,13 +2474,18 @@ document.addEventListener('alpine:init', () => {
                 if (operation.timer !== null) clearTimeout(operation.timer);
                 operation.timer = null;
             }
-            for (const operation of Object.values(this.groupCutOperations)) {
+            for (const [groupId, operation] of Object.entries(this.groupCutOperations)) {
                 if (['pending', 'saving'].includes(operation.status)) operation.status = 'unconfirmed';
                 for (const item of operation.channels || []) {
                     if (['pending', 'dispatching'].includes(item.status)) item.status = 'unconfirmed';
                 }
                 if (operation.timer !== null) clearTimeout(operation.timer);
                 operation.timer = null;
+                if (operation.takeAllId && this.takeAllOperation?.id === operation.takeAllId) {
+                    this.takeAllOperation[groupId].status = 'unconfirmed';
+                    this.takeAllOperation[groupId].error = 'Connection closed before output confirmation.';
+                    this.takeAllOperation.status = 'unconfirmed';
+                }
             }
             for (const operation of Object.values(this.groupAlignOperations)) {
                 if (['pending', 'saving'].includes(operation.status)) operation.status = 'unconfirmed';

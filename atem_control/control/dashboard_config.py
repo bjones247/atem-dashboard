@@ -128,18 +128,27 @@ def update_config(device_id, expected_revision, config, ip=None):
 
 
 def update_config_for_connection(connection, expected_revision, config, ip=None):
-    device_id = device_id_from_connection(connection)
-    from atem_control.control.dashboard_switching import state_is_fresh
+    from atem_control.control import dashboard_switching
     from atem_control.control.dashboard_ownership import validate_config_against_state
 
-    conflicts = validate_config_against_state(
-        connection.mixerstate, config, state_fresh=state_is_fresh(connection))
-    if conflicts:
-        labels = sorted({item.get('reason') or
-                         f"{item['type']}:{('OUT ' + str(item['outputId'])) if item.get('outputId') else item.get('sourceId', '')}"
-                         for item in conflicts})
-        raise DashboardConfigError('Configuration conflicts with discovered ATEM state: ' + ', '.join(labels))
-    return update_config(device_id, expected_revision, config, ip=ip)
+    # Use the same process-local lock as 3C physical route dispatch. A stale
+    # session cannot alter ownership after a route passes its revision check,
+    # and configuration edits wait until any AUX route is observed or reviewed.
+    with dashboard_switching.configuration_update_lock():
+        pending_reason = dashboard_switching.configuration_update_block_reason(connection)
+        if pending_reason:
+            raise DashboardConfigError(pending_reason)
+        device_id = device_id_from_connection(connection)
+        conflicts = validate_config_against_state(
+            connection.mixerstate, config,
+            state_fresh=dashboard_switching.state_is_fresh(connection))
+        if conflicts:
+            labels = sorted({item.get('reason') or
+                             f"{item['type']}:{('OUT ' + str(item['outputId'])) if item.get('outputId') else item.get('sourceId', '')}"
+                             for item in conflicts})
+            raise DashboardConfigError(
+                'Configuration conflicts with discovered ATEM state: ' + ', '.join(labels))
+        return update_config(device_id, expected_revision, config, ip=ip)
 
 
 def identity_snapshot(connection):

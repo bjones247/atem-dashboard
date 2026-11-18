@@ -14,23 +14,27 @@ DEVICE_A = '7665f2ed6f4042e6bbcbbe17ef0143e7'
 DEVICE_B = '0123456789abcdef0123456789abcdef'
 
 
+class FakeConnection:
+    """Weak-referenceable stand-in for WebATEM's pooled connection object."""
+
+
 def connection(device_id=DEVICE_A, ip='192.168.1.12'):
-    return SimpleNamespace(
-        is_ready=True,
-        is_connected=True,
-        protocol=SimpleNamespace(transport=SimpleNamespace(last_rx_monotonic=time.monotonic())),
-        mixerstate={
-            'device-identity': SimpleNamespace(device_id=device_id, ip=ip),
-            'topology': SimpleNamespace(aux_outputs=6),
-            'input-properties': {
-                501: SimpleNamespace(index=501, name='Studio Input', short_name='STU',
-                                     port_type=0, available_aux=True),
-                502: SimpleNamespace(index=502, name='Studio Input 2', short_name='ST2',
-                                     port_type=0, available_aux=True),
-            },
-            'aux-output-source': {i: SimpleNamespace(source=501) for i in range(6)},
+    fake = FakeConnection()
+    fake.is_ready = True
+    fake.is_connected = True
+    fake.protocol = SimpleNamespace(transport=SimpleNamespace(last_rx_monotonic=time.monotonic()))
+    fake.mixerstate = {
+        'device-identity': SimpleNamespace(device_id=device_id, ip=ip),
+        'topology': SimpleNamespace(aux_outputs=6),
+        'input-properties': {
+            501: SimpleNamespace(index=501, name='Studio Input', short_name='STU',
+                                 port_type=0, available_aux=True),
+            502: SimpleNamespace(index=502, name='Studio Input 2', short_name='ST2',
+                                 port_type=0, available_aux=True),
         },
-    )
+        'aux-output-source': {i: SimpleNamespace(source=501) for i in range(6)},
+    }
+    return fake
 
 
 def changed_config(source=501):
