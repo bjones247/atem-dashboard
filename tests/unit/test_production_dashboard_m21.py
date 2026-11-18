@@ -557,7 +557,74 @@ def test_aux_cut_uses_existing_dispatch_once_and_waits_for_observed_route(monkey
     assert 'awaiting' in switching.dispatch_aux_cut(c, payload)[1]
     c.mixerstate['aux-output-source'][2].source = 2
     assert switching.aux_cut_readiness(c, 2)[0] is None
+    assert ('aux', 2) not in switching._operations.get(c, {})
     assert len(sent) == 1
+
+
+def test_unconfirmed_aux_route_with_original_source_requires_read_only_review(monkeypatch):
+    c = FakeConnection()
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda *args: sent.append(args) or (True, None))
+    payload = {'aux_channel': 2, 'input_source': 2, 'expected_live': 1}
+
+    assert switching.dispatch_aux_cut(c, payload) == (True, None)
+    switching._operations[c][('aux', 2)]['since'] -= switching.PENDING_SECONDS + 1
+    assert 'unconfirmed' in switching.aux_cut_readiness(c, 2)[0]
+    assert 'unconfirmed' in switching.dispatch_aux_cut(c, payload)[1]
+    assert switching.review_unconfirmed(c, 'aux', 2) == (True, None)
+    assert ('aux', 2) not in switching._operations.get(c, {})
+    assert len(sent) == 1  # read-only review does not retry the route command
+
+
+def test_unexpected_aux_route_stays_guarded_across_dashboard_sessions(monkeypatch):
+    c = _three_c_connection()
+    config = _three_c_config()
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda _c, command, data: sent.append((command, data)) or (True, None))
+    first = {'config_revision': 7, 'output_id': 3, 'mode': 'other_route',
+             'expected_live': 2, 'input_source': 1}
+
+    assert switching.dispatch_output_route(c, first, config)[0]
+    # An external controller selects a third source before the original
+    # request is confirmed. A second dashboard session observes that route.
+    c.mixerstate['input-properties'][3] = NS(available_aux=True, available_me1=True)
+    c.mixerstate['aux-output-source'][2].source = 3
+    second = {**first, 'expected_live': 3, 'input_source': 2}
+    ok, reason = switching.dispatch_output_route(c, second, config)
+
+    assert not ok and 'unconfirmed' in reason.lower()
+    assert 'review current hardware state' in reason.lower()
+    assert len(sent) == 1  # the competing session cannot dispatch
+    assert switching.configuration_update_block_reason(c)
+
+    # Explicit read-only review releases the guard but does not issue a write.
+    switching._operations[c][('aux', 2)]['since'] -= switching.PENDING_SECONDS + 1
+    assert switching.review_unconfirmed(c, 'aux', 2) == (True, None)
+    assert switching.configuration_update_block_reason(c) is None
+    assert len(sent) == 1
+
+
+def test_multi_output_unexpected_route_keeps_only_that_output_guarded(monkeypatch):
+    c = _three_c_connection(routes={0: 90010, 1: 1, 2: 1, 3: 1, 4: 2, 5: 1})
+    config = _three_c_config(virtual1={'outputs': [1, 2], 'previewSource': 2, 'programTarget': 1})
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda _c, command, data: sent.append((command, data)) or (True, None))
+    payload = {'config_revision': 7, 'group_id': 'virtual1', 'input_source': 2}
+
+    ok, result = switching.dispatch_virtual_group_cut(c, payload, config)
+    assert ok and len(result['outcomes']) == 2
+    assert [item['channel'] for item in result['outcomes']] == [1, 2]
+
+    c.mixerstate['input-properties'][3] = NS(available_aux=True, available_me1=True)
+    c.mixerstate['aux-output-source'][1].source = 3  # OUT 2 diverges unexpectedly
+    c.mixerstate['aux-output-source'][2].source = 2  # OUT 3 confirms its target
+    assert 'unconfirmed' in switching.aux_cut_readiness(c, 1)[0].lower()
+    assert switching.aux_cut_readiness(c, 2)[0] is None
+    operations = switching._operations.get(c, {})
+    assert ('aux', 1) in operations
+    assert ('aux', 2) not in operations
+    assert switching.configuration_update_block_reason(c)
+    assert len(sent) == 2
 
 
 def test_consumer_rechecks_at_command_boundary_and_keeps_stock_verbs(monkeypatch):

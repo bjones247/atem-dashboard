@@ -68,9 +68,13 @@ def _pending(connection, key, live):
     operation = operations.get(key)
     if not operation:
         return None
-    if live == operation['target'] or (live is not None and live != operation['before']):
+    if live == operation['target']:
         operations.pop(key, None)
         return None
+    if live is not None and live != operation['before']:
+        operation['uncertain'] = True
+        return ('Observed hardware state differs from both the previous and requested source. '
+                'The operation is unconfirmed; review current hardware state before another action.')
     if time.monotonic() - operation['since'] >= PENDING_SECONDS:
         operation['uncertain'] = True
         return 'Previous command is unconfirmed. Review current hardware state before another action.'
