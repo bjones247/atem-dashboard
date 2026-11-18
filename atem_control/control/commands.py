@@ -97,6 +97,8 @@ ATEM_COMMAND_MAP = {
     'set_usk_on_air': lambda c, d: ops.set_usk_on_air(
         c, keyer=d['key_index'], enabled=d['enabled'], me=d.get('me', 0)),
     'toggle_dsk': lambda c, d: ops.toggle_dsk(c, dsk_idx=d.get('dsk', 0)),
+    'set_dsk_on_air': lambda c, d: ops.set_dsk_on_air(
+        c, enabled=d['enabled'], dsk_idx=d['dsk']),
     'dsk_auto': lambda c, d: ops.dsk_auto(c, dsk_idx=d.get('dsk', 0)),
     'set_dsk_rate': lambda c, d: ops.set_dsk_rate(c, rate_str=d['rate'], dsk_idx=d.get('dsk', 0)),
 

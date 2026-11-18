@@ -26,26 +26,18 @@ HERE = Path(__file__).parent
 
 
 @pytest.mark.django_db
-def test_dashboard_milestone_2_dom_elements(client):
-    """Verify DOM elements for Milestone 2 interactive CUT and USK controls."""
+def test_dashboard_milestone_3b_keeps_deferred_switching_controls_out_of_ui(client):
+    """The 3B state view does not expose switching actions reserved for 3C."""
     response = client.get('/atem/dashboard/', {'ip': '192.168.1.114'})
     assert response.status_code == 200
     content = response.content.decode('utf-8')
 
-    # Status header indicates Milestone 2
-    assert 'Milestone 2' in content
-
-    # CUT buttons are now active Alpine handlers (not disabled in M1)
-    assert '@click="cut(panel)"' in content
-    assert '@click="toggleUSK(k.keyIndex)"' in content
-
-    # Key-tied guard notice in template
-    assert 'M/E CUT BLOCKED (KEY TIED)' in content
-    assert 'Untie keyer(s) in ATEM to enable background-only M/E CUT' in content
-
-    # Direct Program mode toggle in header
-    assert 'Preview + CUT' in content
-    assert 'Direct Program' in content
+    assert 'Primary Switcher' in content
+    assert 'virtualSwitcherViews' in content
+    assert 'Other Outputs' in content
+    assert '@click="cut(panel)"' not in content
+    assert '@click="toggleUSK(k.keyIndex)"' not in content
+    assert 'CUT ALL OUTPUTS' not in content
 
 
 # =============================================================================

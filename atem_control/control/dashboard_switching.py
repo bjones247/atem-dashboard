@@ -56,7 +56,7 @@ def _pending(connection, key, live):
         return None
     if time.monotonic() - operation['since'] >= PENDING_SECONDS:
         operation['uncertain'] = True
-        return 'Previous command is unconfirmed. Review current hardware state before another CUT.'
+        return 'Previous command is unconfirmed. Review current hardware state before another action.'
     return 'A switching command is awaiting hardware confirmation.'
 
 
@@ -163,6 +163,38 @@ def usk_toggle_readiness(connection, key_index, expected_on_air=None):
         return None, live
 
 
+def _dsk_on_air(mx, dsk_index):
+    state = _entry(mx, 'dkey-state', dsk_index)
+    value = getattr(state, 'on_air', None)
+    return value if type(value) is bool else None
+
+
+def dsk_toggle_readiness(connection, dsk_index, expected_on_air=None):
+    """Return (reason, observed_on_air) from a received DskS packet."""
+    with _lock:
+        mx, reason = _raw(connection)
+        if reason:
+            return reason, None
+        count = getattr(mx.get('topology'), 'downstream_keyers', None)
+        if not _integer(dsk_index) or not _integer(count) or dsk_index >= count:
+            return 'Downstream keyer is not confirmed by device topology.', None
+        state = _entry(mx, 'dkey-state', dsk_index)
+        live = _dsk_on_air(mx, dsk_index)
+        if live is None:
+            return 'Downstream keyer on-air state has not been observed.', None
+        if type(getattr(state, 'is_transitioning', None)) is not bool or \
+                type(getattr(state, 'is_autotransitioning', None)) is not bool:
+            return 'Downstream keyer transition state is incomplete.', live
+        if state.is_transitioning or state.is_autotransitioning:
+            return 'Downstream keyer is transitioning.', live
+        reason = _pending(connection, ('dsk', dsk_index), live)
+        if reason:
+            return reason, live
+        if expected_on_air is not None and expected_on_air is not live:
+            return 'Downstream keyer changed; review current on-air state.', live
+        return None, live
+
+
 def safety_snapshot(connection):
     """UI projection from the same evaluation used at the command boundary."""
     with _lock:
@@ -181,9 +213,22 @@ def safety_snapshot(connection):
                 if _integer(key_index):
                     key_reason, on_air = usk_toggle_readiness(connection, key_index)
                     usk[str(key_index)] = {'reason': key_reason, 'onAir': on_air}
+        dsk = {}
+        dsk_count = getattr(top, 'downstream_keyers', None)
+        if _integer(dsk_count):
+            for dsk_index in range(min(dsk_count, 64)):
+                dsk_reason, on_air = dsk_toggle_readiness(connection, dsk_index)
+                dsk[str(dsk_index)] = {'reason': dsk_reason, 'onAir': on_air}
         return {'fresh': freshness_reason is None,
                 'meCut': {'reason': reason, 'program': program, 'preview': preview},
-                'aux': aux, 'usk': usk}
+                'aux': aux, 'usk': usk, 'dsk': dsk}
+
+
+def state_is_fresh(connection):
+    """Whether the pooled connection has a recent, ready hardware snapshot."""
+    with _lock:
+        _mx, reason = _raw(connection)
+        return reason is None
 
 
 def _record(connection, key, before, target):
@@ -246,17 +291,493 @@ def dispatch_usk_toggle(connection, data):
         return ok, error
 
 
+def dispatch_dsk_toggle(connection, data):
+    """Guard an explicit DSK on-air target on the pooled command path."""
+    with _lock:
+        dsk_index = data.get('dsk')
+        expected = data.get('expected_on_air')
+        target = data.get('target_on_air')
+        if type(expected) is not bool or type(target) is not bool or target is expected:
+            return False, 'Expected DSK state and opposite on-air target are required.'
+        reason, live = dsk_toggle_readiness(connection, dsk_index, expected)
+        if reason:
+            return False, reason
+        ok, error = dispatch(connection, 'set_dsk_on_air',
+                             {'dsk': dsk_index, 'enabled': target})
+        if ok:
+            _record(connection, ('dsk', dsk_index), live, target)
+        return ok, error
+
+
+def _me_state(mx):
+    """Return validated M/E buses, transition settings, and position."""
+    program = _source(mx, 'program-bus-input', 0)
+    preview = _source(mx, 'preview-bus-input', 0)
+    settings = _entry(mx, 'transition-settings', 0)
+    position = _entry(mx, 'transition-position', 0)
+    if program is None or preview is None:
+        return None, 'M/E Program or Preview has not been observed.'
+    if _entry(mx, 'input-properties', program) is None or _entry(mx, 'input-properties', preview) is None:
+        return None, 'M/E Program or Preview source is missing from the device catalog.'
+    if settings is None or position is None:
+        return None, 'M/E transition settings or position have not been observed.'
+    selection = [getattr(settings, 'next_transition_bkgd', None)] + [
+        getattr(settings, f'next_transition_key{i}', None) for i in range(1, 5)]
+    in_transition = getattr(position, 'in_transition', None)
+    position_value = getattr(position, 'position', None)
+    if any(type(value) is not bool for value in selection) or type(in_transition) is not bool:
+        return None, 'M/E transition selection or progress state is incomplete or malformed.'
+    if not _integer(position_value):
+        return None, 'M/E transition position is unknown.'
+    return {'program': program, 'preview': preview, 'settings': settings,
+            'position': position, 'selection': selection,
+            'in_transition': in_transition, 'position_value': position_value}, None
+
+
+def dispatch_me_preview(connection, data):
+    """Guard and dispatch a Primary hardware Preview selection."""
+    with _lock:
+        mx, reason = _raw(connection)
+        if reason:
+            return False, reason
+        state, reason = _me_state(mx)
+        if reason:
+            return False, reason
+        target = data.get('source')
+        expected = data.get('expected_preview')
+        if data.get('me', 0) != 0 or not _integer(target) or not _integer(expected):
+            return False, 'A valid M/E 1 Preview source and expected current source are required.'
+        if state['preview'] != expected:
+            return False, 'M/E Preview changed; review the current hardware state.'
+        if state['in_transition'] or state['position_value'] != 0:
+            return False, 'M/E Preview is locked while a transition is active or not at rest.'
+        pending = _pending(connection, ('me_preview', 0), state['preview'])
+        if pending:
+            return False, pending
+        source = _entry(mx, 'input-properties', target)
+        if source is None or getattr(source, 'available_me1', None) is not True:
+            return False, 'Selected source is not directly available to M/E 1.'
+        ok, error = dispatch(connection, 'set_preview', {'source': target, 'me': 0})
+        if ok:
+            _record(connection, ('me_preview', 0), state['preview'], target)
+        return ok, error
+
+
+def dispatch_me_program(connection, data):
+    """Guard the explicitly enabled direct Primary Program operation."""
+    with _lock:
+        mx, reason = _raw(connection)
+        if reason:
+            return False, reason
+        state, reason = _me_state(mx)
+        if reason:
+            return False, reason
+        target = data.get('source')
+        expected = data.get('expected_program')
+        if data.get('me', 0) != 0 or not _integer(target) or not _integer(expected):
+            return False, 'A valid M/E 1 Program source and expected current source are required.'
+        if state['program'] != expected:
+            return False, 'M/E Program changed; review the current hardware state.'
+        if state['in_transition'] or state['position_value'] != 0:
+            return False, 'Direct Program selection is blocked while an M/E transition is active.'
+        pending = _pending(connection, ('me', 0), state['program'])
+        if pending:
+            return False, pending
+        source = _entry(mx, 'input-properties', target)
+        if source is None or getattr(source, 'available_me1', None) is not True:
+            return False, 'Selected source is not directly available to M/E 1.'
+        if target == state['program']:
+            return False, 'Selected source is already M/E Program.'
+        ok, error = dispatch(connection, 'set_program', {'source': target, 'me': 0})
+        if ok:
+            _record(connection, ('me', 0), state['program'], target)
+        return ok, error
+
+
+def dispatch_me_auto(connection, data):
+    """Guard Primary AUTO; keyed transitions require explicit confirmation."""
+    with _lock:
+        mx, reason = _raw(connection)
+        if reason:
+            return False, reason
+        state, reason = _me_state(mx)
+        if reason:
+            return False, reason
+        if data.get('me', 0) != 0 or data.get('expected_program') != state['program'] or \
+                data.get('expected_preview') != state['preview']:
+            return False, 'M/E Program or Preview changed; review the current hardware state.'
+        if state['in_transition'] or state['position_value'] != 0:
+            return False, 'M/E transition is active or not at rest.'
+        if state['program'] == state['preview']:
+            return False, 'M/E Preview is already live; select a different Preview source.'
+        pending = _pending(connection, ('me', 0), state['program'])
+        if pending:
+            return False, pending
+        background, *keys = state['selection']
+        expected_selection = data.get('expected_selection')
+        observed_selection = {'background': background,
+                              **{f'key{i + 1}': keys[i] for i in range(4)}}
+        if not isinstance(expected_selection, dict) or expected_selection != observed_selection:
+            return False, 'M/E next-transition selection changed; review the tied keyers before AUTO.'
+        if not (background or any(keys)):
+            return False, 'No M/E background or keyer is selected for the next transition.'
+        tied = [index + 1 for index, selected in enumerate(keys) if selected]
+        if tied and data.get('allow_keyed') is not True:
+            return False, 'Keyed AUTO requires explicit confirmation for: ' + ', '.join(f'KEY {i}' for i in tied)
+        ok, error = dispatch(connection, 'auto', {'me': 0})
+        if ok:
+            _record(connection, ('me', 0), state['program'], state['preview'])
+        return ok, error
+
+
+def dispatch_me_transition_style(connection, data):
+    """Configure a supported transition style without executing it."""
+    with _lock:
+        mx, reason = _raw(connection)
+        if reason:
+            return False, reason
+        style = data.get('style')
+        if type(style) is not int or style not in (0, 1, 2, 3, 4):
+            return False, 'Unsupported transition style.'
+        settings = _entry(mx, 'transition-settings', 0)
+        position = _entry(mx, 'transition-position', 0)
+        if settings is None or position is None or type(getattr(settings, 'style', None)) is not int:
+            return False, 'Current M/E transition style has not been observed.'
+        if type(getattr(position, 'in_transition', None)) is not bool or \
+                not _integer(getattr(position, 'position', None)):
+            return False, 'M/E transition progress state is incomplete.'
+        if position.in_transition or position.position != 0:
+            return False, 'Transition style cannot change while M/E is transitioning.'
+        if style in (3, 4):
+            topology = mx.get('topology')
+            capability = 'dves' if style == 3 else 'stingers'
+            count = getattr(topology, capability, None)
+            if not _integer(count) or count == 0:
+                return False, f'{"DVE" if style == 3 else "Stinger"} transition capability is unavailable or unknown.'
+        pending = _pending(connection, ('transition_style', 0), settings.style)
+        if pending:
+            return False, pending
+        if style == settings.style:
+            return False, 'Transition style is already selected.'
+        ok, error = dispatch(connection, 'set_transition_style', {'style': style, 'me': 0})
+        if ok:
+            _record(connection, ('transition_style', 0), settings.style, style)
+        return ok, error
+
+
+def _config_payload(config_snapshot):
+    if isinstance(config_snapshot, dict) and isinstance(config_snapshot.get('config'), dict):
+        return config_snapshot['config'], config_snapshot.get('revision')
+    return config_snapshot if isinstance(config_snapshot, dict) else {}, None
+
+
+def _group(config, group_id):
+    groups = config.get('virtualSwitchers')
+    item = groups.get(group_id) if isinstance(groups, dict) else None
+    return item if isinstance(item, dict) else {}
+
+
+def _route_projection(mx, config, revision):
+    from atem_control.control.dashboard_ownership import project_routes
+    return project_routes(mx, {'deviceId': None, 'revision': revision, 'config': config},
+                          revision, state_fresh=True)
+
+
+def output_route_readiness(connection, data, config_snapshot):
+    """Validate one physical output route for a named 3C workflow."""
+    mx, reason = _raw(connection)
+    if reason:
+        return reason, None
+    config, revision = _config_payload(config_snapshot)
+    if data.get('config_revision') != revision:
+        return 'Dashboard configuration changed; reload ownership before routing.', None
+    output_id = data.get('output_id')
+    if type(output_id) is not int or not 1 <= output_id <= 6:
+        return 'Physical output must be OUT 1 through OUT 6.', None
+    channel = output_id - 1
+    topology = mx.get('topology')
+    if getattr(topology, 'aux_outputs', None) != 6:
+        return 'Physical OUT routing is unavailable unless exactly six AUX channels are reported.', None
+    live = _source(mx, 'aux-output-source', channel)
+    if live is None:
+        return f'OUT {output_id} current route has not been observed.', None
+    expected_live = data.get('expected_live')
+    if not _integer(expected_live) or expected_live != live:
+        return f'OUT {output_id} changed since the operation was reviewed.', None
+    target = data.get('input_source')
+    source = _entry(mx, 'input-properties', target) if _integer(target) else None
+    if source is None or getattr(source, 'available_aux', None) is not True:
+        return f'Selected source is not directly routable to OUT {output_id}.', None
+    pending = _pending(connection, ('aux', channel), live)
+    if pending:
+        return pending, None
+
+    from atem_control.control import dashboard_ownership
+    projection = dashboard_ownership.project_routes(mx, config_snapshot, revision, state_fresh=True)
+    output = next((item for item in projection['outputs'] if item['outputId'] == output_id), None)
+    if not output or not output.get('available') or output.get('routeStatus') != 'observed':
+        return f'OUT {output_id} is unavailable or unresolved.', None
+    owner = output.get('owner')
+    saved_owners = output.get('savedOwners') or []
+    mode = data.get('mode')
+    program_id = projection['capabilities'].get('programOutputSourceId')
+    if program_id is None:
+        return 'M/E Program output identity is ambiguous; ownership routing is blocked.', None
+    if owner == 'unresolved' or owner == 'unknown' or len(saved_owners) > 1:
+        return f'OUT {output_id} has an ownership conflict that must be resolved first.', None
+
+    if mode == 'primary_assign':
+        if target != program_id:
+            return 'Primary assignment must route to the discovered M/E Program feed.', None
+        if output.get('observedRouteOwner') == 'primary':
+            return f'OUT {output_id} already carries M/E Program.', None
+        if owner not in ('other', 'virtual1', 'virtual2'):
+            return f'OUT {output_id} cannot be assigned to Primary from its current ownership state.', None
+        transfer_from = data.get('transfer_from')
+        if owner in ('virtual1', 'virtual2') and transfer_from != owner:
+            return f'OUT {output_id} is owned by {owner}; initiate an explicit ownership transfer.', None
+        if owner == 'other' and saved_owners:
+            return f'OUT {output_id} has a saved assignment; resolve the ownership conflict first.', None
+    elif mode == 'primary_release':
+        if output.get('observedRouteOwner') != 'primary' or live != program_id:
+            return f'OUT {output_id} is not currently routed to the discovered M/E Program feed.', None
+        me, reason = _me_state(mx)
+        if reason:
+            return reason, None
+        if me['in_transition'] or me['position_value'] != 0 or \
+                _pending(connection, ('me', 0), me['program']):
+            return 'Cannot release an M/E Program output while M/E is transitioning or a command is pending.', None
+        background = _source(mx, 'program-bus-input', 0)
+        bg_source = _entry(mx, 'input-properties', background) if background is not None else None
+        if background is None or bg_source is None or getattr(bg_source, 'available_aux', None) is not True:
+            return 'Current M/E Program background is unknown or cannot be routed directly; output release is blocked.', None
+        if target != background:
+            return 'Primary release target changed; it must remain the current M/E Program background.', None
+        if config.get('minimumPrimaryDestinations', True):
+            count = sum(1 for item in projection['outputs'] if item['observedRouteOwner'] == 'primary')
+            if count <= 1:
+                return 'Cannot release the final Primary Program destination while the minimum-destination policy is enabled.', None
+    elif mode == 'virtual_assign':
+        group_id = data.get('group_id')
+        if group_id not in ('virtual1', 'virtual2'):
+            return 'Unknown virtual switcher.', None
+        group = _group(config, group_id)
+        if not isinstance(group.get('outputs'), list):
+            return 'Saved virtual switcher assignments are malformed.', None
+        if channel in group['outputs']:
+            return f'OUT {output_id} is already assigned to this virtual switcher.', None
+        other_group = 'virtual2' if group_id == 'virtual1' else 'virtual1'
+        other_outputs = _group(config, other_group).get('outputs', [])
+        if channel in other_outputs:
+            if data.get('transfer_from') != other_group:
+                return f'OUT {output_id} belongs to {other_group}; initiate an explicit ownership transfer.', None
+        elif owner == 'primary':
+            if data.get('transfer_from') != 'primary':
+                return f'OUT {output_id} carries M/E Program; initiate an explicit transfer from Primary.', None
+        elif owner != 'other':
+            return f'OUT {output_id} is not available for virtual assignment.', None
+        if projection['groups'][group_id]['routeStatus'] in ('mixed', 'unknown'):
+            return f'{group_id} routing must be uniform and observed before assigning another output.', None
+        if target == program_id:
+            return 'A virtual switcher cannot claim the M/E Program feed; assign this output to Primary.', None
+        expected_target = projection['groups'][group_id]['liveSourceId']
+        if projection['groups'][group_id]['routeStatus'] == 'empty':
+            expected_target = group.get('programTarget')
+        if target != expected_target:
+            return f'{group_id} assignment target changed; review the current live or saved Program target.', None
+        if target is None:
+            return f'{group_id} has no saved Program target; set one before assigning an output.', None
+        if live == target:
+            # Assignment can complete without routing if the current output is
+            # already carrying the exact group target; the caller still needs
+            # to persist the ownership through a revisioned config update.
+            return None, {'live': live, 'target': target, 'channel': channel, 'no_op': True}
+        if output.get('observedRouteOwner') == 'primary' and data.get('transfer_from') != 'primary':
+            return f'OUT {output_id} is currently Primary; explicit transfer confirmation is required.', None
+    elif mode == 'other_route':
+        if owner != 'other' or saved_owners:
+            return f'OUT {output_id} is not an unowned Other Output.', None
+        if target == program_id:
+            return 'Routing to M/E Program changes ownership; use the Primary assignment workflow.', None
+    else:
+        return 'Unknown physical output operation.', None
+
+    if target == live:
+        return f'OUT {output_id} is already showing the selected source.', None
+    return None, {'live': live, 'target': target, 'channel': channel, 'no_op': False}
+
+
+def dispatch_output_route(connection, data, config_snapshot):
+    """Preflight and enqueue one 3C physical output route through WebATEM."""
+    with _lock:
+        reason, route = output_route_readiness(connection, data, config_snapshot)
+        if reason:
+            return False, reason
+        if route['no_op']:
+            return True, route
+        ok, error = dispatch(connection, 'set_aux_output', {
+            'aux_channel': route['channel'], 'input_source': route['target']})
+        if ok:
+            _record(connection, ('aux', route['channel']), route['live'], route['target'])
+        return ok, error or route
+
+
+def dispatch_virtual_group_cut(connection, data, config_snapshot):
+    """Preflight a uniform virtual group then enqueue one route per output.
+
+    The commands are independent and may partially succeed. This function
+    returns an outcome for every destination and never retries a failure.
+    """
+    with _lock:
+        mx, reason = _raw(connection)
+        if reason:
+            return False, reason
+        config, revision = _config_payload(config_snapshot)
+        group_id = data.get('group_id')
+        if group_id not in ('virtual1', 'virtual2'):
+            return False, 'Unknown virtual switcher.'
+        if data.get('config_revision') != revision:
+            return False, 'Dashboard configuration changed; reload before CUT.'
+        group = _group(config, group_id)
+        channels = group.get('outputs')
+        if not isinstance(channels, list) or not channels:
+            return False, 'This virtual switcher has no assigned outputs.'
+        if any(type(c) is not int or not 0 <= c < 6 for c in channels) or len(channels) != len(set(channels)):
+            return False, 'Virtual switcher has duplicate or unavailable output assignments.'
+        if getattr(mx.get('topology'), 'aux_outputs', None) != 6:
+            return False, 'Physical OUT routing is unavailable unless exactly six AUX channels are reported.'
+        target = group.get('previewSource')
+        if not _integer(target) or data.get('input_source') != target:
+            return False, 'Queued Preview changed or is invalid; reload the virtual switcher state.'
+        source = _entry(mx, 'input-properties', target)
+        if source is None or getattr(source, 'available_aux', None) is not True:
+            return False, 'Queued Preview source is not directly routable to the assigned outputs.'
+        from atem_control.control.dashboard_ownership import project_routes
+        projection = project_routes(mx, config_snapshot, revision, state_fresh=True)
+        projected = projection['groups'][group_id]
+        if projected['routeStatus'] != 'uniform' or projected['liveSourceId'] is None:
+            return False, 'Virtual switcher routes are mixed or unknown; resolve routing before CUT.'
+        if any(item.get('owner') != group_id for item in projection['outputs']
+               if item.get('auxIndex') in channels):
+            return False, 'Virtual switcher output ownership is conflicted; resolve ownership before CUT.'
+        previous = projected['liveSourceId']
+        if target == previous:
+            return False, 'Queued Preview is already live.'
+        outcomes = []
+        for channel in channels:
+            live = _source(mx, 'aux-output-source', channel)
+            if live != previous:
+                return False, 'A virtual switcher route changed during group preflight; refresh and review.'
+            pending = _pending(connection, ('aux', channel), live)
+            if pending:
+                return False, pending
+        for channel in channels:
+            live = _source(mx, 'aux-output-source', channel)
+            ok, error = dispatch(connection, 'set_aux_output', {
+                'aux_channel': channel, 'input_source': target})
+            if ok:
+                _record(connection, ('aux', channel), live, target)
+            outcomes.append({'channel': channel, 'ok': ok, 'error': error})
+        return True, {'group_id': group_id, 'target': target, 'previous': previous,
+                      'revision': revision, 'outcomes': outcomes}
+
+
+def dispatch_virtual_group_align(connection, data, config_snapshot):
+    """Explicitly align a mixed virtual group to one reviewed target.
+
+    ``expected_routes`` binds the request to the complete route snapshot shown
+    in the operator confirmation. Each changed physical route is dispatched
+    and tracked independently; already-matching outputs are returned as
+    confirmed no-ops.
+    """
+    with _lock:
+        mx, reason = _raw(connection)
+        if reason:
+            return False, reason
+        config, revision = _config_payload(config_snapshot)
+        group_id = data.get('group_id')
+        if group_id not in ('virtual1', 'virtual2'):
+            return False, 'Unknown virtual switcher.'
+        if data.get('config_revision') != revision:
+            return False, 'Dashboard configuration changed; reload before aligning routes.'
+        group = _group(config, group_id)
+        channels = group.get('outputs')
+        if not isinstance(channels, list) or not channels:
+            return False, 'This virtual switcher has no assigned outputs.'
+        if any(type(channel) is not int or not 0 <= channel < 6 for channel in channels) or \
+                len(channels) != len(set(channels)):
+            return False, 'Virtual switcher has duplicate or unavailable output assignments.'
+        if getattr(mx.get('topology'), 'aux_outputs', None) != 6:
+            return False, 'Physical OUT routing is unavailable unless exactly six AUX channels are reported.'
+        target = data.get('input_source')
+        source = _entry(mx, 'input-properties', target) if _integer(target) else None
+        if source is None or getattr(source, 'available_aux', None) is not True:
+            return False, 'Alignment target is not directly routable to the assigned outputs.'
+        from atem_control.control.dashboard_ownership import project_routes
+        projection = project_routes(mx, config_snapshot, revision, state_fresh=True)
+        group_projection = projection['groups'][group_id]
+        if group_projection['routeStatus'] != 'mixed':
+            return False, 'Alignment is only available for a currently mixed virtual group.'
+        program_id = projection['capabilities'].get('programOutputSourceId')
+        if program_id is None or target == program_id:
+            return False, 'Alignment cannot target an unknown or Primary M/E Program feed.'
+        expected = data.get('expected_routes')
+        if not isinstance(expected, list) or len(expected) != len(channels):
+            return False, 'The reviewed per-output route snapshot is missing or incomplete.'
+        expected_by_channel = {}
+        for item in expected:
+            if not isinstance(item, dict) or type(item.get('channel')) is not int or \
+                    type(item.get('source')) is not int or item['channel'] in expected_by_channel:
+                return False, 'The reviewed per-output route snapshot is malformed.'
+            expected_by_channel[item['channel']] = item['source']
+        if set(expected_by_channel) != set(channels):
+            return False, 'The reviewed per-output route snapshot no longer matches group ownership.'
+        current_routes = {}
+        for channel in channels:
+            output = next((item for item in projection['outputs'] if item.get('auxIndex') == channel), None)
+            live = _source(mx, 'aux-output-source', channel)
+            if not output or output.get('owner') != group_id or output.get('routeStatus') != 'observed' or live is None:
+                return False, 'A group output is unavailable, stale, or ownership-conflicted.'
+            if expected_by_channel[channel] != live:
+                return False, f'OUT {channel + 1} changed after the alignment plan was reviewed.'
+            pending = _pending(connection, ('aux', channel), live)
+            if pending:
+                return False, pending
+            current_routes[channel] = live
+        outcomes = []
+        for channel in channels:
+            live = current_routes[channel]
+            if live == target:
+                outcomes.append({'channel': channel, 'ok': True, 'no_op': True, 'error': None})
+                continue
+            ok, error = dispatch(connection, 'set_aux_output', {
+                'aux_channel': channel, 'input_source': target})
+            if ok:
+                _record(connection, ('aux', channel), live, target)
+            outcomes.append({'channel': channel, 'ok': ok, 'no_op': False, 'error': error})
+        return True, {'group_id': group_id, 'target': target, 'revision': revision,
+                      'outcomes': outcomes}
+
+
 def review_unconfirmed(connection, kind, channel=0):
     """Explicit read-only reconciliation after timeout; never retries a write."""
     with _lock:
-        if kind not in ('me', 'aux', 'usk') or (kind in ('aux', 'usk') and not _integer(channel)):
+        if kind not in ('me', 'me_preview', 'style', 'aux', 'usk', 'dsk') or \
+                (kind in ('aux', 'usk', 'dsk') and not _integer(channel)):
             return False, 'Unknown dashboard switching operation.'
         mx, reason = _raw(connection)
         if reason:
             return False, reason
-        key = ('me', 0) if kind == 'me' else (kind, channel)
+        key = ('me', 0) if kind == 'me' else (kind, 0) if kind in ('me_preview', 'style') else (kind, channel)
         if kind == 'usk':
             live = _usk_on_air(mx, channel)
+        elif kind == 'dsk':
+            live = _dsk_on_air(mx, channel)
+        elif kind == 'me_preview':
+            live = _source(mx, 'preview-bus-input', 0)
+        elif kind == 'style':
+            settings = _entry(mx, 'transition-settings', 0)
+            live = getattr(settings, 'style', None)
         else:
             live = _source(mx, 'program-bus-input' if kind == 'me' else 'aux-output-source', key[1])
         if live is None:

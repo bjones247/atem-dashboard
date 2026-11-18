@@ -3,6 +3,38 @@ from django.db import models
 from django.utils import timezone
 
 
+def dashboard_device_defaults():
+    return {
+        'schemaVersion': 1,
+        'virtualSwitchers': {
+            'virtual1': {'outputs': [], 'previewSource': None, 'programTarget': None},
+            'virtual2': {'outputs': [], 'previewSource': None, 'programTarget': None},
+        },
+        'customNames': {'primary': None, 'virtual1': None, 'virtual2': None},
+        'minimumPrimaryDestinations': True,
+        'preferences': {},
+    }
+
+
+class DashboardDeviceConfig(models.Model):
+    """Persistent dashboard state keyed only by protocol WhoI device ID."""
+
+    hardware_id = models.CharField(max_length=128, unique=True)
+    identity_source = models.CharField(max_length=16, default='protocol')
+    last_ip = models.GenericIPAddressField(null=True, blank=True)
+    display_name = models.CharField(max_length=128, blank=True, default='')
+    model_name = models.CharField(max_length=128, blank=True, default='')
+    revision = models.PositiveBigIntegerField(default=1)
+    config = models.JSONField(default=dashboard_device_defaults)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Dashboard device configuration'
+
+    def __str__(self):
+        return f'{self.display_name or self.hardware_id} (r{self.revision})'
+
+
 class ATEMControlLog(models.Model):
     """Connect/disconnect audit trail. Drives the Connect page's
     "Recent ATEMs" quick-connect list. ``user`` is set when the host's ASGI

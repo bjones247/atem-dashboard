@@ -258,6 +258,105 @@ test('upstream keyers retain independent pending targets and reconcile separatel
   assert.equal(d.upstreamKeyers[0].statusText, 'ON AIR');
 });
 
+function projectedHardware(overrides = {}) {
+  const state = hardware({ program: 2, preview: 3 });
+  state.dashboardRouting = {
+    deviceId: 'a'.repeat(32),
+    revision: 4,
+    stateFresh: true,
+    capabilities: { outputMappingStatus: 'ready', outputMappingReason: null },
+    outputs: [
+      { outputId: 1, auxIndex: 0, displayName: 'OUT 1', owner: 'primary', observedRouteOwner: 'primary', routeStatus: 'observed', liveSourceId: 10010, conflicts: [] },
+      { outputId: 2, auxIndex: 1, displayName: 'OUT 2', owner: 'virtual1', routeStatus: 'observed', liveSourceId: 1, conflicts: [] },
+      { outputId: 3, auxIndex: 2, displayName: 'OUT 3', owner: 'other', routeStatus: 'observed', liveSourceId: 3, conflicts: [] },
+      { outputId: 4, auxIndex: 3, displayName: 'OUT 4', owner: 'unknown', routeStatus: 'stale', liveSourceId: null, lastObservedSourceId: 2, conflicts: [{ type: 'route_stale', reason: 'Route observation is stale' }] },
+      { outputId: 5, auxIndex: 4, displayName: 'OUT 5', owner: 'unresolved', routeStatus: 'observed', liveSourceId: 1, conflicts: [{ type: 'duplicate_ownership', reason: 'Ownership conflict' }] },
+      { outputId: 6, auxIndex: 5, displayName: 'OUT 6', owner: 'virtual1', routeStatus: 'observed', liveSourceId: 2, conflicts: [] },
+    ],
+    primaryOutputIds: [1],
+    groups: {
+      virtual1: { outputIds: [2, 6], outputs: [
+        { outputId: 2, liveSourceId: 1, lastObservedSourceId: null, routeStatus: 'observed' },
+        { outputId: 6, liveSourceId: 2, lastObservedSourceId: null, routeStatus: 'observed' },
+      ], previewSourceId: 3, previewSourceValid: true, savedProgramTargetId: 1, routeStatus: 'mixed', liveSourceId: null, programStatus: 'mixed' },
+      virtual2: { outputIds: [], outputs: [], previewSourceId: null, previewSourceValid: true, savedProgramTargetId: 3, routeStatus: 'empty', liveSourceId: null, programStatus: 'no_outputs' },
+    },
+    conflicts: [{ type: 'duplicate_ownership', group: 'virtual1', reason: 'Ownership conflict' }],
+    ...overrides,
+  };
+  return state;
+}
+
+test('Milestone 3B projection keeps hardware M/E state separate from saved virtual state', () => {
+  const { dashboard: d, sent } = controller();
+  d.updateState(projectedHardware());
+  assert.equal(d.hardwareProgramSourceId, 2);
+  assert.equal(d.hardwarePreviewSourceId, 3);
+  assert.deepEqual(d.primarySwitcherOutputs.map(output => output.displayName), ['OUT 1']);
+  const virtual = d.virtualSwitcherViews[0];
+  assert.deepEqual(virtual.outputs.map(output => output.displayName), ['OUT 2', 'OUT 6']);
+  assert.equal(virtual.group.previewSourceId, 3);
+  assert.equal(virtual.group.savedProgramTargetId, 1);
+  assert.equal(virtual.group.routeStatus, 'mixed');
+  assert.deepEqual(d.otherOutputViews.map(output => output.displayName), ['OUT 3', 'OUT 4', 'OUT 5']);
+  assert.equal(d.outputSourceId(d.otherOutputViews[1]), 2); // stale is labeled last-observed
+  assert.match(d.outputConflictText(d.otherOutputViews[2]), /Ownership conflict/);
+  assert.deepEqual(sent, [{ command: 'dashboard_config_get' }]);
+});
+
+test('Milestone 3B custom names use revision-checked software config only', () => {
+  const { dashboard: d, sent } = controller();
+  d.updateState(projectedHardware());
+  d.acceptDashboardConfig({
+    type: 'dashboard_config', deviceId: 'a'.repeat(32), revision: 4,
+    config: { schemaVersion: 1, customNames: { primary: null, virtual1: null, virtual2: 'Studio Feed' }, preferences: {}, virtualSwitchers: {}, minimumPrimaryDestinations: true },
+  });
+  assert.equal(d.virtualSwitcherViews[1].title, 'Studio Feed');
+  d.beginNameEdit('virtual1', 'Virtual Switcher 1');
+  d.nameDraft = 'Stage';
+  d.saveSwitcherName('virtual1');
+  assert.deepEqual(sent[1], {
+    command: 'dashboard_config_update', expected_revision: 4,
+    config: { schemaVersion: 1, customNames: { primary: null, virtual1: 'Stage', virtual2: 'Studio Feed' }, preferences: {}, virtualSwitchers: {}, minimumPrimaryDestinations: true },
+  });
+  assert.equal(sent.some(message => ['dashboard_cut_me', 'dashboard_cut_aux', 'set_aux_output', 'cut'].includes(message.command)), false);
+});
+
+test('Milestone 3B reloads device config when the observed projection revision advances', () => {
+  const { dashboard: d, sent } = controller();
+  d.updateState(projectedHardware());
+  d.acceptDashboardConfig({ type: 'dashboard_config', deviceId: 'a'.repeat(32), revision: 4,
+    config: { schemaVersion: 1, customNames: { primary: null, virtual1: null, virtual2: null } } });
+  const newer = projectedHardware();
+  newer.dashboardRouting.revision = 5;
+  d.updateState(newer);
+  assert.deepEqual(sent.map(message => message.command), ['dashboard_config_get', 'dashboard_config_get']);
+});
+
+test('Milestone 3B reports output topology mismatch without presenting routes as known', () => {
+  const { dashboard: d } = controller();
+  const state = projectedHardware({
+    capabilities: { outputMappingStatus: 'topology_mismatch', outputMappingReason: 'Expected six AUX channels; found four.' },
+    outputs: [{ outputId: 1, auxIndex: 0, displayName: 'OUT 1', owner: 'unresolved', routeStatus: 'topology_mismatch', liveSourceId: null, conflicts: [] }],
+    primaryOutputIds: [],
+  });
+  d.updateState(state);
+  assert.equal(d.outputMappingError, 'Expected six AUX channels; found four.');
+  assert.equal(d.primarySwitcherOutputs.length, 0);
+  assert.equal(d.outputSourceId(d.otherOutputViews[0]), null);
+  assert.match(d.outputStatus(d.otherOutputViews[0]), /topology mismatch/i);
+});
+
+test('Milestone 3B marks stale M/E state and hides it as current after disconnect', () => {
+  const { dashboard: d } = controller();
+  d.updateState(projectedHardware({ stateFresh: false }));
+  assert.equal(d.meObservationStale, true);
+  assert.equal(d.hardwareProgramSourceId, 2);
+  d.handleMessage({ type: 'connection_status', connected: false });
+  assert.equal(d.hardwareProgramSourceId, null);
+  assert.equal(d.hardwarePreviewSourceId, null);
+});
+
 test('keyer timeout acts on the current reconciled object and blocks repeat toggles', () => {
   const { dashboard: d, sent, timers } = controller();
   d.updateState(hardware());
@@ -281,4 +380,208 @@ test('unknown keyer state blocks a hardware toggle', () => {
   assert.match(d.keyerToggleReason(d.upstreamKeyers[0]), /not been observed/);
   d.toggleUSK(0);
   assert.equal(sent.length, 0);
+});
+
+function threeCProjection({ routes = [90010, 1, 2, 1, 2, 1], virtual1 = [], virtual2 = [] } = {}) {
+  const owners = routes.map((route, index) => route === 90010 ? 'primary' :
+    (virtual1.includes(index) ? 'virtual1' : virtual2.includes(index) ? 'virtual2' : 'other'));
+  const outputs = routes.map((liveSourceId, index) => ({
+    outputId: index + 1, auxIndex: index, displayName: `OUT ${index + 1}`,
+    liveSourceId, lastObservedSourceId: null, routeStatus: 'observed', owner: owners[index],
+    observedRouteOwner: liveSourceId === 90010 ? 'primary' : 'other', savedOwners: [],
+    available: true, conflicts: [],
+  }));
+  const group = (key, channels) => {
+    const live = channels.map(channel => routes[channel]);
+    const uniform = live.length > 0 && live.every(source => source === live[0]);
+    const cfg = { virtual1: { previewSource: 3, programTarget: 1 },
+      virtual2: { previewSource: 3, programTarget: 1 } }[key];
+    return {
+      outputIds: channels.map(channel => channel + 1), routeStatus: channels.length === 0 ? 'empty' : uniform ? 'uniform' : 'mixed',
+      liveSourceId: uniform ? live[0] : null, savedProgramTargetId: cfg.programTarget,
+      previewSourceId: cfg.previewSource, previewSourceValid: true, outputs: channels.map(channel => outputs[channel]),
+    };
+  };
+  return {
+    deviceId: 'a'.repeat(32), revision: 7, stateFresh: true,
+    capabilities: { outputMappingStatus: 'ready', outputMappingReason: '', programOutputSourceId: 90010 },
+    outputs, groups: { virtual1: group('virtual1', virtual1), virtual2: group('virtual2', virtual2) },
+    conflicts: [], programBackgroundSourceId: 1,
+  };
+}
+
+function configureThreeC(d, options = {}) {
+  const state = hardware({ program: 1, preview: 2, aux3: 2 });
+  state.mes[0].transition.position = 0;
+  state.mes[0].transition.style = 0;
+  state.dashboardRouting = threeCProjection(options);
+  d.updateState(state);
+  const config = {
+    schemaVersion: 1,
+    virtualSwitchers: {
+      virtual1: { outputs: options.virtual1 || [], previewSource: 3, programTarget: 1 },
+      virtual2: { outputs: options.virtual2 || [], previewSource: 3, programTarget: 1 },
+    },
+    customNames: { primary: null, virtual1: null, virtual2: null },
+    minimumPrimaryDestinations: true, preferences: {},
+  };
+  d.dashboardConfigDeviceId = 'a'.repeat(32);
+  d.dashboardConfig = { deviceId: 'a'.repeat(32), revision: 7, config };
+}
+
+test('3C Primary Preview and AUTO use guarded server commands; keyed AUTO needs explicit operator confirmation', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d);
+  sent.length = 0;
+  d.selectPrimaryPreview(3);
+  assert.deepEqual(sent[0], { command: 'dashboard_set_preview_me', me: 0, source: 3, expected_preview: 2 });
+  d.updateState(hardware({ program: 1, preview: 3, aux3: 2 }));
+  const safeState = hardware({ program: 1, preview: 3, aux3: 2 });
+  safeState.mes[0].transition.position = 0;
+  safeState.mes[0].transition.style = 0;
+  safeState.mes[0].transition.selection.key1 = true;
+  safeState.dashboardRouting = threeCProjection();
+  d.updateState(safeState);
+  d.primaryAuto();
+  assert.equal(d.keyedAutoConfirmOpen, true);
+  d.dispatchPrimaryAuto(true);
+  assert.equal(sent[1].command, 'dashboard_auto_me');
+  assert.equal(sent[1].allow_keyed, true);
+  assert.deepEqual(sent[1].expected_selection, { background: true, key1: true, key2: false, key3: false, key4: false });
+});
+
+test('3C Preview is saved in revisioned configuration without a routing command', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d);
+  sent.length = 0;
+  d.setVirtualPreview('virtual1', 2);
+  assert.deepEqual(sent[0], {
+    command: 'dashboard_config_update', expected_revision: 7,
+    config: { ...d.dashboardConfig.config,
+      virtualSwitchers: { ...d.dashboardConfig.config.virtualSwitchers,
+        virtual1: { outputs: [], previewSource: 2, programTarget: 1 } } },
+  });
+  assert.equal(sent.some(item => item.command === 'set_aux_output' || item.command === 'dashboard_cut_aux'), false);
+});
+
+test('3C virtual output assignment waits for observed route before revisioned ownership save', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d, { routes: [90010, 1, 2, 1, 2, 1], virtual1: [1] });
+  sent.length = 0;
+  d.openAssignmentDialog('virtual1');
+  d.assignmentSelection['3'] = true;
+  d.applyAssignmentChanges();
+  assert.equal(sent[0].command, 'dashboard_output_route');
+  assert.equal(sent[0].output_id, 3);
+  assert.equal(sent[0].input_source, 1);
+  d.handleMessage({ type: 'dashboard_output_route_accepted', output_id: 3, input_source: 1 });
+  assert.equal(sent.some(item => item.command === 'dashboard_config_update'), false);
+  const next = hardware({ program: 1, preview: 2, aux3: 1 });
+  next.dashboardRouting = threeCProjection({ routes: [90010, 1, 1, 1, 2, 1], virtual1: [1] });
+  d.updateState(next);
+  assert.equal(sent[1].command, 'dashboard_config_update');
+  assert.ok(sent[1].config.virtualSwitchers.virtual1.outputs.includes(2));
+});
+
+test('3C Primary release routes only the selected destination to current M/E background', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d, { routes: [90010, 90010, 2, 1, 2, 1] });
+  sent.length = 0;
+  d.openAssignmentDialog('primary');
+  d.assignmentSelection['2'] = false;
+  assert.match(d.stagedAssignmentDescription(d.projectedOutputs[1]), /Release to IN1 \(background only; key overlays removed\)/);
+  d.applyAssignmentChanges();
+  assert.equal(sent[0].command, 'dashboard_output_route');
+  assert.equal(sent[0].mode, 'primary_release');
+  assert.equal(sent[0].output_id, 2);
+  assert.equal(sent[0].input_source, 1);
+  const confirmed = hardware({ program: 1, preview: 2, aux3: 2 });
+  confirmed.auxOutputs.aux2 = 1;
+  confirmed.dashboardRouting = threeCProjection({ routes: [90010, 1, 2, 1, 2, 1] });
+  d.updateState(confirmed);
+  assert.equal(d.routeOperations['2'], undefined);
+  assert.equal(d.routeBatch, null);
+});
+
+test('3C group CUT confirms each physical route before swapping saved target/Preview', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d, { routes: [90010, 1, 1, 1, 2, 1], virtual1: [1, 2] });
+  sent.length = 0;
+  d.cutVirtualGroup('virtual1');
+  assert.equal(sent[0].command, 'dashboard_cut_virtual_group');
+  d.handleMessage({ type: 'dashboard_group_cut_started', group_id: 'virtual1', target: 3, previous: 1,
+    outcomes: [{ channel: 1, ok: true }, { channel: 2, ok: true }] });
+  assert.equal(sent.some(item => item.command === 'dashboard_config_update'), false);
+  const confirmed = hardware({ program: 1, preview: 2, aux3: 3 });
+  confirmed.dashboardRouting = threeCProjection({ routes: [90010, 3, 3, 1, 2, 1], virtual1: [1, 2] });
+  d.updateState(confirmed);
+  const save = sent.find(item => item.command === 'dashboard_config_update');
+  assert.ok(save);
+  assert.equal(save.config.virtualSwitchers.virtual1.programTarget, 3);
+  assert.equal(save.config.virtualSwitchers.virtual1.previewSource, 1);
+});
+
+test('3C late route confirmation reconciles after disconnect without retrying', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d);
+  sent.length = 0;
+  d.routeOtherOutput(d.projectedOutputs[2], 3);
+  assert.equal(sent[0].command, 'dashboard_output_route');
+  d.handleMessage({ type: 'connection_status', connected: false });
+  assert.equal(d.routeOperations['3'].status, 'unconfirmed');
+  const state = hardware({ program: 1, preview: 2, aux3: 3 });
+  state.dashboardRouting = threeCProjection({ routes: [90010, 1, 3, 1, 2, 1] });
+  d.updateState(state);
+  assert.equal(d.routeOperations['3'], undefined);
+  assert.equal(sent.length, 1);
+});
+
+test('3C timed-out route can be reviewed read-only and cleared when hardware stayed unchanged', () => {
+  const { dashboard: d, sent, timers } = controller();
+  configureThreeC(d);
+  sent.length = 0;
+  d.routeOtherOutput(d.projectedOutputs[2], 3);
+  const routeTimer = d.routeOperations['3'].timer;
+  timers.get(routeTimer)();
+  assert.equal(d.routeOperations['3'].status, 'unconfirmed');
+  d.reviewOutputOperation(3);
+  assert.deepEqual(sent[1], { command: 'dashboard_review_aux', aux_channel: 2 });
+  d.handleMessage({ type: 'dashboard_reviewed', kind: 'aux', aux_channel: 2 });
+  const state = hardware({ program: 1, preview: 2, aux3: 2 });
+  state.dashboardRouting = threeCProjection();
+  d.updateState(state);
+  assert.equal(d.routeOperations['3'], undefined);
+  assert.equal(sent.length, 2);
+});
+
+test('3C mixed routing requires explicit alignment review and saves target only after every route confirms', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d, { routes: [90010, 1, 2, 1, 2, 1], virtual1: [1, 2] });
+  sent.length = 0;
+  assert.equal(d.groupAlignReason('virtual1'), '');
+  d.beginVirtualGroupAlign('virtual1');
+  assert.equal(JSON.stringify(d.groupAlignDraft.expectedRoutes), JSON.stringify([{ channel: 1, source: 1 }, { channel: 2, source: 2 }]));
+  d.confirmVirtualGroupAlign();
+  assert.equal(sent[0].command, 'dashboard_align_virtual_group');
+  assert.equal(sent[0].input_source, 1);
+  d.handleMessage({ type: 'dashboard_group_align_started', group_id: 'virtual1', target: 1,
+    outcomes: [{ channel: 1, ok: true, no_op: true }, { channel: 2, ok: true, no_op: false }] });
+  assert.equal(sent.some(item => item.command === 'dashboard_config_update'), false);
+  const confirmed = hardware({ program: 1, preview: 2, aux3: 2 });
+  confirmed.dashboardRouting = threeCProjection({ routes: [90010, 1, 1, 1, 2, 1], virtual1: [1, 2] });
+  d.updateState(confirmed);
+  assert.equal(sent.find(item => item.command === 'dashboard_config_update').config.virtualSwitchers.virtual1.programTarget, 1);
+});
+
+test('3C a competing configuration broadcast is not mistaken for this session save', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d);
+  sent.length = 0;
+  d.setVirtualPreview('virtual1', 2);
+  const competing = JSON.parse(JSON.stringify(sent[0].config));
+  competing.customNames.primary = 'Other Session';
+  d.handleMessage({ type: 'dashboard_config_changed', deviceId: 'a'.repeat(32), revision: 8, config: competing });
+  assert.match(d.dashboardConfigError, /Another dashboard session/);
+  assert.equal(d.assignmentBusy, false);
+  assert.equal(d.configSavePurpose, null);
 });

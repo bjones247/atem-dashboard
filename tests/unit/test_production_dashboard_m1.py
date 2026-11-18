@@ -36,8 +36,8 @@ def test_dashboard_endpoint_renders_ok(client):
 
 
 @pytest.mark.django_db
-def test_dashboard_template_contains_three_panels_and_cut_controls(client):
-    """Template contains the 3 physical output panels and required CUT controls."""
+def test_dashboard_template_contains_read_only_three_switcher_layout(client):
+    """Milestone 3B renders three logical switcher cards and Other Outputs."""
     response = client.get('/atem/dashboard/', {'ip': '192.168.1.114'})
     content = response.content.decode('utf-8')
 
@@ -45,21 +45,22 @@ def test_dashboard_template_contains_three_panels_and_cut_controls(client):
     assert 'Production Dashboard' in content
     assert 'Full Switcher' in content
 
-    # Check for panel loop and output number binding
-    assert 'x-for="panel in panels"' in content
-    assert "'OUT ' + panel.outNumber" in content
+    # Hardware M/E and two virtual switchers are separate from output cards.
+    assert 'HARDWARE M/E' in content
+    assert 'Observed M/E Program' in content
+    assert 'Observed M/E Preview' in content
+    assert 'x-for="view in virtualSwitcherViews"' in content
+    assert 'Saved Preview' in content
+    assert 'Saved Program target' in content
+    assert 'Other Outputs' in content
+    assert 'output.displayName' in content
+    assert 'output.owner' in content
 
-    # Check for Preview and Program rows
-    assert 'Preview (Next)' in content
-    assert 'Program (Live)' in content
-
-    # Check for Upstream Keyers sections (primary M/E panel + fallback)
-    assert 'Upstream Keyers' in content
-
-    # Check that individual CUT controls exist and Master CUT is guarded/disabled in M2
-    assert '@click="cut(panel)"' in content
-    assert 'CUT ALL OUTPUTS' in content
-    assert 'Milestone 3' in content
+    # No switching, assignment, keyer, or TAKE ALL affordance is present in 3B.
+    assert '@click="cut(panel)"' not in content
+    assert 'CUT ALL OUTPUTS' not in content
+    assert 'Upstream Keyers' not in content
+    assert 'Change Outputs' not in content
 
 
 @pytest.mark.django_db
@@ -240,5 +241,12 @@ def test_aux_preview_and_master_cut_safety_in_js():
     sanctioned = {'connect', 'refresh', 'cut', 'set_aux_output', 'set_preview', 'set_program',
                   'toggle_usk', 'dashboard_cut_me', 'dashboard_cut_aux',
                   'dashboard_review_me', 'dashboard_review_aux',
-                  'dashboard_toggle_usk', 'dashboard_review_usk'}
+                  'dashboard_toggle_usk', 'dashboard_review_usk',
+                  'dashboard_toggle_dsk', 'dashboard_review_dsk',
+                  'dashboard_config_get', 'dashboard_config_update',
+                  'dashboard_set_preview_me', 'dashboard_set_program_me',
+                  'dashboard_auto_me', 'dashboard_set_transition_style',
+                  'dashboard_output_route', 'dashboard_cut_virtual_group',
+                  'dashboard_align_virtual_group', 'dashboard_review_me_preview',
+                  'dashboard_review_style'}
     assert set(sent_commands).issubset(sanctioned)

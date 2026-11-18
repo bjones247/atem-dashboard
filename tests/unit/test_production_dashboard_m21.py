@@ -16,6 +16,7 @@ import pytest
 from atem_control.control import dashboard_switching as switching
 from atem_control.control.commands import dispatch as dispatch_command
 from atem_control.control.consumer import ATEMConsumer
+from atem_control.models import dashboard_device_defaults
 
 
 class FakeConnection:
@@ -86,6 +87,139 @@ def test_me_cut_uses_observed_rest_state_not_residual_frame_counter(monkeypatch)
     assert sent == ['cut']
 
 
+def _three_c_connection(routes=None):
+    c = FakeConnection()
+    c.mixerstate['topology'] = NS(aux_outputs=6, downstream_keyers=2, dves=1, stingers=1)
+    c.mixerstate['transition-settings'][0].style = 0
+    c.mixerstate['input-properties'].update({
+        90010: NS(name='M/E 1 Program', short_name='PGM', port_type=128,
+                  available_aux=True, available_me1=False),
+        90011: NS(name='M/E 1 Preview', short_name='PVW', port_type=128,
+                  available_aux=True, available_me1=False),
+    })
+    c.mixerstate['aux-output-source'] = {
+        channel: NS(source=source) for channel, source in (routes or {
+            0: 90010, 1: 1, 2: 2, 3: 1, 4: 2, 5: 1,
+        }).items()
+    }
+    return c
+
+
+def _three_c_config(**groups):
+    config = dashboard_device_defaults()
+    for group_id, value in groups.items():
+        config['virtualSwitchers'][group_id].update(value)
+    return {'deviceId': 'a' * 32, 'revision': 7, 'config': config}
+
+
+def test_guarded_me_preview_direct_program_and_transition_style(monkeypatch):
+    c = _three_c_connection()
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda _c, command, data: sent.append((command, data)) or (True, None))
+    assert switching.dispatch_me_preview(c, {'me': 0, 'source': 3, 'expected_preview': 2}) == (True, None)
+    assert sent[-1] == ('set_preview', {'source': 3, 'me': 0})
+    assert 'awaiting' in switching.dispatch_me_preview(c, {'me': 0, 'source': 1, 'expected_preview': 2})[1]
+    c.mixerstate['preview-bus-input'][0].source = 3
+    assert switching.dispatch_me_program(c, {'me': 0, 'source': 2, 'expected_program': 1}) == (True, None)
+    assert sent[-1] == ('set_program', {'source': 2, 'me': 0})
+    assert 'awaiting' in switching.dispatch_me_program(c, {'me': 0, 'source': 3, 'expected_program': 1})[1]
+
+    # Clear the simulated in-process M/E operation as if state confirmed it.
+    c.mixerstate['program-bus-input'][0].source = 2
+    assert switching.dispatch_me_transition_style(c, {'me': 0, 'style': 2}) == (True, None)
+    assert sent[-1] == ('set_transition_style', {'style': 2, 'me': 0})
+    assert 'awaiting' in switching.dispatch_me_transition_style(c, {'me': 0, 'style': 2})[1]
+
+
+def test_keyed_auto_requires_explicit_intent_and_does_not_change_ties(monkeypatch):
+    c = _three_c_connection()
+    c.mixerstate['transition-settings'][0].next_transition_key2 = True
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda _c, command, data: sent.append((command, data)) or (True, None))
+    payload = {'me': 0, 'expected_program': 1, 'expected_preview': 2,
+               'expected_selection': {'background': True, 'key1': False, 'key2': True,
+                                      'key3': False, 'key4': False}}
+    assert 'explicit confirmation' in switching.dispatch_me_auto(c, payload)[1]
+    assert switching.dispatch_me_auto(c, {**payload, 'allow_keyed': True}) == (True, None)
+    assert sent == [('auto', {'me': 0})]
+    assert c.mixerstate['transition-settings'][0].next_transition_key2 is True
+
+
+def test_physical_output_route_checks_installation_topology_ownership_and_expected_route(monkeypatch):
+    c = _three_c_connection()
+    config = _three_c_config(virtual1={'outputs': [1], 'previewSource': 2, 'programTarget': 1})
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda _c, command, data: sent.append((command, data)) or (True, None))
+    request = {'config_revision': 7, 'output_id': 3, 'mode': 'virtual_assign', 'group_id': 'virtual1',
+               'expected_live': 2, 'input_source': 1}
+    assert switching.dispatch_output_route(c, request, config)[0]
+    assert sent == [('set_aux_output', {'aux_channel': 2, 'input_source': 1})]
+    assert 'awaiting' in switching.dispatch_output_route(c, request, config)[1]
+
+    c.mixerstate['topology'].aux_outputs = 5
+    assert 'exactly six' in switching.dispatch_output_route(c, {**request, 'output_id': 4,
+        'expected_live': 1}, config)[1]
+
+
+def test_primary_output_release_routes_to_current_background_and_protects_last_destination(monkeypatch):
+    c = _three_c_connection(routes={0: 90010, 1: 90010, 2: 2, 3: 1, 4: 2, 5: 1})
+    config = _three_c_config()
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda _c, command, data: sent.append((command, data)) or (True, None))
+    request = {'config_revision': 7, 'output_id': 1, 'mode': 'primary_release',
+               'expected_live': 90010, 'input_source': 1}
+    assert switching.dispatch_output_route(c, request, config)[0]
+    assert sent == [('set_aux_output', {'aux_channel': 0, 'input_source': 1})]
+    c.mixerstate['aux-output-source'][0].source = 1
+    assert 'final Primary' in switching.dispatch_output_route(c, {**request, 'output_id': 2}, config)[1]
+
+
+def test_virtual_group_cut_preflights_all_routes_then_dispatches_independently(monkeypatch):
+    c = _three_c_connection(routes={0: 90010, 1: 1, 2: 1, 3: 2, 4: 2, 5: 2})
+    config = _three_c_config(virtual1={'outputs': [1, 2], 'previewSource': 2, 'programTarget': 1})
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda _c, command, data: sent.append((command, data)) or (True, None))
+    payload = {'config_revision': 7, 'group_id': 'virtual1', 'input_source': 2}
+    ok, result = switching.dispatch_virtual_group_cut(c, payload, config)
+    assert ok
+    assert result['previous'] == 1 and result['target'] == 2
+    assert [item['ok'] for item in result['outcomes']] == [True, True]
+    assert [data['aux_channel'] for _command, data in sent] == [1, 2]
+    assert 'awaiting' in switching.dispatch_virtual_group_cut(c, payload, config)[1]
+
+
+def test_mixed_virtual_group_alignment_requires_reviewed_routes_and_dispatches_per_output(monkeypatch):
+    c = _three_c_connection(routes={0: 90010, 1: 1, 2: 2, 3: 1, 4: 2, 5: 1})
+    config = _three_c_config(virtual1={'outputs': [1, 2], 'previewSource': 3, 'programTarget': 1})
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda _c, command, data: sent.append((command, data)) or (True, None))
+    payload = {'config_revision': 7, 'group_id': 'virtual1', 'input_source': 1,
+               'expected_routes': [{'channel': 1, 'source': 1}, {'channel': 2, 'source': 2}]}
+    ok, result = switching.dispatch_virtual_group_align(c, payload, config)
+    assert ok
+    assert result['outcomes'] == [
+        {'channel': 1, 'ok': True, 'no_op': True, 'error': None},
+        {'channel': 2, 'ok': True, 'no_op': False, 'error': None},
+    ]
+    assert sent == [('set_aux_output', {'aux_channel': 2, 'input_source': 1})]
+
+    c2 = _three_c_connection(routes={0: 90010, 1: 1, 2: 2, 3: 1, 4: 2, 5: 1})
+    changed = {**payload, 'expected_routes': [{'channel': 1, 'source': 3}, {'channel': 2, 'source': 2}]}
+    assert 'changed after' in switching.dispatch_virtual_group_align(c2, changed, config)[1]
+
+
+def test_virtual_assignment_cannot_claim_primary_me_program_feed(monkeypatch):
+    c = _three_c_connection(routes={0: 90010, 1: 1, 2: 2, 3: 1, 4: 2, 5: 1})
+    config = _three_c_config()
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda *args: sent.append(args) or (True, None))
+    request = {'config_revision': 7, 'output_id': 2, 'mode': 'virtual_assign', 'group_id': 'virtual1',
+               'expected_live': 1, 'input_source': 90010}
+    ok, error = switching.dispatch_output_route(c, request, config)
+    assert not ok and 'cannot claim the M/E Program feed' in error
+    assert sent == []
+
+
 def test_usk_toggle_is_key_specific_requires_raw_state_and_confirms_independently(monkeypatch):
     c = FakeConnection()
     sent = []
@@ -106,6 +240,68 @@ def test_usk_toggle_is_key_specific_requires_raw_state_and_confirms_independentl
     c.mixerstate['key-on-air'][0].pop(1)
     assert 'not been observed' in switching.dispatch_usk_toggle(
         c, {'me': 0, 'key_index': 1, 'expected_on_air': False, 'target_on_air': True})[1]
+
+
+def test_dsk_toggle_uses_discovered_state_and_requires_stable_keyer(monkeypatch):
+    c = FakeConnection()
+    c.mixerstate['topology'].downstream_keyers = 2
+    c.mixerstate['dkey-state'] = {
+        0: NS(on_air=False, is_transitioning=False, is_autotransitioning=False),
+        1: NS(on_air=False, is_transitioning=False, is_autotransitioning=False),
+    }
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda *args: sent.append(args[1:3]) or (True, None))
+    on = {'dsk': 0, 'expected_on_air': False, 'target_on_air': True}
+
+    assert switching.dispatch_dsk_toggle(c, on) == (True, None)
+    assert sent == [('set_dsk_on_air', {'dsk': 0, 'enabled': True})]
+    assert 'awaiting' in switching.dispatch_dsk_toggle(c, on)[1]
+    c.mixerstate['dkey-state'][0].on_air = True
+    assert switching.dsk_toggle_readiness(c, 0) == (None, True)
+    off = {'dsk': 0, 'expected_on_air': True, 'target_on_air': False}
+    assert switching.dispatch_dsk_toggle(c, off) == (True, None)
+    assert sent[-1] == ('set_dsk_on_air', {'dsk': 0, 'enabled': False})
+
+    c.mixerstate['dkey-state'][0].is_transitioning = True
+    assert 'transitioning' in switching.dispatch_dsk_toggle(
+        c, {'dsk': 0, 'expected_on_air': False, 'target_on_air': True})[1]
+    assert len(sent) == 2
+
+
+def test_consumer_uses_guarded_dsk_dispatch(monkeypatch):
+    c = FakeConnection()
+    c.mixerstate['topology'].downstream_keyers = 1
+    c.mixerstate['dkey-state'] = {
+        0: NS(on_air=False, is_transitioning=False, is_autotransitioning=False),
+    }
+    calls = []
+    monkeypatch.setattr(switching, 'dispatch', lambda *args: calls.append(args[1]) or (True, None))
+    consumer = ATEMConsumer.__new__(ATEMConsumer)
+    consumer.connection = c
+    consumer.sent = []
+    consumer._record_atem_command = lambda *args: None
+
+    async def send_json(data):
+        consumer.sent.append(data)
+
+    consumer.send_json = send_json
+    payload = {'dsk': 0, 'expected_on_air': False, 'target_on_air': True}
+    asyncio.run(consumer.execute_command('dashboard_toggle_dsk', payload))
+    asyncio.run(consumer.execute_command('dashboard_toggle_dsk', payload))
+    assert calls == ['set_dsk_on_air']
+    assert 'awaiting' in consumer.sent[-1]['message']
+    assert consumer.sent[-1]['dsk'] == 0
+
+
+def test_dsk_toggle_uses_existing_atemwire_absolute_command_packet():
+    c = FakeConnection()
+    sent = []
+    c.send = sent.append
+
+    assert dispatch_command(c, 'set_dsk_on_air', {'dsk': 1, 'enabled': False}) == (True, None)
+    assert len(sent) == 1
+    assert type(sent[0]).__name__ == 'DkeyOnairCommand'
+    assert (sent[0].index, sent[0].on_air) == (1, False)
 
 
 def test_usk_snapshot_and_uncertain_review_use_observed_key_state(monkeypatch):
@@ -296,12 +492,9 @@ def test_alpine_keyer_button_dom_with_offline_browser(tmp_path):
 @pytest.mark.django_db
 def test_rendered_dashboard_keeps_live_program_visible_and_cut_reasons(client):
     html = client.get('/atem/dashboard/').content.decode('utf-8')
-    assert '.production-dashboard .btn.source-btn.btn-pgm-active:disabled' in html
-    assert "'btn-pgm-active': hardwareReady && panel.onAirSourceId === src.source" in html
-    assert 'Live source outside grid:' in html
-    assert ':disabled="!!meCutReason"' in html
-    assert ':disabled="!!auxCutReason(panel)"' in html
-    assert 'x-text="meCutReason"' in html
-    assert 'x-text="auxCutReason(panel)"' in html
-    assert 'CUT ALL OUTPUTS' in html and 'disabled' in html
-    assert ':aria-disabled="!hardwareReady || !!k.disabledReason"' in html
+    assert 'Observed M/E Program' in html
+    assert 'Observed M/E Preview' in html
+    assert 'outputSourceId(output)' in html
+    assert 'outputStatus(output)' in html
+    assert 'MIXED ROUTING' in html
+    assert 'CUT ALL OUTPUTS' not in html

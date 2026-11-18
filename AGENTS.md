@@ -1,6 +1,6 @@
 # ATEM Dashboard — AI Agent Instructions
 
-This repository extends **WebATEM 2.6.0** with a production dashboard for a Blackmagic **ATEM 1 M/E Constellation 4K**. The approved target design is **Primary Switcher**, **Virtual Switcher 1**, and **Virtual Switcher 2** with dynamically assigned physical outputs, plus Other Outputs. The current code still uses three physical OUT 1–3 panels; see the blueprint and ADR before changing it. Incorrect writes can change video on real displays. Prioritize truthful hardware state, conservative writes, regression protection, and explicit operator approval for live-hardware testing.
+This repository extends **WebATEM 2.6.0** with a production dashboard for a Blackmagic **ATEM 1 M/E Constellation 4K**. The dashboard presents **Primary Switcher**, **Virtual Switcher 1**, and **Virtual Switcher 2**, plus Other Outputs. Milestone 3C assignment and individual switching controls are implemented and offline-tested; physical hardware rehearsal remains separate and requires explicit operator approval. Incorrect writes can change video on real displays. Prioritize truthful hardware state, conservative writes, and regression protection.
 
 ## Start every task here
 
@@ -35,6 +35,6 @@ This repository extends **WebATEM 2.6.0** with a production dashboard for a Blac
 
 ## Current task priority
 
-**Milestone 2.1 hardware-validation remediation is awaiting review.** The operator confirmed individual AUX switching on the physical ATEM, then found a blocked M/E CUT and a USK toggle that stayed disabled after activation. Focused corrections now use raw-state, fail-closed M/E CUT preflight without treating a residual frame count as an active transition, and independently reconcile keyer targets against raw on-air observations. These corrections have offline tests and still require a separately authorized controlled hardware retest. Milestone 3 implementation and TAKE ALL remain paused. See `docs/AI_PROJECT_HANDOFF.md`.
+**Current checkpoint: Milestone 3C implementation is ready for review.** It adds explicit output assignment/release, virtual group CUT and mixed-route alignment, Other Outputs routing, and guarded Primary/virtual controls. Do not implement TAKE ALL; that remains 3D and requires separate authorization. Physical validation of any routing or switching command requires explicit operator approval and isolated destinations. The configured deployment is single-worker; do not deploy multiple workers until shared notification and hardware-operation coordination are implemented. The fixed installation convention maps protocol AUX indices 0–5 to OUT 1–6 only when exactly six AUX channels are reported. Keep AUX IDs internal and show physical OUT labels. See `docs/AI_PROJECT_HANDOFF.md` and the Blueprint.
 
 Do not infer that automated tests or hardware validation succeeded merely because a prior assistant reported a passing suite. Verify relevant claims where feasible, and clearly distinguish tests from physical hardware observations.

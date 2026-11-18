@@ -1,6 +1,8 @@
 /**
- * production_dashboard.js — Production Dashboard (3-Output) Client Controller
- * Milestone 2: Individual Output Switching and Upstream Keyer Control.
+ * Production Dashboard client controller.
+ * Milestones 2/2.1 switching behavior is retained for regression compatibility;
+ * the Milestone 3B dashboard view is read-only; 3C controls use guarded
+ * dashboard commands and observed-state confirmation.
  *
  * Core capabilities:
  * 1. Independent AUX Preview (software-only until CUT).
@@ -26,6 +28,7 @@ document.addEventListener('alpine:init', () => {
         // Feedback / Alerts
         actionError: '',
         actionNotice: '',
+        outputMappingError: '',
         actionNoticeTimer: null,
 
         // Authoritative ATEM state
@@ -33,6 +36,40 @@ document.addEventListener('alpine:init', () => {
         sources: [],
         auxOutputs: {},
         mes: [],
+
+        // Milestone 3B read-only view and per-device custom switcher names.
+        dashboardConfig: null,
+        dashboardConfigDeviceId: null,
+        dashboardConfigRequestedDeviceId: null,
+        dashboardConfigRequestedRevision: null,
+        dashboardConfigSaving: false,
+        dashboardConfigError: '',
+        dashboardConfigSaveTimer: null,
+        configSaveExpected: null,
+        nameEditingKey: null,
+        nameDraft: '',
+
+        // Milestone 3C operation state. Command acceptance is never treated
+        // as hardware confirmation.
+        previewPending: false,
+        previewPendingTarget: null,
+        previewPendingTimer: null,
+        previewUnconfirmed: false,
+        stylePending: false,
+        stylePendingTarget: null,
+        stylePendingTimer: null,
+        styleUnconfirmed: false,
+        routeOperations: {},
+        routeBatch: null,
+        assignmentDialogOpen: false,
+        assignmentOwner: null,
+        assignmentSelection: {},
+        assignmentBusy: false,
+        groupCutOperations: {},
+        groupAlignOperations: {},
+        groupAlignDraft: null,
+        keyedAutoConfirmOpen: false,
+        configSavePurpose: null,
 
         // Discovered M/E program source ID and multi-output status
         me1ProgramSourceId: null,
@@ -100,6 +137,7 @@ document.addEventListener('alpine:init', () => {
 
         // Discovered Upstream Keyers on M/E 1
         upstreamKeyers: [],
+        downstreamKeyers: [],
 
         // Settings / Display preferences
         labelStyle: 'both',
@@ -188,6 +226,10 @@ document.addEventListener('alpine:init', () => {
                 this.upstreamKeyers.forEach(k => {
                     if (k.pending) this.markKeyerUnconfirmed(k);
                 });
+                this.downstreamKeyers.forEach(k => {
+                    if (k.pending) this.markKeyerUnconfirmed(k);
+                });
+                this.markThreeCOperationsUnconfirmed('Connection closed before the result was confirmed.');
                 this.scheduleReconnect();
             };
 
@@ -232,6 +274,7 @@ document.addEventListener('alpine:init', () => {
                     } else {
                         this.connected = false;
                         this.state = null;
+                        this.outputMappingError = '';
                         this.statusMessage = data.message || 'Connection failed.';
                         this.panels.forEach(p => {
                             if (p.pending) this.markUnconfirmed(p);
@@ -240,11 +283,80 @@ document.addEventListener('alpine:init', () => {
                         this.upstreamKeyers.forEach(k => {
                             if (k.pending) this.markKeyerUnconfirmed(k);
                         });
+                        this.downstreamKeyers.forEach(k => {
+                            if (k.pending) this.markKeyerUnconfirmed(k);
+                        });
+                        this.markThreeCOperationsUnconfirmed('Connection closed before the result was confirmed.');
                     }
                     break;
 
                 case 'error':
                     this.showError(data.message || 'ATEM command rejected');
+                    if (data.command === 'dashboard_config_update') {
+                        if (this.dashboardConfigSaveTimer !== null) clearTimeout(this.dashboardConfigSaveTimer);
+                        this.dashboardConfigSaveTimer = null;
+                        this.dashboardConfigSaving = false;
+                        this.dashboardConfigError = data.message || 'Configuration update failed.';
+                        if (this.routeBatch?.savingConfig) {
+                            this.routeBatch.savingConfig = false;
+                            this.routeBatch.error = data.message || 'Ownership configuration was not saved.';
+                            this.assignmentBusy = false;
+                            this.routeBatch = null;
+                        }
+                        if (typeof this.configSavePurpose === 'string' && this.configSavePurpose.startsWith('group-cut:')) {
+                            const groupId = this.configSavePurpose.split(':')[1];
+                            const operation = this.groupCutOperations[groupId];
+                            if (operation) {
+                                operation.status = 'confirmed_config_failed';
+                                operation.error = 'Hardware routes changed, but the saved Preview/Program state was not updated.';
+                            }
+                        } else if (typeof this.configSavePurpose === 'string' && this.configSavePurpose.startsWith('group-align:')) {
+                            const groupId = this.configSavePurpose.split(':')[1];
+                            const operation = this.groupAlignOperations[groupId];
+                            if (operation) {
+                                operation.status = 'confirmed_config_failed';
+                                operation.error = 'Hardware routes changed, but the saved Program target was not updated.';
+                            }
+                        }
+                        this.configSavePurpose = null;
+                        this.configSaveExpected = null;
+                        this.dashboardConfigRequestedDeviceId = null;
+                        this.dashboardConfigRequestedRevision = null;
+                    }
+                    if (data.command === 'dashboard_output_route' && Number.isInteger(data.output_id)) {
+                        this.failRouteOperation(data.output_id, data.message || 'Output route failed.');
+                    }
+                    if (data.command === 'dashboard_cut_virtual_group' && data.group_id) {
+                        const operation = this.groupCutOperations[data.group_id];
+                        if (operation) {
+                            operation.status = 'blocked';
+                            operation.error = data.message || 'Group CUT was blocked.';
+                        }
+                    }
+                    if (data.command === 'dashboard_align_virtual_group' && data.group_id) {
+                        const operation = this.groupAlignOperations[data.group_id];
+                        if (operation) {
+                            operation.status = 'blocked';
+                            operation.error = data.message || 'Mixed-route alignment was blocked.';
+                        }
+                    }
+                    if (data.command === 'dashboard_set_preview_me') {
+                        this.previewPending = false;
+                        this.previewUnconfirmed = false;
+                        if (this.previewPendingTimer !== null) clearTimeout(this.previewPendingTimer);
+                        this.previewPendingTimer = null;
+                    }
+                    if (['dashboard_cut_me', 'dashboard_auto_me', 'dashboard_set_program_me'].includes(data.command)) {
+                        this.primaryActionPending = null;
+                        if (this.primaryActionTimer !== null) clearTimeout(this.primaryActionTimer);
+                        this.primaryActionTimer = null;
+                    }
+                    if (data.command === 'dashboard_set_transition_style') {
+                        this.stylePending = false;
+                        this.styleUnconfirmed = false;
+                        if (this.stylePendingTimer !== null) clearTimeout(this.stylePendingTimer);
+                        this.stylePendingTimer = null;
+                    }
                     this.panels.forEach(p => {
                         const affectsPending = !data.command ||
                             (data.command === 'dashboard_cut_me' && p.isME) ||
@@ -255,6 +367,11 @@ document.addEventListener('alpine:init', () => {
                     this.upstreamKeyers.forEach(k => {
                         const affectsPending = !data.command ||
                             (data.command === 'dashboard_toggle_usk' && k.keyIndex === data.key_index);
+                        if (k.pending && affectsPending) this.markKeyerUnconfirmed(k);
+                    });
+                    this.downstreamKeyers.forEach(k => {
+                        const affectsPending = !data.command ||
+                            (data.command === 'dashboard_toggle_dsk' && k.keyIndex === data.dsk);
                         if (k.pending && affectsPending) this.markKeyerUnconfirmed(k);
                     });
                     break;
@@ -274,6 +391,44 @@ document.addEventListener('alpine:init', () => {
                             keyer.disabledReason = '';
                         }
                     }
+                    if (data.kind === 'dsk') {
+                        const keyer = this.downstreamKeyers.find(k => k.keyIndex === data.dsk);
+                        if (keyer) {
+                            keyer.unconfirmed = false;
+                            keyer.pendingTarget = null;
+                            keyer.disabledReason = '';
+                        }
+                    }
+                    if (data.kind === 'me') {
+                        this.primaryActionPending = null;
+                        if (this.primaryActionTimer !== null) clearTimeout(this.primaryActionTimer);
+                        this.primaryActionTimer = null;
+                    }
+                    if (data.kind === 'me_preview') {
+                        this.previewPending = false;
+                        this.previewUnconfirmed = false;
+                        if (this.previewPendingTimer !== null) clearTimeout(this.previewPendingTimer);
+                        this.previewPendingTimer = null;
+                    }
+                    if (data.kind === 'style') {
+                        this.stylePending = false;
+                        this.styleUnconfirmed = false;
+                        if (this.stylePendingTimer !== null) clearTimeout(this.stylePendingTimer);
+                        this.stylePendingTimer = null;
+                    }
+                    if (data.kind === 'aux' && Number.isInteger(data.aux_channel)) {
+                        const outputId = data.aux_channel + 1;
+                        const routeOperation = this.routeOperations[String(outputId)];
+                        if (routeOperation?.status === 'unconfirmed') routeOperation.reviewRequested = true;
+                        for (const operation of Object.values(this.groupCutOperations)) {
+                            const item = operation.channels?.find(channel => channel.channel === data.aux_channel);
+                            if (item?.status === 'unconfirmed') item.reviewRequested = true;
+                        }
+                        for (const operation of Object.values(this.groupAlignOperations)) {
+                            const item = operation.channels?.find(channel => channel.channel === data.aux_channel);
+                            if (item?.status === 'unconfirmed') item.reviewRequested = true;
+                        }
+                    }
                     break;
 
                 case 'atem_state':
@@ -281,16 +436,35 @@ document.addEventListener('alpine:init', () => {
                         this.updateState(data.state);
                     }
                     break;
+
+                case 'dashboard_config':
+                case 'dashboard_config_changed':
+                    this.acceptDashboardConfig(data);
+                    break;
+
+                case 'dashboard_output_route_accepted':
+                    this.acceptOutputRoute(data);
+                    break;
+
+                case 'dashboard_group_cut_started':
+                    this.acceptGroupCut(data);
+                    break;
+
+                case 'dashboard_group_align_started':
+                    this.acceptGroupAlign(data);
+                    break;
             }
         },
 
         updateState(state) {
             this.state = state;
             this.connected = !!state.is_connected;
+            this.outputMappingError = state.dashboardRouting?.capabilities?.outputMappingReason || '';
             this.atemName = state.atem_name || (this.connected ? 'Connected ATEM' : 'Disconnected');
             this.sources = state.sources || [];
             this.auxOutputs = state.auxOutputs || {};
             this.mes = state.mes || [];
+            this.requestDashboardConfig();
 
             // 1. Discover M/E 1 Program source ID dynamically from state.sources
             this.discoverMeProgramSource();
@@ -303,6 +477,8 @@ document.addEventListener('alpine:init', () => {
 
             // 4. Update discovered Upstream Keyers on M/E 1
             this.reconcileUpstreamKeyers();
+            this.reconcileDownstreamKeyers();
+            this.reconcileThreeC();
         },
 
         discoverMeProgramSource() {
@@ -528,6 +704,52 @@ document.addEventListener('alpine:init', () => {
             }
         },
 
+        reconcileDownstreamKeyers() {
+            const count = this.state?.topology?.dsks;
+            if (!Number.isInteger(count) || count < 0) {
+                this.downstreamKeyers = [];
+                return;
+            }
+            const previous = this.downstreamKeyers;
+            const keyers = [];
+            for (let i = 0; i < count; i++) {
+                const observed = this.state?.dashboardSafety?.dsk?.[String(i)];
+                const onAir = typeof observed?.onAir === 'boolean' ? observed.onAir : null;
+                const dsk = this.state?.dsks?.[i] || {};
+                const fillSourceId = dsk.fill_source ?? null;
+                const fillSource = this.sources.find(s => s.source === fillSourceId);
+                const fillLabel = fillSource ? (fillSource.short || fillSource.long || `IN ${fillSourceId}`) :
+                    (fillSourceId !== null ? `Src ${fillSourceId}` : 'None');
+                const existing = previous.find(k => k.keyIndex === i);
+                let pending = existing?.pending || false;
+                let unconfirmed = existing?.unconfirmed || false;
+                let pendingTarget = existing?.pendingTarget ?? null;
+                let pendingTimeoutId = existing?.pendingTimeoutId ?? null;
+                if (pendingTarget !== null && onAir === pendingTarget) {
+                    if (pendingTimeoutId !== null) clearTimeout(pendingTimeoutId);
+                    pending = false;
+                    unconfirmed = false;
+                    pendingTarget = null;
+                    pendingTimeoutId = null;
+                }
+                const disabledReason = pending ? 'DSK toggle awaiting hardware confirmation.' :
+                    unconfirmed ? 'Previous DSK toggle unconfirmed. Review hardware state.' :
+                    onAir === null ? 'DSK on-air state has not been observed.' :
+                    (observed?.reason || '');
+                const keyer = existing || {};
+                Object.assign(keyer, {
+                    keyIndex: i, label: `DSK ${i + 1}`, onAir,
+                    statusText: onAir === null ? 'UNKNOWN' : (onAir ? 'ON AIR' : 'OFF AIR'),
+                    fillSourceId, fillLabel, pending, unconfirmed, disabledReason,
+                    pendingTarget, pendingTimeoutId
+                });
+                keyers.push(keyer);
+            }
+            if (keyers.length !== previous.length || keyers.some((k, i) => k !== previous[i])) {
+                this.downstreamKeyers = keyers;
+            }
+        },
+
         // ---------------------------------------------------------------------
         // Safety & Guard Checks
         // ---------------------------------------------------------------------
@@ -729,6 +951,30 @@ document.addEventListener('alpine:init', () => {
             }));
         },
 
+        toggleDSK(keyIndex) {
+            const keyer = this.downstreamKeyers.find(k => k.keyIndex === keyIndex);
+            if (!keyer) return;
+            const reason = this.keyerToggleReason(keyer);
+            if (reason) { this.showError(reason); return; }
+
+            keyer.pending = true;
+            keyer.pendingTarget = !keyer.onAir;
+            keyer.disabledReason = 'DSK toggle awaiting hardware confirmation.';
+            if (keyer.pendingTimeoutId !== null) clearTimeout(keyer.pendingTimeoutId);
+            keyer.pendingTimeoutId = setTimeout(() => {
+                const current = this.downstreamKeyers.find(k => k.keyIndex === keyIndex);
+                if (current?.pending) {
+                    this.markKeyerUnconfirmed(current);
+                    this.showError(`DSK ${keyIndex + 1} toggle timed out. Hardware result is unconfirmed.`);
+                }
+            }, 3200);
+
+            this.ws.send(JSON.stringify({
+                command: 'dashboard_toggle_dsk', dsk: keyIndex,
+                expected_on_air: keyer.onAir, target_on_air: keyer.pendingTarget
+            }));
+        },
+
         keyerToggleReason(keyer) {
             if (!this.hardwareReady) return 'Switcher disconnected or hardware state stale.';
             return keyer.disabledReason || '';
@@ -745,6 +991,11 @@ document.addEventListener('alpine:init', () => {
         reviewKeyer(keyIndex) {
             if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
             this.ws.send(JSON.stringify({command: 'dashboard_review_usk', key_index: keyIndex}));
+        },
+
+        reviewDSK(keyIndex) {
+            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+            this.ws.send(JSON.stringify({command: 'dashboard_review_dsk', dsk: keyIndex}));
         },
 
         // Master CUT remains disabled in Milestone 2
@@ -778,7 +1029,7 @@ document.addEventListener('alpine:init', () => {
 
         clearAllPendingTimeouts() {
             this.panels.forEach(p => this.clearPendingTimeout(p));
-            this.upstreamKeyers.forEach(k => {
+            [...this.upstreamKeyers, ...this.downstreamKeyers].forEach(k => {
                 if (k.pendingTimeoutId) {
                     clearTimeout(k.pendingTimeoutId);
                     k.pendingTimeoutId = null;
@@ -845,6 +1096,996 @@ document.addEventListener('alpine:init', () => {
             if (!s) return `Source ${sourceId}`;
             return s.long || s.short || `Source ${sourceId}`;
         },
+
+        getSourceShortNameById(sourceId) {
+            if (sourceId === null || sourceId === undefined) return 'Not set';
+            const source = this.sources.find(item => item.source === sourceId);
+            return source ? (source.short || source.long || `Source ${sourceId}`) : `Unavailable source ${sourceId}`;
+        },
+
+        get routingProjection() {
+            return this.state?.dashboardRouting || null;
+        },
+
+        get projectedOutputs() {
+            // Projection may retain unexpected AUX indices for diagnostics.
+            // Only mapped physical connectors have an outputId/OUT label and
+            // are shown as physical outputs in this installation's UI.
+            return Array.isArray(this.routingProjection?.outputs)
+                ? this.routingProjection.outputs.filter(output => Number.isInteger(output.outputId)) : [];
+        },
+
+        get primarySwitcherOutputs() {
+            // The header badge follows the observed M/E Program route even if
+            // a saved virtual claim makes effective ownership unresolved.
+            return this.projectedOutputs.filter(output => output.observedRouteOwner === 'primary');
+        },
+
+        get virtualSwitcherViews() {
+            const projection = this.routingProjection;
+            return ['virtual1', 'virtual2'].map((key, index) => {
+                const group = projection?.groups?.[key] || {};
+                return {
+                    key,
+                    title: this.switcherName(key, `Virtual Switcher ${index + 1}`),
+                    // Only validated ownership is shown as an assignment badge.
+                    outputs: this.projectedOutputs.filter(output => output.owner === key),
+                    group,
+                    invalidAssignments: this.invalidAssignmentsFor(key),
+                };
+            });
+        },
+
+        get otherOutputViews() {
+            return this.projectedOutputs.filter(output =>
+                !['primary', 'virtual1', 'virtual2'].includes(output.owner));
+        },
+
+        get primarySwitcherName() {
+            return this.switcherName('primary', 'Primary Switcher');
+        },
+
+        get hardwareMe() {
+            return this.mes[0] || null;
+        },
+
+        get hardwareProgramSourceId() {
+            if (!this.connected || !this.state) return null;
+            return this.hardwareMe?.program ?? this.state?.dashboardSafety?.meCut?.program ?? null;
+        },
+
+        get hardwarePreviewSourceId() {
+            if (!this.connected || !this.state) return null;
+            return this.hardwareMe?.preview ?? this.state?.dashboardSafety?.meCut?.preview ?? null;
+        },
+
+        get meObservationStale() {
+            return this.routingProjection?.stateFresh === false || this.state?.dashboardSafety?.fresh === false;
+        },
+
+        switcherName(key, fallback) {
+            const config = this.dashboardConfigDeviceId === this.routingProjection?.deviceId
+                ? this.dashboardConfig?.config : null;
+            const value = config?.customNames?.[key];
+            return typeof value === 'string' && value.trim() ? value.trim() : fallback;
+        },
+
+        invalidAssignmentsFor(key) {
+            const conflicts = this.routingProjection?.conflicts || [];
+            return conflicts.filter(conflict => conflict.group === key ||
+                (Array.isArray(conflict.groups) && conflict.groups.includes(key)));
+        },
+
+        sourceStateLabel(sourceId) {
+            if (sourceId === null || sourceId === undefined) return 'Not observed';
+            return this.getSourceShortNameById(sourceId);
+        },
+
+        requestDashboardConfig() {
+            const deviceId = this.routingProjection?.deviceId;
+            if (!this.connected || !deviceId || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+            const projectionRevision = this.routingProjection?.revision;
+            const configRevision = this.dashboardConfigDeviceId === deviceId ? this.dashboardConfig?.revision : null;
+            if (configRevision === projectionRevision ||
+                (configRevision !== null && projectionRevision != null && configRevision > projectionRevision)) return;
+            if (this.dashboardConfigRequestedDeviceId === deviceId &&
+                this.dashboardConfigRequestedRevision === projectionRevision) return;
+            this.dashboardConfigRequestedDeviceId = deviceId;
+            this.dashboardConfigRequestedRevision = projectionRevision;
+            this.ws.send(JSON.stringify({ command: 'dashboard_config_get' }));
+        },
+
+        acceptDashboardConfig(data) {
+            if (!data || !data.deviceId || !data.config) return;
+            const projectedDeviceId = this.routingProjection?.deviceId;
+            if (projectedDeviceId && data.deviceId !== projectedDeviceId) return;
+            if (this.dashboardConfigDeviceId === data.deviceId &&
+                this.dashboardConfig && data.revision < this.dashboardConfig.revision) return;
+            this.dashboardConfigDeviceId = data.deviceId;
+            this.dashboardConfig = { deviceId: data.deviceId, revision: data.revision, config: data.config };
+            this.dashboardConfigRequestedDeviceId = data.deviceId;
+            const projectionRevision = this.routingProjection?.revision;
+            this.dashboardConfigRequestedRevision = (
+                projectionRevision === data.revision ||
+                (projectionRevision != null && data.revision > projectionRevision)
+            ) ? projectionRevision : null;
+            this.dashboardConfigSaving = false;
+            if (this.dashboardConfigSaveTimer !== null) clearTimeout(this.dashboardConfigSaveTimer);
+            this.dashboardConfigSaveTimer = null;
+            this.dashboardConfigError = '';
+            if (this.configSavePurpose) {
+                const matchesPendingSave = JSON.stringify(this.configSaveExpected) === JSON.stringify(data.config);
+                if (matchesPendingSave) {
+                    if (this.routeBatch?.savingConfig) {
+                        this.routeBatch = null;
+                        this.assignmentBusy = false;
+                        this.assignmentDialogOpen = false;
+                        this.showNotice('Output ownership changes saved.');
+                    }
+                    if (this.configSavePurpose.startsWith('group-cut:')) this.finishGroupCutConfig(data);
+                    else if (this.configSavePurpose.startsWith('group-align:')) this.finishGroupAlignConfig(data);
+                    else this.configSavePurpose = null;
+                    this.configSaveExpected = null;
+                } else {
+                    const message = 'Another dashboard session changed the configuration first. Review the refreshed settings; confirmed hardware routes are shown separately.';
+                    if (this.routeBatch?.savingConfig) {
+                        this.routeBatch.error = message;
+                        this.routeBatch = null;
+                        this.assignmentBusy = false;
+                    }
+                    if (this.configSavePurpose.startsWith('group-cut:')) {
+                        const groupId = this.configSavePurpose.split(':')[1];
+                        const operation = this.groupCutOperations[groupId];
+                        if (operation) {
+                            operation.status = 'confirmed_config_failed';
+                            operation.error = message;
+                        }
+                    } else if (this.configSavePurpose.startsWith('group-align:')) {
+                        const groupId = this.configSavePurpose.split(':')[1];
+                        const operation = this.groupAlignOperations[groupId];
+                        if (operation) {
+                            operation.status = 'confirmed_config_failed';
+                            operation.error = message;
+                        }
+                    }
+                    this.dashboardConfigError = message;
+                    this.configSavePurpose = null;
+                    this.configSaveExpected = null;
+                    this.showError(message);
+                }
+            }
+        },
+
+        beginNameEdit(key, currentName) {
+            if (!this.dashboardConfig || this.dashboardConfigSaving) return;
+            this.nameEditingKey = key;
+            this.nameDraft = currentName;
+            this.dashboardConfigError = '';
+        },
+
+        cancelNameEdit() {
+            this.nameEditingKey = null;
+            this.nameDraft = '';
+        },
+
+        saveSwitcherName(key) {
+            if (!this.dashboardConfig || this.dashboardConfigDeviceId !== this.routingProjection?.deviceId || this.dashboardConfigSaving || !this.ws ||
+                this.ws.readyState !== WebSocket.OPEN) return;
+            const config = JSON.parse(JSON.stringify(this.dashboardConfig.config));
+            const trimmed = (this.nameDraft || '').trim();
+            const defaults = { primary: 'Primary Switcher', virtual1: 'Virtual Switcher 1', virtual2: 'Virtual Switcher 2' };
+            config.customNames[key] = trimmed && trimmed !== defaults[key] ? trimmed : null;
+            this.dashboardConfigError = '';
+            this.sendDashboardConfig(config, 'name');
+            this.nameEditingKey = null;
+        },
+
+        outputStatus(output) {
+            const labels = {
+                observed: 'Live route observed', stale: 'Hardware observation is stale',
+                unobserved: 'Route has not been observed', topology_mismatch: 'Output mapping unavailable: AUX topology mismatch',
+                malformed: 'Hardware route is malformed', source_missing: 'Routed source is unavailable',
+            };
+            return labels[output?.routeStatus] || 'Output state unresolved';
+        },
+
+        outputSourceId(output) {
+            if (output?.routeStatus === 'observed') return output.liveSourceId;
+            if (output?.routeStatus === 'stale') return output.lastObservedSourceId;
+            return null;
+        },
+
+        outputConflictText(output) {
+            const conflicts = output?.conflicts || [];
+            if (!conflicts.length) return '';
+            return conflicts.map(item => item.reason || item.type.replaceAll('_', ' ')).join('; ');
+        },
+
+        groupOutputOperation(groupId, auxIndex) {
+            const alignment = this.groupAlignOperations[groupId];
+            const aligned = alignment?.channels?.find(item => item.channel === auxIndex);
+            if (aligned && !['complete', 'blocked'].includes(alignment.status)) return aligned;
+            return this.groupCutOperations[groupId]?.channels?.find(item => item.channel === auxIndex) || null;
+        },
+
+        sendDashboardConfig(config, purpose = null) {
+            if (!this.dashboardConfig || this.dashboardConfigSaving || !this.ws ||
+                this.ws.readyState !== WebSocket.OPEN ||
+                this.dashboardConfigDeviceId !== this.routingProjection?.deviceId) return false;
+            this.dashboardConfigSaving = true;
+            this.configSavePurpose = purpose;
+            this.configSaveExpected = JSON.parse(JSON.stringify(config));
+            this.ws.send(JSON.stringify({ command: 'dashboard_config_update',
+                expected_revision: this.dashboardConfig.revision, config }));
+            if (this.dashboardConfigSaveTimer !== null) clearTimeout(this.dashboardConfigSaveTimer);
+            this.dashboardConfigSaveTimer = setTimeout(() => {
+                this.dashboardConfigSaveTimer = null;
+                this.dashboardConfigSaving = false;
+                this.dashboardConfigError = 'Configuration save result is unknown. Reloaded settings will show whether it was committed.';
+                if (this.routeBatch?.savingConfig) {
+                    this.routeBatch.error = this.dashboardConfigError;
+                    this.routeBatch = null;
+                    this.assignmentBusy = false;
+                }
+                if (typeof this.configSavePurpose === 'string' && this.configSavePurpose.startsWith('group-cut:')) {
+                    const groupId = this.configSavePurpose.split(':')[1];
+                    const operation = this.groupCutOperations[groupId];
+                    if (operation) {
+                        operation.status = 'confirmed_config_failed';
+                        operation.error = 'Output routes are confirmed, but the saved Preview/Program result is unknown.';
+                    }
+                } else if (typeof this.configSavePurpose === 'string' && this.configSavePurpose.startsWith('group-align:')) {
+                    const groupId = this.configSavePurpose.split(':')[1];
+                    const operation = this.groupAlignOperations[groupId];
+                    if (operation) {
+                        operation.status = 'confirmed_config_failed';
+                        operation.error = 'Output routes are confirmed, but the saved Program target result is unknown.';
+                    }
+                }
+                this.configSavePurpose = null;
+                this.configSaveExpected = null;
+                this.dashboardConfigRequestedDeviceId = null;
+                this.dashboardConfigRequestedRevision = null;
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    this.ws.send(JSON.stringify({ command: 'dashboard_config_get' }));
+                }
+                this.showError(this.dashboardConfigError);
+            }, 5000);
+            return true;
+        },
+
+        setVirtualPreview(groupId, sourceId) {
+            if (!this.hardwareReady || !this.dashboardConfig || this.dashboardConfigSaving ||
+                !['virtual1', 'virtual2'].includes(groupId)) return;
+            const source = this.sources.find(item => item.source === sourceId);
+            if (!Number.isInteger(sourceId) || !source || source.available_aux !== true) return;
+            const config = JSON.parse(JSON.stringify(this.dashboardConfig.config));
+            config.virtualSwitchers[groupId].previewSource = sourceId;
+            this.sendDashboardConfig(config, 'preview');
+        },
+
+        setEmptyVirtualProgramTarget(groupId, sourceId) {
+            if (!this.hardwareReady || !this.dashboardConfig || this.dashboardConfigSaving ||
+                !['virtual1', 'virtual2'].includes(groupId) ||
+                this.routingProjection?.groups?.[groupId]?.routeStatus !== 'empty') return;
+            const source = this.sources.find(item => item.source === sourceId);
+            if (!Number.isInteger(sourceId) || !source || source.available_aux !== true) return;
+            const config = JSON.parse(JSON.stringify(this.dashboardConfig.config));
+            config.virtualSwitchers[groupId].programTarget = sourceId;
+            this.sendDashboardConfig(config, 'program-target');
+        },
+
+        primaryPreviewReason(sourceId) {
+            if (!this.hardwareReady) return 'Switcher disconnected or state is stale.';
+            if (this.previewUnconfirmed) return 'Previous M/E Preview command is unconfirmed; review hardware state.';
+            if (this.previewPending) return 'M/E Preview change is awaiting hardware confirmation.';
+            if (this.primaryActionPending) return 'A Primary switching operation is pending.';
+            const source = this.sources.find(item => item.source === sourceId);
+            return source && source.available_me1 === true ? '' : 'Source is not available to M/E 1.';
+        },
+
+        selectPrimaryPreview(sourceId) {
+            if (this.primaryPreviewReason(sourceId) || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+            const current = this.hardwarePreviewSourceId;
+            if (!Number.isInteger(current) || current === sourceId) return;
+            this.previewPending = true;
+            this.previewUnconfirmed = false;
+            this.previewPendingTarget = sourceId;
+            this.previewPendingTimer = setTimeout(() => {
+                if (this.previewPending) {
+                    this.previewPending = false;
+                    this.previewUnconfirmed = true;
+                    this.previewPendingTimer = null;
+                    this.showError('M/E Preview selection timed out; hardware result is unconfirmed.');
+                }
+            }, 3500);
+            this.ws.send(JSON.stringify({ command: 'dashboard_set_preview_me', me: 0,
+                source: sourceId, expected_preview: current }));
+        },
+
+        primaryProgramReason(sourceId) {
+            if (this.programSelectionMode !== 'direct') return 'Direct Program mode is not enabled.';
+            if (!this.hardwareReady) return 'Switcher disconnected or state is stale.';
+            if (this.primaryActionPending || this.previewPending) return 'A Primary switching operation is pending.';
+            const source = this.sources.find(item => item.source === sourceId);
+            return source && source.available_me1 === true ? '' : 'Source is not available to M/E 1.';
+        },
+
+        selectPrimaryProgram(sourceId) {
+            if (this.primaryProgramReason(sourceId) || !this.ws || this.ws.readyState !== WebSocket.OPEN ||
+                sourceId === this.hardwareProgramSourceId) return;
+            this.primaryActionPending = { kind: 'program', target: sourceId, before: this.hardwareProgramSourceId };
+            this.armPrimaryOperationTimeout();
+            this.ws.send(JSON.stringify({ command: 'dashboard_set_program_me', me: 0,
+                source: sourceId, expected_program: this.hardwareProgramSourceId }));
+        },
+
+        primaryCutReason() {
+            if (!this.hardwareReady) return 'Switcher disconnected or state is stale.';
+            if (this.primaryActionPending || this.previewPending) return 'A Primary switching operation is pending.';
+            return this.meCutReason;
+        },
+
+        primaryCut() {
+            const reason = this.primaryCutReason();
+            if (reason) { this.showError(reason); return; }
+            this.primaryActionPending = { kind: 'cut', target: this.hardwarePreviewSourceId,
+                before: this.hardwareProgramSourceId };
+            this.armPrimaryOperationTimeout();
+            this.ws.send(JSON.stringify({ command: 'dashboard_cut_me', me: 0,
+                expected_program: this.hardwareProgramSourceId,
+                expected_preview: this.hardwarePreviewSourceId }));
+        },
+
+        reviewPrimaryOperation() {
+            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+            this.ws.send(JSON.stringify({ command: 'dashboard_review_me' }));
+        },
+
+        reviewPrimaryPreview() {
+            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+            this.ws.send(JSON.stringify({ command: 'dashboard_review_me_preview' }));
+        },
+
+        reviewTransitionStyle() {
+            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+            this.ws.send(JSON.stringify({ command: 'dashboard_review_style' }));
+        },
+
+        get primaryActionPending() { return this._primaryActionPending || null; },
+        set primaryActionPending(value) { this._primaryActionPending = value; },
+
+        armPrimaryOperationTimeout() {
+            if (this.primaryActionTimer !== null) clearTimeout(this.primaryActionTimer);
+            this.primaryActionTimer = setTimeout(() => {
+                if (this.primaryActionPending) {
+                    this.primaryActionPending.unconfirmed = true;
+                    this.showError('Primary operation timed out; hardware result is unconfirmed. Review current state.');
+                }
+            }, 3500);
+        },
+
+        primaryAutoReason() {
+            if (!this.hardwareReady) return 'Switcher disconnected or state is stale.';
+            if (this.primaryActionPending || this.previewPending) return 'A Primary switching operation is pending.';
+            const transition = this.hardwareMe?.transition;
+            if (!transition || typeof transition.in_transition !== 'boolean' ||
+                !Number.isInteger(transition.position) || transition.in_transition || transition.position !== 0) {
+                return 'M/E transition state is unknown or not at rest.';
+            }
+            if (!Number.isInteger(this.hardwareProgramSourceId) || !Number.isInteger(this.hardwarePreviewSourceId)) return 'M/E Program or Preview is unknown.';
+            if (this.hardwareProgramSourceId === this.hardwarePreviewSourceId) return 'M/E Preview is already live.';
+            const selection = transition.selection;
+            if (!selection || typeof selection.background !== 'boolean' ||
+                [1, 2, 3, 4].some(i => typeof selection[`key${i}`] !== 'boolean')) return 'Next-transition selection is unknown or incomplete.';
+            if (!selection.background && ![1, 2, 3, 4].some(i => selection[`key${i}`])) return 'No M/E background or keyer is selected for the transition.';
+            return '';
+        },
+
+        primaryAuto() {
+            const reason = this.primaryAutoReason();
+            if (reason) { this.showError(reason); return; }
+            if (this.meTiedKeyList.length) { this.keyedAutoConfirmOpen = true; return; }
+            this.dispatchPrimaryAuto(false);
+        },
+
+        dispatchPrimaryAuto(allowKeyed) {
+            this.keyedAutoConfirmOpen = false;
+            if (this.primaryAutoReason() || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+            this.primaryActionPending = { kind: 'auto', target: this.hardwarePreviewSourceId,
+                before: this.hardwareProgramSourceId };
+            this.armPrimaryOperationTimeout();
+            this.ws.send(JSON.stringify({ command: 'dashboard_auto_me', me: 0,
+                expected_program: this.hardwareProgramSourceId, expected_preview: this.hardwarePreviewSourceId,
+                expected_selection: { background: this.hardwareMe.transition.selection.background,
+                    key1: this.hardwareMe.transition.selection.key1, key2: this.hardwareMe.transition.selection.key2,
+                    key3: this.hardwareMe.transition.selection.key3, key4: this.hardwareMe.transition.selection.key4 },
+                allow_keyed: allowKeyed === true }));
+        },
+
+        transitionStyles: [
+            { value: 0, label: 'MIX' }, { value: 1, label: 'DIP' },
+            { value: 2, label: 'WIPE' }, { value: 3, label: 'DVE' },
+            { value: 4, label: 'STINGER' },
+        ],
+
+        transitionStyleSupported(style) {
+            const topology = this.state?.topology || {};
+            if (style === 3) return Number.isInteger(topology.dves) && topology.dves > 0;
+            if (style === 4) return Number.isInteger(topology.stingers) && topology.stingers > 0;
+            return [0, 1, 2].includes(style);
+        },
+
+        selectTransitionStyle(style) {
+            if (!this.hardwareReady || this.primaryActionPending || this.stylePending ||
+                this.styleUnconfirmed ||
+                !this.transitionStyleSupported(style) || !this.ws || this.ws.readyState !== WebSocket.OPEN ||
+                this.hardwareMe?.transition?.style === style) return;
+            this.stylePending = true;
+            this.styleUnconfirmed = false;
+            this.stylePendingTarget = style;
+            this.stylePendingTimer = setTimeout(() => {
+                if (this.stylePending) {
+                    this.stylePending = false;
+                    this.styleUnconfirmed = true;
+                    this.stylePendingTimer = null;
+                    this.showError('Transition style result is unconfirmed; review current hardware state.');
+                }
+            }, 3500);
+            this.ws.send(JSON.stringify({ command: 'dashboard_set_transition_style', style, me: 0 }));
+        },
+
+        get physicalOutputs() {
+            return this.projectedOutputs.slice().sort((a, b) => a.outputId - b.outputId);
+        },
+
+        openAssignmentDialog(owner) {
+            if (!['primary', 'virtual1', 'virtual2'].includes(owner) || !this.dashboardConfig ||
+                this.outputMappingError || !this.hardwareReady || this.assignmentBusy) return;
+            this.assignmentOwner = owner;
+            const selected = {};
+            for (const output of this.physicalOutputs) {
+                selected[String(output.outputId)] = owner === 'primary'
+                    ? output.observedRouteOwner === 'primary'
+                    : (this.dashboardConfig.config.virtualSwitchers[owner].outputs || []).includes(output.outputId - 1);
+            }
+            this.assignmentSelection = selected;
+            this.assignmentDialogOpen = true;
+        },
+
+        stagedAssignmentDescription(output) {
+            if (!this.assignmentOwner || !this.dashboardConfig || !output) return '';
+            const checked = !!this.assignmentSelection[String(output.outputId)];
+            if (this.assignmentOwner === 'primary') {
+                const currentlyPrimary = output.observedRouteOwner === 'primary';
+                if (checked && !currentlyPrimary) {
+                    return `Route ${this.sourceStateLabel(output.liveSourceId)} → M/E PROGRAM`;
+                }
+                if (!checked && currentlyPrimary) {
+                    return `Release to ${this.sourceStateLabel(this.routingProjection?.programBackgroundSourceId)} (background only; key overlays removed)`;
+                }
+                return '';
+            }
+            const group = this.routingProjection?.groups?.[this.assignmentOwner];
+            const assigned = (this.dashboardConfig.config.virtualSwitchers[this.assignmentOwner]?.outputs || [])
+                .includes(output.auxIndex);
+            if (checked && !assigned) {
+                const target = group?.routeStatus === 'empty' ? group.savedProgramTargetId : group?.liveSourceId;
+                return Number.isInteger(target)
+                    ? `Route ${this.sourceStateLabel(output.liveSourceId)} → ${this.sourceStateLabel(target)}`
+                    : 'Cannot assign: set a valid Program target first.';
+            }
+            if (!checked && assigned) return `Release; preserve ${this.sourceStateLabel(output.liveSourceId)}`;
+            return '';
+        },
+
+        closeAssignmentDialog() {
+            if (this.assignmentBusy) return;
+            this.assignmentDialogOpen = false;
+            this.assignmentOwner = null;
+            this.assignmentSelection = {};
+        },
+
+        applyAssignmentChanges() {
+            if (!this.assignmentDialogOpen || this.assignmentBusy || !this.dashboardConfig ||
+                !this.hardwareReady || this.outputMappingError) return;
+            const owner = this.assignmentOwner;
+            const config = this.dashboardConfig.config;
+            const ops = [];
+            const removals = [];
+            const programId = this.routingProjection?.capabilities?.programOutputSourceId;
+            for (const output of this.physicalOutputs) {
+                const checked = !!this.assignmentSelection[String(output.outputId)];
+                const channel = output.outputId - 1;
+                if (owner === 'primary') {
+                    const currently = output.observedRouteOwner === 'primary';
+                    if (checked === currently) continue;
+                    if (checked) {
+                        if (!Number.isInteger(programId)) { this.showError('M/E Program feed identity is unavailable.'); return; }
+                        ops.push({ outputId: output.outputId, mode: 'primary_assign', targetOwner: 'primary', target: programId,
+                            expectedLive: output.liveSourceId,
+                            transferFrom: output.owner === 'virtual1' || output.owner === 'virtual2' ? output.owner : null });
+                    } else {
+                        const background = this.routingProjection?.programBackgroundSourceId;
+                        if (!Number.isInteger(background)) { this.showError('Current M/E Program background is unavailable.'); return; }
+                        ops.push({ outputId: output.outputId, mode: 'primary_release', targetOwner: 'other',
+                            target: background, expectedLive: output.liveSourceId });
+                    }
+                } else {
+                    const assigned = (config.virtualSwitchers[owner].outputs || []).includes(channel);
+                    if (checked === assigned) continue;
+                    if (!checked) { removals.push({ groupId: owner, channel }); continue; }
+                    const group = this.routingProjection?.groups?.[owner];
+                    if (!group || ['mixed', 'unknown'].includes(group.routeStatus)) {
+                        this.showError(`${owner} routing must be uniform and observed before adding an output.`); return;
+                    }
+                    const target = group.routeStatus === 'empty' ? group.savedProgramTargetId : group.liveSourceId;
+                    if (!Number.isInteger(target)) { this.showError(`Set a valid ${owner} Program target before assigning an output.`); return; }
+                    const transferFrom = ['primary', 'virtual1', 'virtual2'].includes(output.owner) ? output.owner : null;
+                    ops.push({ outputId: output.outputId, mode: 'virtual_assign', targetOwner: owner,
+                        groupId: owner, target, expectedLive: output.liveSourceId, transferFrom });
+                }
+            }
+            if (!ops.length && !removals.length) { this.closeAssignmentDialog(); return; }
+            this.assignmentBusy = true;
+            this.routeBatch = { owner, operations: ops.map(operation => ({ ...operation, status: 'queued' })),
+                removals, confirmed: [], savingConfig: false, error: '' };
+            this.dispatchNextAssignmentRoute();
+        },
+
+        dispatchNextAssignmentRoute() {
+            if (!this.routeBatch || this.routeBatch.savingConfig) return;
+            const next = this.routeBatch.operations.find(operation => operation.status === 'queued');
+            if (!next) { this.persistAssignmentBatch(); return; }
+            next.status = 'pending';
+            const operation = { ...next, before: next.expectedLive,
+                batchIndex: this.routeBatch.operations.indexOf(next), status: 'pending', timer: null, accepted: false };
+            this.routeOperations[String(next.outputId)] = operation;
+            operation.timer = setTimeout(() => {
+                const current = this.routeOperations[String(next.outputId)];
+                if (!current || current.status !== 'pending') return;
+                current.status = 'unconfirmed';
+                next.status = 'unconfirmed';
+                this.showError(`OUT ${next.outputId} route timed out; hardware result is unconfirmed. Review it before continuing.`);
+            }, 4000);
+            this.ws.send(JSON.stringify({ command: 'dashboard_output_route', config_revision: this.dashboardConfig.revision,
+                output_id: next.outputId, mode: next.mode, group_id: next.groupId || null,
+                transfer_from: next.transferFrom || null, expected_live: next.expectedLive,
+                input_source: next.target }));
+        },
+
+        acceptOutputRoute(data) {
+            const operation = this.routeOperations[String(data.output_id)];
+            if (!operation) return;
+            operation.accepted = true;
+            if (data.no_op) this.confirmRouteOperation(data.output_id);
+        },
+
+        reviewOutputOperation(outputId) {
+            if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !Number.isInteger(outputId) || outputId < 1 || outputId > 6) return;
+            this.ws.send(JSON.stringify({ command: 'dashboard_review_aux', aux_channel: outputId - 1 }));
+        },
+
+        reviewUnconfirmedAssignmentRoutes() {
+            if (!this.routeBatch) return;
+            const ids = Object.entries(this.routeOperations)
+                .filter(([, operation]) => operation.status === 'unconfirmed')
+                .map(([id]) => Number(id));
+            ids.forEach(id => this.reviewOutputOperation(id));
+        },
+
+        confirmRouteOperation(outputId) {
+            const key = String(outputId);
+            const operation = this.routeOperations[key];
+            if (!operation) return;
+            if (operation.timer !== null) clearTimeout(operation.timer);
+            operation.status = 'confirmed';
+            delete this.routeOperations[key];
+            if (Number.isInteger(operation.batchIndex) && this.routeBatch) {
+                this.routeBatch.operations[operation.batchIndex].status = 'confirmed';
+                this.routeBatch.confirmed.push(operation);
+                this.dispatchNextAssignmentRoute();
+            } else this.showNotice(`OUT ${outputId} route confirmed.`);
+        },
+
+        failRouteOperation(outputId, message) {
+            const operation = this.routeOperations[String(outputId)];
+            if (!operation) return;
+            if (operation.timer !== null) clearTimeout(operation.timer);
+            operation.status = 'failed';
+            delete this.routeOperations[String(outputId)];
+            if (Number.isInteger(operation.batchIndex) && this.routeBatch) {
+                this.routeBatch.operations[operation.batchIndex].status = 'failed';
+                this.routeBatch.error = message;
+                this.dispatchNextAssignmentRoute();
+            }
+            this.showError(message);
+        },
+
+        persistAssignmentBatch() {
+            if (!this.routeBatch || this.routeBatch.savingConfig) return;
+            const batch = this.routeBatch;
+            const config = JSON.parse(JSON.stringify(this.dashboardConfig.config));
+            let changed = false;
+            for (const groupId of ['virtual1', 'virtual2']) {
+                const outputs = config.virtualSwitchers[groupId].outputs;
+                const remove = new Set(batch.removals.filter(item => item.groupId === groupId).map(item => item.channel));
+                for (const operation of batch.confirmed) {
+                    const channel = operation.outputId - 1;
+                    if (operation.targetOwner === 'primary' || operation.transferFrom === groupId || operation.targetOwner === groupId) remove.add(channel);
+                }
+                const nextOutputs = outputs.filter(channel => !remove.has(channel));
+                if (nextOutputs.length !== outputs.length) changed = true;
+                config.virtualSwitchers[groupId].outputs = nextOutputs;
+            }
+            for (const operation of batch.confirmed) {
+                if (operation.targetOwner === 'virtual1' || operation.targetOwner === 'virtual2') {
+                    const group = config.virtualSwitchers[operation.targetOwner];
+                    const channel = operation.outputId - 1;
+                    if (!group.outputs.includes(channel)) group.outputs.push(channel);
+                    group.programTarget = operation.target;
+                    changed = true;
+                }
+            }
+            if (!changed) {
+                this.routeBatch = null; this.assignmentBusy = false; this.assignmentDialogOpen = false;
+                if (batch.error) this.showError(batch.error); else this.showNotice('Output routing changes confirmed.');
+                return;
+            }
+            batch.savingConfig = true;
+            if (!this.sendDashboardConfig(config, 'assignment')) {
+                batch.savingConfig = false; this.assignmentBusy = false;
+                this.showError('Output routes changed, but ownership could not be saved. Reload and resolve the conflict.');
+            }
+        },
+
+        routeOtherOutput(output, sourceId) {
+            if (!this.hardwareReady || this.outputMappingError || !this.dashboardConfig || this.assignmentBusy ||
+                !Number.isInteger(output?.liveSourceId) || !Number.isInteger(sourceId) ||
+                this.routeOperations[String(output.outputId)]) return;
+            const operation = { outputId: output.outputId, mode: 'other_route', targetOwner: 'other', target: sourceId,
+                before: output.liveSourceId, status: 'pending', batchIndex: null, accepted: false, timer: null };
+            operation.timer = setTimeout(() => {
+                const current = this.routeOperations[String(output.outputId)];
+                if (current && current.status === 'pending') {
+                    current.status = 'unconfirmed';
+                    this.showError(`OUT ${output.outputId} route timed out; hardware result is unconfirmed.`);
+                }
+            }, 4000);
+            this.routeOperations[String(output.outputId)] = operation;
+            this.ws.send(JSON.stringify({ command: 'dashboard_output_route', config_revision: this.dashboardConfig.revision,
+                output_id: output.outputId, mode: 'other_route', expected_live: output.liveSourceId, input_source: sourceId }));
+        },
+
+        groupCutReason(groupId) {
+            if (!this.hardwareReady || !this.dashboardConfig) return 'Switcher or saved configuration is unavailable.';
+            if (this.outputMappingError) return this.outputMappingError;
+            if (this.assignmentBusy) return 'An output ownership change is pending.';
+            const pending = this.groupCutOperations[groupId];
+            if (pending && ['pending', 'unconfirmed', 'partial'].includes(pending.status)) return 'Previous group CUT is pending or incomplete; review actual routes.';
+            const alignment = this.groupAlignOperations[groupId];
+            if (alignment && ['pending', 'unconfirmed', 'partial', 'saving'].includes(alignment.status)) return 'Mixed-route alignment is pending or incomplete; review actual routes.';
+            const group = this.routingProjection?.groups?.[groupId];
+            if (!group || !Array.isArray(group.outputIds) || !group.outputIds.length) return 'Assign at least one output before CUT.';
+            if (group.routeStatus === 'mixed') return 'MIXED ROUTING must be resolved before group CUT.';
+            if (group.routeStatus !== 'uniform') return 'All assigned output routes must be current and observed.';
+            if (group.previewSourceValid !== true || !Number.isInteger(group.previewSourceId)) return 'Select a valid directly routable Preview source.';
+            if (group.previewSourceId === group.liveSourceId) return 'Queued Preview is already live.';
+            const assigned = new Set(group.outputIds);
+            if ((this.routingProjection?.conflicts || []).some(item =>
+                assigned.has(item.outputId) || assigned.has((item.auxIndex ?? -1) + 1))) return 'Output ownership or routing conflict must be resolved first.';
+            return '';
+        },
+
+        cutVirtualGroup(groupId) {
+            const reason = this.groupCutReason(groupId);
+            if (reason) { this.showError(reason); return; }
+            const group = this.routingProjection.groups[groupId];
+            const operation = this.groupCutOperations[groupId] = {
+                status: 'pending', target: group.previewSourceId, previous: group.liveSourceId,
+                channels: group.outputIds.map(outputId => ({ channel: outputId - 1, status: 'dispatching', error: '' })),
+                configSaved: false, timer: null,
+            };
+            operation.timer = setTimeout(() => {
+                if (operation.status === 'pending') {
+                    operation.status = 'unconfirmed';
+                    this.showError(`${this.switcherName(groupId, groupId)} CUT timed out; review each output route.`);
+                }
+            }, 5000);
+            this.ws.send(JSON.stringify({ command: 'dashboard_cut_virtual_group', group_id: groupId,
+                config_revision: this.dashboardConfig.revision, input_source: group.previewSourceId }));
+        },
+
+        acceptGroupCut(data) {
+            const operation = this.groupCutOperations[data.group_id];
+            if (!operation) return;
+            operation.target = data.target; operation.previous = data.previous;
+            for (const outcome of data.outcomes || []) {
+                const item = operation.channels.find(channel => channel.channel === outcome.channel);
+                if (!item) continue;
+                item.status = outcome.ok ? 'pending' : 'failed'; item.error = outcome.error || '';
+            }
+            this.reconcileThreeC();
+        },
+
+        finishGroupCutConfig() {
+            const groupId = this.configSavePurpose.split(':')[1];
+            this.configSavePurpose = null;
+            const operation = this.groupCutOperations[groupId];
+            if (!operation) return;
+            operation.configSaved = true; operation.status = 'complete';
+            if (operation.timer !== null) clearTimeout(operation.timer);
+            operation.timer = null;
+            this.showNotice(`${this.switcherName(groupId, groupId)} CUT confirmed on all outputs.`);
+        },
+
+        groupAlignReason(groupId) {
+            if (!this.hardwareReady || !this.dashboardConfig) return 'Switcher or saved configuration is unavailable.';
+            if (this.outputMappingError || this.assignmentBusy) return this.outputMappingError || 'An output ownership change is pending.';
+            const operation = this.groupAlignOperations[groupId];
+            if (operation?.status === 'pending' || operation?.status === 'unconfirmed' ||
+                operation?.channels?.some(item => item.status === 'unconfirmed')) {
+                return 'A prior alignment has uncertain output routes; review hardware state before another alignment.';
+            }
+            const cut = this.groupCutOperations[groupId];
+            if (cut && ['pending', 'unconfirmed'].includes(cut.status)) return 'A virtual switcher CUT is still pending.';
+            const group = this.routingProjection?.groups?.[groupId];
+            if (!group || group.routeStatus !== 'mixed' || !Array.isArray(group.outputs) || !group.outputs.length) {
+                return 'Alignment is available only for a mixed group with assigned outputs.';
+            }
+            if (group.outputs.some(output => output.routeStatus !== 'observed' || output.owner !== groupId)) {
+                return 'Every assigned route must be observed and ownership conflict-free.';
+            }
+            if (group.outputs.some(output => this.routeOperations[String(output.outputId)])) return 'An output route command is pending.';
+            return '';
+        },
+
+        beginVirtualGroupAlign(groupId) {
+            const reason = this.groupAlignReason(groupId);
+            if (reason) { this.showError(reason); return; }
+            const group = this.routingProjection.groups[groupId];
+            const savedTarget = group.savedProgramTargetId;
+            const firstLive = group.outputs.find(output => Number.isInteger(output.liveSourceId))?.liveSourceId;
+            const source = this.sources.find(item => item.source === savedTarget && item.available_aux === true);
+            this.groupAlignDraft = { groupId,
+                target: source ? savedTarget : firstLive,
+                expectedRoutes: group.outputs.map(output => ({ channel: output.auxIndex, source: output.liveSourceId })) };
+        },
+
+        cancelVirtualGroupAlign() {
+            this.groupAlignDraft = null;
+        },
+
+        confirmVirtualGroupAlign() {
+            const draft = this.groupAlignDraft;
+            if (!draft || this.groupAlignReason(draft.groupId)) return;
+            const source = this.sources.find(item => item.source === draft.target && item.available_aux === true);
+            if (!source || draft.target === this.routingProjection?.capabilities?.programOutputSourceId) {
+                this.showError('Choose a directly routable source other than the Primary M/E Program feed.');
+                return;
+            }
+            const operation = this.groupAlignOperations[draft.groupId] = {
+                status: 'pending', target: draft.target,
+                channels: draft.expectedRoutes.map(item => ({ channel: item.channel, before: item.source, status: 'dispatching', error: '' })),
+                timer: null,
+            };
+            operation.timer = setTimeout(() => {
+                if (operation.status === 'pending') {
+                    operation.status = 'unconfirmed';
+                    for (const item of operation.channels) if (item.status === 'pending' || item.status === 'dispatching') item.status = 'unconfirmed';
+                    this.showError(`${this.switcherName(draft.groupId, draft.groupId)} alignment timed out; inspect each output before retrying.`);
+                }
+            }, 5000);
+            this.ws.send(JSON.stringify({ command: 'dashboard_align_virtual_group', group_id: draft.groupId,
+                config_revision: this.dashboardConfig.revision, input_source: draft.target,
+                expected_routes: draft.expectedRoutes }));
+            this.groupAlignDraft = null;
+        },
+
+        acceptGroupAlign(data) {
+            const operation = this.groupAlignOperations[data.group_id];
+            if (!operation) return;
+            for (const outcome of data.outcomes || []) {
+                const item = operation.channels.find(channel => channel.channel === outcome.channel);
+                if (!item) continue;
+                item.status = outcome.ok ? (outcome.no_op ? 'confirmed' : 'pending') : 'failed';
+                item.error = outcome.error || '';
+            }
+            this.reconcileThreeC();
+        },
+
+        finishGroupAlignConfig() {
+            const groupId = this.configSavePurpose.split(':')[1];
+            const operation = this.groupAlignOperations[groupId];
+            if (operation) {
+                operation.status = 'complete';
+                if (operation.timer !== null) clearTimeout(operation.timer);
+                operation.timer = null;
+                this.showNotice(`${this.switcherName(groupId, groupId)} outputs aligned and confirmed.`);
+            }
+            this.configSavePurpose = null;
+        },
+
+        reconcileThreeC() {
+            if (this.previewPending && this.hardwarePreviewSourceId === this.previewPendingTarget) {
+                this.previewPending = false; this.previewPendingTarget = null;
+                this.previewUnconfirmed = false;
+                if (this.previewPendingTimer !== null) clearTimeout(this.previewPendingTimer);
+                this.previewPendingTimer = null;
+            }
+            if (this.stylePending && this.hardwareMe?.transition?.style === this.stylePendingTarget) {
+                this.stylePending = false; this.stylePendingTarget = null;
+                this.styleUnconfirmed = false;
+                if (this.stylePendingTimer !== null) clearTimeout(this.stylePendingTimer);
+                this.stylePendingTimer = null;
+            }
+            if (this.primaryActionPending) {
+                const op = this.primaryActionPending;
+                if (this.hardwareProgramSourceId === op.target && op.target !== op.before) {
+                    this.primaryActionPending = null;
+                    if (this.primaryActionTimer !== null) clearTimeout(this.primaryActionTimer);
+                    this.primaryActionTimer = null;
+                } else if (this.hardwareProgramSourceId !== null && this.hardwareProgramSourceId !== op.before && this.hardwareProgramSourceId !== op.target) {
+                    op.unconfirmed = true;
+                }
+            }
+            for (const [id, operation] of Object.entries(this.routeOperations)) {
+                if (!['pending', 'unconfirmed'].includes(operation.status)) continue;
+                const output = this.projectedOutputs.find(item => item.outputId === Number(id));
+                if (output?.routeStatus === 'observed' && output.liveSourceId === operation.target) {
+                    this.confirmRouteOperation(Number(id));
+                } else if (operation.reviewRequested && output?.routeStatus === 'observed' && output.liveSourceId === operation.before) {
+                    if (operation.timer !== null) clearTimeout(operation.timer);
+                    operation.status = 'failed';
+                    delete this.routeOperations[id];
+                    if (Number.isInteger(operation.batchIndex) && this.routeBatch) {
+                        this.routeBatch.operations[operation.batchIndex].status = 'failed';
+                        this.routeBatch.error = `OUT ${id} remains on its previous route after review.`;
+                        this.dispatchNextAssignmentRoute();
+                    } else this.showError(`OUT ${id} remains on its previous route after review; no change was confirmed.`);
+                } else if (output?.routeStatus === 'observed' && output.liveSourceId !== operation.before) {
+                    operation.status = 'unconfirmed';
+                    if (operation.timer !== null) clearTimeout(operation.timer);
+                    this.showError(`OUT ${id} changed to an unexpected source; operation is unconfirmed.`);
+                }
+            }
+            for (const [groupId, operation] of Object.entries(this.groupCutOperations)) {
+                if (!['pending', 'unconfirmed', 'partial'].includes(operation.status) || !Array.isArray(operation.channels)) continue;
+                for (const item of operation.channels) {
+                    if (!['pending', 'unconfirmed', 'dispatching'].includes(item.status)) continue;
+                    const output = this.projectedOutputs.find(route => route.auxIndex === item.channel);
+                    if (output?.routeStatus === 'observed' && output.liveSourceId === operation.target) item.status = 'confirmed';
+                    else if (item.reviewRequested && output?.routeStatus === 'observed' && output.liveSourceId === operation.previous) {
+                        item.status = 'failed'; item.error = `OUT ${output.outputId} remains on its previous route after review.`;
+                    }
+                    else if (output?.routeStatus === 'observed' && output.liveSourceId !== operation.previous) {
+                        item.status = 'unconfirmed'; item.error = `OUT ${output.outputId} changed to an unexpected source.`;
+                    }
+                }
+                if (operation.channels.length && operation.channels.every(item => item.status === 'confirmed') && !operation.configSaved) {
+                    operation.status = 'saving';
+                    if (operation.timer !== null) clearTimeout(operation.timer);
+                    const config = JSON.parse(JSON.stringify(this.dashboardConfig.config));
+                    const group = config.virtualSwitchers[groupId];
+                    group.programTarget = operation.target;
+                    const previousSource = this.sources.find(source => source.source === operation.previous);
+                    if (previousSource?.available_aux === true) group.previewSource = operation.previous;
+                    this.configSavePurpose = `group-cut:${groupId}`;
+                    if (!this.sendDashboardConfig(config, this.configSavePurpose)) {
+                        operation.status = 'confirmed_config_failed'; this.configSavePurpose = null;
+                        this.showError('All output routes confirmed, but the saved switcher state could not be updated.');
+                    }
+                } else if (operation.channels.some(item => ['failed', 'unconfirmed'].includes(item.status))) {
+                    operation.status = 'partial';
+                    if (operation.timer !== null) clearTimeout(operation.timer);
+                    this.showError('Group CUT partially completed or was diverted. Actual routes are shown; Preview was not swapped.');
+                }
+            }
+            for (const [groupId, operation] of Object.entries(this.groupAlignOperations)) {
+                if (!['pending', 'unconfirmed', 'partial'].includes(operation.status) || !Array.isArray(operation.channels)) continue;
+                for (const item of operation.channels) {
+                    if (!['pending', 'unconfirmed', 'dispatching'].includes(item.status)) continue;
+                    const output = this.projectedOutputs.find(route => route.auxIndex === item.channel);
+                    if (output?.routeStatus === 'observed' && output.liveSourceId === operation.target) item.status = 'confirmed';
+                    else if (item.reviewRequested && output?.routeStatus === 'observed' && output.liveSourceId === item.before) {
+                        item.status = 'failed'; item.error = `OUT ${output.outputId} remains on its previous route after review.`;
+                    }
+                    else if (output?.routeStatus === 'observed' && output.liveSourceId !== item.before) {
+                        item.status = 'unconfirmed'; item.error = `OUT ${output.outputId} changed to an unexpected source.`;
+                    }
+                }
+                if (operation.channels.length && operation.channels.every(item => item.status === 'confirmed')) {
+                    operation.status = 'saving';
+                    if (operation.timer !== null) clearTimeout(operation.timer);
+                    const config = JSON.parse(JSON.stringify(this.dashboardConfig.config));
+                    config.virtualSwitchers[groupId].programTarget = operation.target;
+                    this.configSavePurpose = `group-align:${groupId}`;
+                    if (!this.sendDashboardConfig(config, this.configSavePurpose)) {
+                        operation.status = 'confirmed_config_failed'; this.configSavePurpose = null;
+                        this.showError('Routes are aligned, but the saved Program target could not be updated.');
+                    }
+                } else if (operation.channels.some(item => ['failed', 'unconfirmed'].includes(item.status))) {
+                    operation.status = 'partial';
+                    if (operation.timer !== null) clearTimeout(operation.timer);
+                    this.showError('Alignment partially completed or was diverted. Actual routes remain visible; no Program target was saved.');
+                }
+            }
+        },
+
+        markThreeCOperationsUnconfirmed(reason) {
+            if (this.dashboardConfigSaveTimer !== null) clearTimeout(this.dashboardConfigSaveTimer);
+            this.dashboardConfigSaveTimer = null;
+            if (this.dashboardConfigSaving) {
+                this.dashboardConfigSaving = false;
+                this.dashboardConfigError = 'Configuration save result is unknown after disconnect; reload settings before continuing.';
+                if (this.routeBatch?.savingConfig) {
+                    this.routeBatch.error = this.dashboardConfigError;
+                    this.routeBatch = null;
+                    this.assignmentBusy = false;
+                }
+                if (typeof this.configSavePurpose === 'string' && this.configSavePurpose.startsWith('group-cut:')) {
+                    const groupId = this.configSavePurpose.split(':')[1];
+                    const operation = this.groupCutOperations[groupId];
+                    if (operation) {
+                        operation.status = 'confirmed_config_failed';
+                        operation.error = this.dashboardConfigError;
+                    }
+                } else if (typeof this.configSavePurpose === 'string' && this.configSavePurpose.startsWith('group-align:')) {
+                    const groupId = this.configSavePurpose.split(':')[1];
+                    const operation = this.groupAlignOperations[groupId];
+                    if (operation) {
+                        operation.status = 'confirmed_config_failed';
+                        operation.error = this.dashboardConfigError;
+                    }
+                }
+                this.configSavePurpose = null;
+                this.configSaveExpected = null;
+                this.dashboardConfigRequestedDeviceId = null;
+                this.dashboardConfigRequestedRevision = null;
+            }
+            if (this.previewPending) {
+                this.previewPending = false;
+                this.previewUnconfirmed = true;
+                if (this.previewPendingTimer !== null) clearTimeout(this.previewPendingTimer);
+                this.previewPendingTimer = null;
+            }
+            if (this.stylePending) {
+                this.stylePending = false;
+                this.styleUnconfirmed = true;
+                if (this.stylePendingTimer !== null) clearTimeout(this.stylePendingTimer);
+                this.stylePendingTimer = null;
+            }
+            if (this.primaryActionPending) {
+                this.primaryActionPending.unconfirmed = true;
+                if (this.primaryActionTimer !== null) clearTimeout(this.primaryActionTimer);
+                this.primaryActionTimer = null;
+            }
+            for (const operation of Object.values(this.routeOperations)) {
+                if (operation.status === 'pending') operation.status = 'unconfirmed';
+                if (operation.timer !== null) clearTimeout(operation.timer);
+                operation.timer = null;
+            }
+            for (const operation of Object.values(this.groupCutOperations)) {
+                if (['pending', 'saving'].includes(operation.status)) operation.status = 'unconfirmed';
+                for (const item of operation.channels || []) {
+                    if (['pending', 'dispatching'].includes(item.status)) item.status = 'unconfirmed';
+                }
+                if (operation.timer !== null) clearTimeout(operation.timer);
+                operation.timer = null;
+            }
+            for (const operation of Object.values(this.groupAlignOperations)) {
+                if (['pending', 'saving'].includes(operation.status)) operation.status = 'unconfirmed';
+                for (const item of operation.channels || []) {
+                    if (['pending', 'dispatching'].includes(item.status)) item.status = 'unconfirmed';
+                }
+                if (operation.timer !== null) clearTimeout(operation.timer);
+                operation.timer = null;
+            }
+            if (reason) this.showError(reason);
+        },
+
+        get primaryActionTimer() { return this._primaryActionTimer ?? null; },
+        set primaryActionTimer(value) { this._primaryActionTimer = value; },
 
         saveFriendlyName(panel, newName) {
             const trimmed = (newName || '').trim();
