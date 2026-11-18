@@ -12,7 +12,7 @@ Milestone 1 and 2 presented three physical output panels. Actual reference hardw
 
 ## Decision
 
-The dashboard presents **Primary** as the actual hardware M/E 1, regardless of which outputs carry it; **AUX Switcher 1** and **AUX Switcher 2** as independent persistent logical groups that may each own zero or more physical AUX outputs; and **Other Outputs** for all remaining discovered destinations. Physical output routes remain hardware-authoritative. Primary destinations are derived from observed M/E Program feed routing; AUX group memberships are saved application configuration. Mixed AUX routing has no single live Program source and must be resolved by explicit operator action before ordinary group CUT. One M/E command controls its shared engine; AUX group actions may require one route command per physical destination.
+The dashboard presents **Primary Switcher** as the actual hardware M/E 1, regardless of which outputs carry it; **Virtual Switcher 1** and **Virtual Switcher 2** as independent persistent logical groups that may each own zero or more physical AUX outputs; and **Other Outputs** for all remaining discovered destinations. These are default display names; Custom Name does not change internal identity. Physical output routes remain hardware-authoritative. Primary destinations are derived from observed M/E Program feed routing; virtual group memberships are saved application configuration. Mixed AUX routing has no single live Program source and must be resolved by explicit operator action before ordinary group CUT. One M/E command controls its shared engine; virtual group actions may require one route command per physical destination.
 
 Output assignment is an explicit, confirmed operation. Assigning Primary routes an eligible output to the discovered M/E Program feed. Releasing Primary routes the output to the current verified M/E Program **background input**, with an explicit warning that composited key overlays are lost. Missing/unroutable input or active transition blocks release. A default-on operational policy prevents dashboard removal of the final Primary destination; external zero-destination state warns but is never auto-corrected. Releasing a logical AUX output changes saved ownership only and preserves its route.
 
@@ -20,12 +20,12 @@ Persist per-device group assignments, queued Previews, Program targets, and pref
 
 ## Consequences and boundaries
 
-- Milestone 1 remains historical read-only work. Milestone 2 remains the switching infrastructure foundation, but its old UI layout is superseded and has unresolved styling and fail-open transition-guard defects. Neither milestone is a claim of successful hardware validation.
+- Milestone 1 remains historical read-only work. Milestone 2 remains the switching infrastructure foundation, but its old UI layout is superseded. Individual AUX switching was observed working on physical hardware; the M/E CUT and USK follow-up corrections await controlled retest.
 - Milestone 3 is split into reviewed checkpoints: 3A state/persistence, 3B UI, 3C assignment/individual control, 3D TAKE ALL. The previous Milestone 3 settings scope moves to later work. The independent SDI video phase remains deferred.
 - A saved group does not own the hardware route: external changes must be shown, never overwritten on reconnect. An externally M/E-routed group output produces an ownership conflict; the user resolves it explicitly.
 - Multi-output operations are not atomic or frame-synchronous. Confirm each route and report partial or unconfirmed outcomes; never auto-retry uncertain writes.
 - The reference model's connector count, source ID `10010`, and `outNumber - 1` AUX-channel mapping are not safe defaults. Discover and verify capabilities and mapping before enabling writes.
-- The installed transition reader can supply safe-looking defaults when no transition packet has arrived. A distinct completeness signal and fail-closed guard are prerequisites to live M/E operations.
+- The installed transition reader can supply safe-looking defaults when no transition packet has arrived. Milestone 2.1 added a distinct completeness signal and fail-closed CUT guard; the hardware follow-up corrected an overstrict residual-frame-count check. New M/E operations must preserve those checks and undergo controlled validation.
 - Stock `/atem/control/`, the shared ATEM pool/WebSocket, Windows UDP patch, and existing WebATEM capabilities remain protected.
 
 ## Alternatives considered

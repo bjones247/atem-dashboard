@@ -239,5 +239,6 @@ def test_aux_preview_and_master_cut_safety_in_js():
 
     sanctioned = {'connect', 'refresh', 'cut', 'set_aux_output', 'set_preview', 'set_program',
                   'toggle_usk', 'dashboard_cut_me', 'dashboard_cut_aux',
-                  'dashboard_review_me', 'dashboard_review_aux'}
+                  'dashboard_review_me', 'dashboard_review_aux',
+                  'dashboard_toggle_usk', 'dashboard_review_usk'}
     assert set(sent_commands).issubset(sanctioned)

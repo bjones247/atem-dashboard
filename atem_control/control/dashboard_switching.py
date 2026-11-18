@@ -74,8 +74,9 @@ def me_cut_readiness(connection):
         preview_source = _entry(mx, 'input-properties', preview)
         if program_source is None or preview_source is None:
             return 'M/E Program or Preview source is missing from the device catalog.', program, preview
-        if getattr(program_source, 'available_me1', None) is not True or getattr(preview_source, 'available_me1', None) is not True:
-            return 'M/E Program or Preview source is not confirmed as routable.', program, preview
+        # Both sources are already observed on real M/E buses. Availability
+        # flags describe a new bus assignment and may omit internal sources;
+        # CUT only takes the currently selected Preview bus to Program.
         reason = _pending(connection, ('me', 0), program)
         if reason:
             return reason, program, preview
@@ -98,9 +99,9 @@ def me_cut_readiness(connection):
         handle_position = getattr(position, 'position', None)
         if not _integer(handle_position) or handle_position != 0:
             return 'M/E transition position is unknown or not at rest.', program, preview
-        frames_remaining = getattr(position, 'frames_remaining', None)
-        if not _integer(frames_remaining) or frames_remaining != 0:
-            return 'M/E transition frame count is unknown or not at rest.', program, preview
+        # TrPs frames_remaining may retain a value after the ATEM reports
+        # in_transition=False and position=0. Those two observed fields are
+        # the rest-state guard; the residual countdown is informational.
         if program == preview:
             return 'M/E Preview is already live; select a different Preview source.', program, preview
         return None, program, preview
@@ -136,6 +137,32 @@ def aux_cut_readiness(connection, channel, target=None, expected_live=None):
         return None, live
 
 
+def _usk_on_air(mx, key_index):
+    me_keys = _entry(mx, 'key-on-air', 0)
+    entry = me_keys.get(key_index) if isinstance(me_keys, dict) else None
+    value = getattr(entry, 'enabled', None)
+    return value if type(value) is bool else None
+
+
+def usk_toggle_readiness(connection, key_index, expected_on_air=None):
+    """Return (reason, observed_on_air) from a received KeOn packet."""
+    with _lock:
+        mx, reason = _raw(connection)
+        if reason:
+            return reason, None
+        if not _integer(key_index):
+            return 'Invalid upstream keyer index.', None
+        live = _usk_on_air(mx, key_index)
+        if live is None:
+            return 'Upstream keyer on-air state has not been observed.', None
+        reason = _pending(connection, ('usk', key_index), live)
+        if reason:
+            return reason, live
+        if expected_on_air is not None and expected_on_air is not live:
+            return 'Upstream keyer changed; review current on-air state.', live
+        return None, live
+
+
 def safety_snapshot(connection):
     """UI projection from the same evaluation used at the command boundary."""
     with _lock:
@@ -147,8 +174,16 @@ def safety_snapshot(connection):
         for channel in range(min(count, 64)) if _integer(count) else ():
             aux_reason, live = aux_cut_readiness(connection, channel)
             aux[str(channel)] = {'reason': aux_reason, 'live': live}
+        usk = {}
+        me_keys = _entry(mx, 'key-on-air', 0) if mx else None
+        if isinstance(me_keys, dict):
+            for key_index in me_keys:
+                if _integer(key_index):
+                    key_reason, on_air = usk_toggle_readiness(connection, key_index)
+                    usk[str(key_index)] = {'reason': key_reason, 'onAir': on_air}
         return {'fresh': freshness_reason is None,
-                'meCut': {'reason': reason, 'program': program, 'preview': preview}, 'aux': aux}
+                'meCut': {'reason': reason, 'program': program, 'preview': preview},
+                'aux': aux, 'usk': usk}
 
 
 def _record(connection, key, before, target):
@@ -193,16 +228,37 @@ def dispatch_aux_cut(connection, data):
         return ok, error
 
 
+def dispatch_usk_toggle(connection, data):
+    """Guard an explicit USK on-air target on the pooled command path."""
+    with _lock:
+        key_index = data.get('key_index')
+        expected = data.get('expected_on_air')
+        target = data.get('target_on_air')
+        if data.get('me', 0) != 0 or type(expected) is not bool or type(target) is not bool or target is expected:
+            return False, 'Expected M/E 1 keyer state and opposite on-air target are required.'
+        reason, live = usk_toggle_readiness(connection, key_index, data['expected_on_air'])
+        if reason:
+            return False, reason
+        ok, error = dispatch(connection, 'set_usk_on_air',
+                             {'me': 0, 'key_index': key_index, 'enabled': target})
+        if ok:
+            _record(connection, ('usk', key_index), live, target)
+        return ok, error
+
+
 def review_unconfirmed(connection, kind, channel=0):
     """Explicit read-only reconciliation after timeout; never retries a write."""
     with _lock:
-        if kind not in ('me', 'aux') or (kind == 'aux' and not _integer(channel)):
+        if kind not in ('me', 'aux', 'usk') or (kind in ('aux', 'usk') and not _integer(channel)):
             return False, 'Unknown dashboard switching operation.'
         mx, reason = _raw(connection)
         if reason:
             return False, reason
-        key = ('me', 0) if kind == 'me' else ('aux', channel)
-        live = _source(mx, 'program-bus-input' if kind == 'me' else 'aux-output-source', key[1])
+        key = ('me', 0) if kind == 'me' else (kind, channel)
+        if kind == 'usk':
+            live = _usk_on_air(mx, channel)
+        else:
+            live = _source(mx, 'program-bus-input' if kind == 'me' else 'aux-output-source', key[1])
         if live is None:
             return False, 'Current hardware route has not been observed.'
         operations = _operations.get(connection, {})

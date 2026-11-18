@@ -185,7 +185,9 @@ document.addEventListener('alpine:init', () => {
                     if (p.pending) this.markUnconfirmed(p);
                 });
                 this.clearAllPendingTimeouts();
-                this.upstreamKeyers.forEach(k => k.pending = false);
+                this.upstreamKeyers.forEach(k => {
+                    if (k.pending) this.markKeyerUnconfirmed(k);
+                });
                 this.scheduleReconnect();
             };
 
@@ -235,6 +237,9 @@ document.addEventListener('alpine:init', () => {
                             if (p.pending) this.markUnconfirmed(p);
                         });
                         this.clearAllPendingTimeouts();
+                        this.upstreamKeyers.forEach(k => {
+                            if (k.pending) this.markKeyerUnconfirmed(k);
+                        });
                     }
                     break;
 
@@ -247,7 +252,11 @@ document.addEventListener('alpine:init', () => {
                                 p.outNumber - 1 === data.aux_channel);
                         if (p.pending && affectsPending) this.markUnconfirmed(p);
                     });
-                    this.upstreamKeyers.forEach(k => k.pending = false);
+                    this.upstreamKeyers.forEach(k => {
+                        const affectsPending = !data.command ||
+                            (data.command === 'dashboard_toggle_usk' && k.keyIndex === data.key_index);
+                        if (k.pending && affectsPending) this.markKeyerUnconfirmed(k);
+                    });
                     break;
 
                 case 'dashboard_reviewed':
@@ -257,6 +266,14 @@ document.addEventListener('alpine:init', () => {
                             p.unconfirmed = false;
                         }
                     });
+                    if (data.kind === 'usk') {
+                        const keyer = this.upstreamKeyers.find(k => k.keyIndex === data.key_index);
+                        if (keyer) {
+                            keyer.unconfirmed = false;
+                            keyer.pendingTarget = null;
+                            keyer.disabledReason = '';
+                        }
+                    }
                     break;
 
                 case 'atem_state':
@@ -452,43 +469,63 @@ document.addEventListener('alpine:init', () => {
             }
 
             const usk = me0.usk;
-            const states = usk.states || [];
             const data = usk.data || [];
-            const count = Math.max(states.length, data.length);
+            const count = Math.max((usk.states || []).length, data.length);
 
+            const previous = this.upstreamKeyers;
             const keyers = [];
             for (let i = 0; i < count; i++) {
-                const onAir = !!states[i];
+                const observed = this.state?.dashboardSafety?.usk?.[String(i)];
+                const onAir = typeof observed?.onAir === 'boolean' ? observed.onAir : null;
                 const keyData = data[i] || {};
                 const fillSourceId = keyData.fill_source ?? null;
                 const fillSource = this.sources.find(s => s.source === fillSourceId);
                 const fillLabel = fillSource ? (fillSource.short || fillSource.long || `IN ${fillSourceId}`) : (fillSourceId !== null ? `Src ${fillSourceId}` : 'None');
 
                 // Preserve pending state across reconcile
-                const existing = this.upstreamKeyers.find(k => k.keyIndex === i);
-                let pending = existing ? existing.pending : false;
-                let pendingTimeoutId = existing ? existing.pendingTimeoutId : null;
+                const existing = previous.find(k => k.keyIndex === i);
+                let pending = existing?.pending || false;
+                let unconfirmed = existing?.unconfirmed || false;
+                let pendingTarget = existing?.pendingTarget ?? null;
+                let pendingTimeoutId = existing?.pendingTimeoutId ?? null;
 
-                // If state flipped to target, clear pending
-                if (pending && existing && existing.onAir !== onAir) {
-                    if (pendingTimeoutId) clearTimeout(pendingTimeoutId);
+                // Confirm the requested state for this specific keyer.
+                if (pendingTarget !== null && onAir === pendingTarget) {
+                    if (pendingTimeoutId !== null) clearTimeout(pendingTimeoutId);
                     pending = false;
+                    unconfirmed = false;
+                    pendingTarget = null;
                     pendingTimeoutId = null;
                 }
+                const disabledReason = pending ? 'Keyer toggle awaiting hardware confirmation.' :
+                    unconfirmed ? 'Previous keyer toggle unconfirmed. Review hardware state.' :
+                    onAir === null ? 'Keyer on-air state has not been observed.' :
+                    (observed?.reason || '');
 
-                keyers.push({
+                const keyer = existing || {};
+                Object.assign(keyer, {
                     keyIndex: i,
                     label: `KEY ${i + 1}`,
                     onAir: onAir,
-                    statusText: onAir ? 'ON AIR' : 'OFF',
+                    statusText: onAir === null ? 'UNKNOWN' : (onAir ? 'ON AIR' : 'OFF AIR'),
                     fillSourceId: fillSourceId,
                     fillLabel: fillLabel,
                     pending: pending,
+                    unconfirmed: unconfirmed,
+                    disabledReason: disabledReason,
+                    pendingTarget: pendingTarget,
                     pendingTimeoutId: pendingTimeoutId
                 });
+                keyers.push(keyer);
             }
 
-            this.upstreamKeyers = keyers;
+            // Alpine reuses x-for DOM nodes by key. Replacing their objects
+            // left :class and :aria-disabled bound to an older object even
+            // though x-text had refreshed. Preserve reactive object identity
+            // and replace the array only when the discovered keyer set changes.
+            if (keyers.length !== previous.length || keyers.some((k, i) => k !== previous[i])) {
+                this.upstreamKeyers = keyers;
+            }
         },
 
         // ---------------------------------------------------------------------
@@ -666,27 +703,48 @@ document.addEventListener('alpine:init', () => {
         },
 
         toggleUSK(keyIndex) {
-            if (!this.hardwareReady) {
-                this.showError('Switcher disconnected or hardware state stale. Keyer toggle unavailable.');
-                return;
-            }
-
             const keyer = this.upstreamKeyers.find(k => k.keyIndex === keyIndex);
-            if (!keyer || keyer.pending) return;
+            if (!keyer) return;
+            const reason = this.keyerToggleReason(keyer);
+            if (reason) { this.showError(reason); return; }
 
             keyer.pending = true;
-            if (keyer.pendingTimeoutId) clearTimeout(keyer.pendingTimeoutId);
+            keyer.pendingTarget = !keyer.onAir;
+            keyer.disabledReason = 'Keyer toggle awaiting hardware confirmation.';
+            if (keyer.pendingTimeoutId !== null) clearTimeout(keyer.pendingTimeoutId);
             keyer.pendingTimeoutId = setTimeout(() => {
-                keyer.pending = false;
-                keyer.pendingTimeoutId = null;
-                this.showError(`KEY ${keyIndex + 1} toggle timed out. Hardware did not confirm.`);
-            }, 2500);
+                const current = this.upstreamKeyers.find(k => k.keyIndex === keyIndex);
+                if (current?.pending) {
+                    this.markKeyerUnconfirmed(current);
+                    this.showError(`KEY ${keyIndex + 1} toggle timed out. Hardware result is unconfirmed.`);
+                }
+            }, 3200);
 
             this.ws.send(JSON.stringify({
-                command: 'toggle_usk',
+                command: 'dashboard_toggle_usk',
                 key_index: keyIndex,
+                expected_on_air: keyer.onAir,
+                target_on_air: keyer.pendingTarget,
                 me: 0
             }));
+        },
+
+        keyerToggleReason(keyer) {
+            if (!this.hardwareReady) return 'Switcher disconnected or hardware state stale.';
+            return keyer.disabledReason || '';
+        },
+
+        markKeyerUnconfirmed(keyer) {
+            if (keyer.pendingTimeoutId !== null) clearTimeout(keyer.pendingTimeoutId);
+            keyer.pendingTimeoutId = null;
+            keyer.pending = false;
+            keyer.unconfirmed = true;
+            keyer.disabledReason = 'Previous keyer toggle unconfirmed. Review hardware state.';
+        },
+
+        reviewKeyer(keyIndex) {
+            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+            this.ws.send(JSON.stringify({command: 'dashboard_review_usk', key_index: keyIndex}));
         },
 
         // Master CUT remains disabled in Milestone 2

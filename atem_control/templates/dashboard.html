@@ -59,6 +59,29 @@
         color: var(--text-faint) !important;
         border-color: var(--border) !important;
     }
+    .production-dashboard .btn.btn-key-active,
+    .production-dashboard .btn.btn-key-active:hover {
+        background-color: var(--pgm, #dc2626) !important;
+        color: #fff !important;
+        border-color: var(--pgm, #dc2626) !important;
+        transition: none !important;
+    }
+    .production-dashboard .btn.btn-key-active:hover {
+        filter: brightness(1.15);
+        box-shadow: 0 0 12px rgba(220, 38, 38, 0.6);
+    }
+    .production-dashboard .btn.btn-key-pending,
+    .production-dashboard .btn.btn-key-pending:hover {
+        background-color: #92400e !important;
+        color: #fff !important;
+        border-color: #f59e0b !important;
+    }
+    .production-dashboard .btn.btn-key-unconfirmed,
+    .production-dashboard .btn.btn-key-unconfirmed:hover {
+        background-color: var(--surface-raised) !important;
+        color: var(--text-faint) !important;
+        border: 2px dashed #f59e0b !important;
+    }
 </style>
 {% endblock %}
 
@@ -313,19 +336,22 @@
                             <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
                                 <template x-for="k in upstreamKeyers" :key="k.keyIndex">
                                     <button type="button"
-                                            class="btn btn-sm h-auto py-2 flex flex-col justify-between border text-left transition-all"
+                                            class="btn btn-sm h-auto py-2 flex flex-col justify-between border text-left"
                                             :class="{
-                                                'btn-key-active': k.onAir,
-                                                'bg-base-300 border-base-content/10 hover:bg-base-100': !k.onAir,
-                                                'opacity-50 pointer-events-none': k.pending || !hardwareReady
+                                                'btn-key-active': k.onAir === true && !k.pending && !k.unconfirmed,
+                                                'btn-key-pending': k.pending,
+                                                'btn-key-unconfirmed': k.unconfirmed,
+                                                'bg-base-300 border-base-content/10 hover:bg-base-100': k.onAir === false && !k.pending && !k.unconfirmed,
+                                                'cursor-not-allowed': !hardwareReady || !!k.disabledReason,
+                                                'opacity-50': !hardwareReady || (!!k.disabledReason && !k.pending && !k.unconfirmed)
                                             }"
-                                            :disabled="k.pending || !hardwareReady"
+                                            :aria-disabled="!hardwareReady || !!k.disabledReason"
                                             @click="toggleUSK(k.keyIndex)"
-                                            :title="'Toggle ' + k.label + ' on-air status'">
+                                            :title="k.disabledReason || ('Toggle ' + k.label + ' on-air status')">
                                         <div class="flex items-center justify-between w-full">
                                             <span class="font-bold text-xs" x-text="k.label"></span>
                                             <span x-show="!k.pending" class="badge badge-xs font-semibold"
-                                                  :class="k.onAir ? 'badge-primary' : 'badge-ghost text-[10px]'"
+                                                  :class="k.onAir === true ? 'badge-onair' : 'badge-ghost text-[10px]'"
                                                   x-text="k.statusText"></span>
                                             <span x-show="k.pending" class="loading loading-spinner loading-xs"></span>
                                         </div>
@@ -334,6 +360,17 @@
                                             <span class="font-medium truncate block mt-0.5" x-text="k.fillLabel"></span>
                                         </div>
                                     </button>
+                                </template>
+                            </div>
+                            <template x-for="k in upstreamKeyers" :key="'reason-' + k.keyIndex">
+                                <p x-show="k.disabledReason" class="text-xs text-warning mt-1"
+                                   x-text="k.label + ': ' + k.disabledReason"></p>
+                            </template>
+                            <div x-show="upstreamKeyers.some(k => k.unconfirmed)" class="mt-2 flex flex-wrap gap-2">
+                                <template x-for="k in upstreamKeyers" :key="'review-' + k.keyIndex">
+                                    <button x-show="k.unconfirmed" type="button" class="btn btn-xs btn-outline"
+                                            :disabled="!hardwareReady" @click="reviewKeyer(k.keyIndex)"
+                                            x-text="'Review ' + k.label + ' state'"></button>
                                 </template>
                             </div>
                         </div>
@@ -405,18 +442,22 @@
         <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
             <template x-for="k in upstreamKeyers" :key="'fallback-' + k.keyIndex">
                 <button type="button"
-                        class="btn btn-sm h-auto py-2 flex flex-col justify-between border text-left transition-all"
+                        class="btn btn-sm h-auto py-2 flex flex-col justify-between border text-left"
                         :class="{
-                            'btn-key-active': k.onAir,
-                            'bg-base-300 border-base-content/10 hover:bg-base-100': !k.onAir,
-                            'opacity-50 pointer-events-none': k.pending || !hardwareReady
+                            'btn-key-active': k.onAir === true && !k.pending && !k.unconfirmed,
+                            'btn-key-pending': k.pending,
+                            'btn-key-unconfirmed': k.unconfirmed,
+                            'bg-base-300 border-base-content/10 hover:bg-base-100': k.onAir === false && !k.pending && !k.unconfirmed,
+                            'cursor-not-allowed': !hardwareReady || !!k.disabledReason,
+                            'opacity-50': !hardwareReady || (!!k.disabledReason && !k.pending && !k.unconfirmed)
                         }"
-                        :disabled="k.pending || !hardwareReady"
-                        @click="toggleUSK(k.keyIndex)">
+                        :aria-disabled="!hardwareReady || !!k.disabledReason"
+                        @click="toggleUSK(k.keyIndex)"
+                        :title="k.disabledReason || ('Toggle ' + k.label + ' on-air status')">
                     <div class="flex items-center justify-between w-full">
                         <span class="font-bold text-xs" x-text="k.label"></span>
                         <span x-show="!k.pending" class="badge badge-xs font-semibold"
-                              :class="k.onAir ? 'badge-primary' : 'badge-ghost text-[10px]'"
+                              :class="k.onAir === true ? 'badge-onair' : 'badge-ghost text-[10px]'"
                               x-text="k.statusText"></span>
                         <span x-show="k.pending" class="loading loading-spinner loading-xs"></span>
                     </div>
@@ -425,6 +466,17 @@
                         <span class="font-medium truncate block mt-0.5" x-text="k.fillLabel"></span>
                     </div>
                 </button>
+            </template>
+        </div>
+        <template x-for="k in upstreamKeyers" :key="'fallback-reason-' + k.keyIndex">
+            <p x-show="k.disabledReason" class="text-xs text-warning mt-1"
+               x-text="k.label + ': ' + k.disabledReason"></p>
+        </template>
+        <div x-show="upstreamKeyers.some(k => k.unconfirmed)" class="mt-2 flex flex-wrap gap-2">
+            <template x-for="k in upstreamKeyers" :key="'fallback-review-' + k.keyIndex">
+                <button x-show="k.unconfirmed" type="button" class="btn btn-xs btn-outline"
+                        :disabled="!hardwareReady" @click="reviewKeyer(k.keyIndex)"
+                        x-text="'Review ' + k.label + ' state'"></button>
             </template>
         </div>
     </div>

@@ -377,13 +377,15 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
         # thread-sensitive lane so one slow call elsewhere can't queue
         # every operator's commands behind it. The audio verbs go to the
         # mixer the last pushed state named (Fairlight or classic).
-        if command in ('dashboard_review_me', 'dashboard_review_aux'):
-            kind = 'me' if command == 'dashboard_review_me' else 'aux'
+        if command in ('dashboard_review_me', 'dashboard_review_aux', 'dashboard_review_usk'):
+            kind = command.removeprefix('dashboard_review_')
+            index = data.get('key_index') if kind == 'usk' else data.get('aux_channel', 0)
             ok, err = await sync_to_async(dashboard_switching.review_unconfirmed, thread_sensitive=False)(
-                self.connection, kind, data.get('aux_channel', 0))
+                self.connection, kind, index)
             if ok:
                 await self.send_json({'type': 'dashboard_reviewed', 'kind': kind,
-                                      'aux_channel': data.get('aux_channel', 0)})
+                                      'aux_channel': data.get('aux_channel', 0),
+                                      'key_index': data.get('key_index')})
                 await self.send_current_state()
             else:
                 await self.send_json({'type': 'error', 'message': err})
@@ -396,6 +398,10 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
             ok, err = await sync_to_async(dashboard_switching.dispatch_aux_cut, thread_sensitive=False)(
                 self.connection, data)
             logged_command = 'set_aux_output'
+        elif command == 'dashboard_toggle_usk':
+            ok, err = await sync_to_async(dashboard_switching.dispatch_usk_toggle, thread_sensitive=False)(
+                self.connection, data)
+            logged_command = 'toggle_usk'
         else:
             ok, err = await sync_to_async(dispatch_command, thread_sensitive=False)(
                 self.connection, command, data, self._audio_mixer())
@@ -405,6 +411,7 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
             logger.warning(f"Command {command} failed: {err}")
             await self.send_json({'type': 'error', 'command': command,
                                   'aux_channel': data.get('aux_channel'),
+                                  'key_index': data.get('key_index'),
                                   'message': err or f'Failed to execute {command}'})
             return
 

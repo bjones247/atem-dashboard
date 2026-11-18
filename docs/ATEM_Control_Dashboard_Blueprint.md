@@ -19,12 +19,12 @@ This document supersedes version 0.5's operator model of three fixed physical ou
 
 The Production Dashboard presents three **switching controls**, not three physical destinations:
 
-1. **PRIMARY** controls the real hardware M/E 1 Program and Preview buses, transitions, and keyers. It exists even when no physical output carries M/E Program.
-2. **AUX SWITCHER 1** is a software-defined Preview/Program group for zero or more physical AUX-routable outputs.
-3. **AUX SWITCHER 2** is a separate software-defined group with its own assignments, queue, target, pending state, and errors.
+1. **PRIMARY SWITCHER** controls the real hardware M/E 1 Program and Preview buses, transitions, and keyers. It exists even when no physical output carries M/E Program.
+2. **VIRTUAL SWITCHER 1** is a software-defined Preview/Program group for zero or more physical AUX-routable outputs.
+3. **VIRTUAL SWITCHER 2** is a separate software-defined group with its own assignments, queue, target, pending state, and errors.
 4. **OTHER OUTPUTS**, below the columns, lists every discovered physical output not effectively controlled by those groups and offers direct routing where the device exposes a validated command path.
 
-A physical output is a hardware routing destination. A logical AUX switcher is an application control group; it is not another M/E. The current source routed to each physical output is always ATEM-owned. Logical ownership, queues, targets, and presentation preferences are application-owned. Neither a saved assignment nor a transmitted command proves the physical route changed.
+A physical output is a hardware routing destination. A virtual switcher is an application control group using AUX routing; it is not another M/E. The current source routed to each physical output is always ATEM-owned. Logical ownership, queues, targets, and presentation preferences are application-owned. Neither a saved assignment nor a transmitted command proves the physical route changed. Use **Primary Switcher**, **Virtual Switcher 1**, and **Virtual Switcher 2** as default operator-facing names; AUX remains the correct hardware/protocol term.
 
 Discover physical output count, identity, connector label, route, controllability, and available source IDs at runtime. The reference model may expose six assignable SDI outputs; that is a hardware expectation to verify, never a loop bound or fallback. Show an output with an unknown or unsupported route as read-only with its actual observed status and a reason. Do not invent output-to-AUX channel mappings. OUT 1 is a preferred initial Primary destination **when appropriate and explicitly selected**, never a mandatory or automatically routed destination.
 
@@ -47,7 +47,7 @@ The current `topology.outputs` is derived from output port metadata and `auxOutp
 | Source | Hardware source ID, short/long names, type, per-destination availability; hardware owned |
 | Primary | M/E 1 Program background, Preview, transition style/status/selection completeness, discovered USKs and DSKs; hardware owned |
 | Primary destinations | **Derived** from all observed physical routes equal to the discovered M/E 1 Program feed source ID; no saved ownership list |
-| AUX group configuration | Group ID 1 or 2, assigned output keys, queued Preview source ID, saved Program target, preferences, revision; application owned |
+| Virtual switcher configuration | Stable group ID 1 or 2, assigned output keys, queued Preview source ID, saved Program target, custom display name, preferences, revision; application owned |
 | Effective AUX group state | Per-output observed routes, uniform live ID or MIXED ROUTING, conflicts, readiness; derived from hardware plus configuration |
 | Operation | Intended target per engine/output, initiating configuration and hardware revisions, pending/confirmed/unconfirmed/error status; application runtime, journaled where needed |
 
@@ -110,17 +110,23 @@ The explicit resolution workflow is: choose a target source, review a per-output
 
 ## 4. Operator interface
 
-### 4.1 PRIMARY column
+### 4.1 PRIMARY SWITCHER column
 
 Always show M/E 1 Program background, Preview, transition state/style, next-transition background/key selections, all discovered upstream keyers and downstream keyers, and `OUTPUTS: OUT …` derived from actual M/E Program feed routes. The compact **Change** button opens the assignment dialog. Zero destinations yields a conspicuous warning, not a missing Primary panel. No software T-bar.
+
+At the top, show **Primary Switcher** (or its Custom Name), then compact badges for every output actually routed to M/E Program, followed by **Change**. Show `M/E PROGRAM` directly beneath the header to identify the hardware engine. Badge examples such as `[OUT 1] [OUT 5]` are illustrative; derive all output names and membership from observed device routes. Custom Name changes presentation only, never the M/E identity, ownership, or routing.
 
 Program buttons identify the authoritative live M/E background in red. Hardware Preview buttons identify the actual M/E Preview in green and send `set_preview` only when selected. A protected direct Program mode may expose `set_program` after explicit operator enablement; in normal Preview/CUT mode the Program row is an indicator and remains visibly red. CUT sends one native M/E CUT. AUTO sends one native M/E AUTO. MIX/WIPE selection, where supported, changes **transition style**; it does not execute a transition. Show unsupported styles disabled rather than guessing the device can perform them.
 
 Provide an explicit Primary **take action** choice for future TAKE ALL (`CUT` or `AUTO`, default `CUT`), separately from transition style (`MIX`, `WIPE`, etc.). The operator must see both choices before TAKE ALL. Ordinary background-only CUT requires known BKGD selection, no tied keyer, no active transition, fresh state, and no engine pending action. Missing/malformed transition data blocks it. An AUTO with keyed next-transition selection is allowed only in a separately explicit keyed-transition workflow that identifies affected keys and has appropriate readiness and confirmation; never silently clear or modify key ties. Until verified, fail closed. Keyer on-air toggles use observed state, suppress duplicate pending toggles, and reconcile late results.
 
-### 4.2 AUX SWITCHER 1 and AUX SWITCHER 2 columns
+Show discovered upstream keyers in one compact row or wrapping grid, and discovered downstream keyers in a separate compact row immediately below. Match their button footprint to Preview/Program source buttons. Keep labels, fill-source information where available, and ON AIR/OFF AIR text readable. Give ON AIR, OFF AIR, pending, disabled, and hover distinct appearances. Reconcile each keyer independently against its observed target so a confirmed on-air toggle immediately permits an off-air toggle; one keyer's action must not unlock another. Use the existing WebATEM USK and DSK command paths with appropriate readiness checks.
+
+### 4.2 VIRTUAL SWITCHER 1 and VIRTUAL SWITCHER 2 columns
 
 Each column shows its saved output list, **Change**, queued green Preview, live red Program only when all assigned routes are uniform, saved target when empty, and independent pending/error status. An empty group's **Set target** action saves an explicitly chosen Program target without claiming any live hardware change. Preview selection is software-only and persists per device/group with revision checks. Program is read-only in normal mode. A direct Program mode, if retained, requires an explicit operator choice and the same per-output validation/confirmation as a group routing action.
+
+Each header shows **Virtual Switcher 1** or **Virtual Switcher 2** (or its Custom Name), compact badges for validated persistent assignments, and a compact **Change** button. Examples such as `[OUT 2]` or `[OUT 3]` do not imply fixed assignments. A custom display name must not alter the stable group ID, ownership, queued source, or command target.
 
 CUT routes queued Preview to **each** assigned physical output, one command per distinct destination as needed. Require a nonempty, conflict-free, uniform group; a valid different queued target; current observed routes; and no pending or stale state. Track each output independently and never describe the batch as atomic or frame synchronous. If all routes confirm, set saved Program target to the confirmed source. Swap the single known prior live source into Preview only after all expected routes confirm. On partial failure or late confirmation, show actual per-output routes, retain or mark the queue explicitly, and never invent one prior Program source. A mixed group must use the explicit resolution workflow first. A zero-output group has no live CUT action.
 
@@ -132,6 +138,8 @@ Show all discovered outputs without an effective owner in compact horizontally s
 
 Use source IDs under labels; order physical inputs, Black, color sources, then media players where available. Keep a currently live but otherwise filtered source visible as an observed status, never mislabel it. Green means queued or hardware Preview; red means **observed** live Program. Add ON AIR/NEXT text so color is not the only cue. Ready, hovered, pending, blocked, disconnected, stale, and unconfirmed states must be visually distinct and explain their reason. Brand styling must not erase a live red indicator when direct Program clicking is disabled, or make a ready CUT look disabled on hover. Preserve existing WebATEM page styles by scoping dashboard CSS.
 
+Align all three panel bodies at the **top**. Each panel grows according to its own content; a shorter panel must not be vertically centered or bottom-aligned or push another panel downward. Retain the Custom Name control. Default names are Primary Switcher, Virtual Switcher 1, and Virtual Switcher 2; names are labels only and do not change internal identity or hardware routing.
+
 ### 4.5 TAKE ALL (3D only)
 
 Keep a prominent **TAKE ALL** control visibly disabled through 3A–3C. Its eventual operation applies the selected Primary action (one M/E CUT or AUTO, if ready) and each AUX group's queued source to its assigned outputs. Preflight **every participating engine and physical output**, including ownership, mixed routing, source availability, key ties, transition status, freshness, and pending actions. A zero-output AUX group is an explicit nonparticipant; a group with outputs and no valid queue blocks. Prevent duplicate M/E commands and duplicate routing of any destination. Present the intended per-destination plan and confirmation appropriate to its impact.
@@ -142,7 +150,7 @@ Dispatch through the shared command path in a controlled sequence. Record indepe
 
 Before every hardware write, require a ready shared connection, fresh and sufficient state, validated device/output identity, a routable target, no ownership or pending conflict, and operation-specific guards. Disable action when data are missing or stale. Server-side preflight must re-read raw/shared state, because UI checks alone cannot protect against another tab. External hardware controls may race between preflight and command; do not promise atomicity against them.
 
-The current M/E guard in `production_dashboard.js` returns false when transition selection or transition activity is missing, and `atemwire` may default absent transition settings to BKGD-only. This is an unresolved **fail-open safety defect**. Before enabling redesigned M/E CUT/AUTO/TAKE ALL for live validation, propagate whether required transition fields were actually received; block when unknown, malformed, tied unexpectedly, or in progress. Do not change ATEM next-transition settings as a workaround. For intentional keyed transitions, require explicit intent and verify actual device semantics.
+The original M/E UI guard treated absent transition data as safe, and `atemwire` can synthesize BKGD-only defaults. Milestone 2.1 added raw-state server preflight. Hardware validation then showed an overstrict guard: `frames_remaining` could be nonzero while the observed `in_transition` flag was false and the handle position was zero. The remediation relies on the received transition packet, known BKGD/key selection, `in_transition === false`, and position zero; a residual frame count alone does not mark an active transition. Retain this fail-closed policy for redesigned CUT/AUTO/TAKE ALL, and verify the corrected CUT on isolated hardware. Do not change ATEM next-transition settings as a workaround. For intentional keyed transitions, require explicit intent and verify actual device semantics.
 
 For all writes, distinguish accepted/enqueued, pending, confirmed by observed state, rejected, and timed out/unconfirmed. A timeout does not prove the route stayed unchanged. Continue reconciling late state; avoid a stale AUX Preview swap or false success when another operator selected the same target. A matching target route alone may be ambiguous if external changes occurred; retain operation generation/baseline and report uncertainty where causality cannot be established. On disconnect disable writes, label last observation stale, and resync before re-enabling. Never issue a catch-up route on reconnect.
 
@@ -154,9 +162,9 @@ Preserve stock `/atem/control/`, existing WebATEM hosting/authentication assumpt
 |---|---|---|
 | Milestone 0 | Historical integration inventory and WebATEM extension choice | Retained |
 | Milestone 1 | Historical read-only three-physical-output foundation | Completed code, superseded UI model |
-| Milestone 2 | Historical individual switching infrastructure: source discovery, virtual AUX Preview/CUT, M/E Preview/CUT, linked M/E, USK toggles, reconciliation, initial tests | Implemented, **not hardware validated**; fail-open guard and old UI defects remain |
+| Milestone 2 / 2.1 | Historical individual switching infrastructure and focused safety/reconciliation hardening | AUX operation observed working on physical ATEM; M/E CUT and USK follow-up corrections tested offline, awaiting controlled retest; old panel model superseded |
 | **3A State and persistence** | Dynamic output/capability map, identity binding, saved logical assignments/queues/targets, revisions, mixed/conflict projection, server-side state freshness and transition completeness | Review design, migrations, fake-state behavior before 3B |
-| **3B New interface** | Three switcher columns, Other Outputs, assignment-dialog staging, live Program/Preview and status presentation; TAKE ALL disabled | Review rendered/offline interaction behavior before 3C |
+| **3B New interface** | Top-aligned Primary Switcher and two Virtual Switcher columns, output badges/Change, Custom Name, compact separate USK/DSK rows, Other Outputs, live indicators; TAKE ALL disabled | Review rendered/offline interaction behavior before 3C |
 | **3C Assignment and individual control** | Primary assign/release, AUX assign/release, Other Outputs direct route, group CUT, M/E Program/Preview/CUT/AUTO/style, USK/DSK, per-output confirmation, fail-closed guards | Review fake-protocol results and plan controlled hardware rehearsal before 3D |
 | **3D TAKE ALL** | Coordinated readiness, deduplicated dispatch, partial outcomes, controlled device validation | Separate implementation authorization after 3A–3C; explicit operator approval for hardware tests |
 | Milestone 4+ / Later | Advanced settings, operational refinements, release hardening, optional packaging, SDI multiview capture/video thumbnails, and optional ATEM protocol simulator integration (evaluate pyAtemSim or equivalent for hardware-independent development and testing) | Separately scoped and authorized; simulator testing supplements, never replaces, physical hardware validation |
@@ -190,12 +198,15 @@ Every test that could send a command must run against a fake connection unless t
 | A19 | Primary Program and Preview indicators follow hardware and external changes even when Program clicks are disabled. |
 | A20 | CUT and AUTO are distinct from transition-style selection; supported MIX/WIPE selection configures style without taking a transition; no T-bar is added. |
 | A21 | Missing/malformed transition settings, active transition, unintended tied key, or stale state blocks background-only CUT; keyed AUTO requires explicit intent. |
-| A22 | Discovered USK and DSK toggles update from observed hardware and suppress duplicate pending actions. |
+| A22 | Discover USK and DSK counts dynamically; each keyer independently follows observed on-air state, clears pending on its own confirmed target, permits immediate on/off retoggle, and suppresses genuine duplicate pending actions. |
 | A23 | Ready, hover, disabled, pending, blocked, mixed, disconnected, and unconfirmed UI states have clear distinct styling and reasons. |
 | A24 | Late confirmation, command error, timeout, external route change, reconnect, and partial multi-output failure never claim unobserved success or trigger automatic retry. |
 | A25 | TAKE ALL stays disabled through 3A–3C. In 3D, preflight every participant, dispatch at most one M/E action and one route per destination, and report partial results without claiming atomicity. |
 | A26 | Stock WebATEM `/atem/control/`, AUX/M/E/keyer, audio, media, macros, profiles, HyperDeck, and settings routes still work; the new page shares the pooled connection. |
 | A27 | Device identity ambiguity, unsupported output mapping, or mismatched saved capabilities blocks writes and does not apply another device's configuration. |
+| A28 | Headers use default names Primary Switcher, Virtual Switcher 1, and Virtual Switcher 2; Custom Name changes only the displayed label, never stable identity or routing. Primary badges reflect observed M/E Program destinations; virtual badges reflect validated persistent assignments; each header has a compact Change control. |
+| A29 | All three panel bodies align at the top and size independently; a short panel never shifts another panel down. |
+| A30 | Primary shows compact source-sized USK buttons in one row/wrapping grid and DSK buttons immediately below in a separate row, with readable key/fill labels and distinct ON AIR, OFF AIR, pending, disabled, and hover states. |
 
 **Hardware rehearsal, only with operator approval:** verify physical connector ↔ AUX command mapping; real M/E Program feed discovery; safe background-only CUT/USK behavior with keys tied and untied; transition-style and AUTO semantics; DSK control; Primary release background versus keyed composite; external route and multi-tab races; disconnect/reconnect; individual and TAKE ALL partial outcomes; stock control cross-view synchronization. Isolate every affected live destination before any write. Record observations separately from offline test results.
 
@@ -212,6 +223,7 @@ Every test that could send a command must run against a fake connection unless t
 | Phase 1 USK toggles; DSK read-only | **Revised**: Primary includes discovered USK and DSK on-air controls |
 | CUT ALL / Master CUT | **Superseded** by TAKE ALL, deferred to checkpoint 3D |
 | Dynamic source labels, IDs, availability, and actual hardware state synchronization | **Retained** across all switchers and Other Outputs |
+| Custom switcher display names | **Retained** in the new interface with defaults Primary Switcher, Virtual Switcher 1, and Virtual Switcher 2; labels never determine internal switcher identity or routes |
 | Local output friendly names, button label style, source visibility/order | **Deferred** to a later dashboard preferences checkpoint; existing local names may be reused without replacing stock settings |
 | Direct Program mode | **Revised** to an explicit protected action; normal Program rows remain read-only indicators while Primary still supports deliberate hardware Program selection |
 | Staged input renames and broad ATEM settings editing | **Deferred**; reuse stock WebATEM settings and add focused staged updates only where needed |
@@ -235,4 +247,4 @@ The earlier architecture required an explicit replacement source on an output lo
 
 References retained from version 0.5: [WebATEM source](https://github.com/lucas-romanenko/webatem), [bmdwire source](https://github.com/lucas-romanenko/bmdwire), [ATEM Constellation specifications](https://www.blackmagicdesign.com/products/atemconstellation/techspecs/W-APS-40), [Blackmagic ATEM SDK manual](https://documents.blackmagicdesign.com/DeveloperManuals/ATEMSDKManual.pdf), and [ATEM Software Control](https://www.blackmagicdesign.com/products/atemsdi/software). These are protocol and hardware references; inspected repository code and verified device state determine implementation details.
 
-**Definition of done:** The new dashboard controls the real Primary M/E and two independent, persistent logical AUX groups over all discovered supported physical outputs, accurately shows remaining outputs and live routes, guards and confirms every write, preserves stock WebATEM, and passes offline behavioral tests plus an explicitly authorized isolated hardware rehearsal. Milestone 3D TAKE ALL and the independent video phase are not implied by completion of 3A–3C.
+**Definition of done:** The new dashboard presents Primary Switcher and Virtual Switchers 1 and 2 over all discovered supported physical outputs, accurately shows remaining outputs and live routes, guards and confirms every write, preserves stock WebATEM, and passes offline behavioral tests plus an explicitly authorized isolated hardware rehearsal. The virtual switchers remain independent, persistent logical AUX groups internally. Milestone 3D TAKE ALL and the independent video phase are not implied by completion of 3A–3C.

@@ -29,7 +29,8 @@ function controller() {
   return { dashboard, sent, timers };
 }
 
-function hardware({ program = 1, preview = 2, aux3 = 1, meReason = null, auxReason = null } = {}) {
+function hardware({ program = 1, preview = 2, aux3 = 1, meReason = null, auxReason = null,
+                    usk = [false, false] } = {}) {
   return {
     is_connected: true,
     sources: [
@@ -40,11 +41,13 @@ function hardware({ program = 1, preview = 2, aux3 = 1, meReason = null, auxReas
       { source: 10010, short: 'PGM', long: 'ME 1 Program', port_type: 128, available_aux: true },
     ],
     auxOutputs: { aux1: 10010, aux2: 10010, aux3 },
-    mes: [{ program, preview, transition: { selection: { background: true, key1: false, key2: false, key3: false, key4: false }, in_transition: false } }],
+    mes: [{ program, preview, transition: { selection: { background: true, key1: false, key2: false, key3: false, key4: false }, in_transition: false },
+            usk: { states: usk, data: usk.map(() => ({ fill_source: 1 })) } }],
     dashboardSafety: {
       fresh: true,
       meCut: { reason: meReason, program, preview },
       aux: { '0': { reason: null, live: 10010 }, '1': { reason: null, live: 10010 }, '2': { reason: auxReason, live: aux3 } },
+      usk: Object.fromEntries(usk.map((onAir, index) => [String(index), { reason: null, onAir }])),
     },
   };
 }
@@ -220,4 +223,62 @@ test('live source remains hardware-derived, including a source outside the grid'
   d.updateState(hardware({ program: 1, aux3: 3 }));
   assert.equal(d.panels[0].onAirSourceId, 1);
   assert.equal(d.panels[2].onAirSourceId, 3);
+});
+
+test('one upstream keyer turns on then off after its own observed confirmations', () => {
+  const { dashboard: d, sent } = controller();
+  d.updateState(hardware());
+  const keyer = d.upstreamKeyers[0];
+  d.toggleUSK(0);
+  assert.deepEqual(sent[0], { command: 'dashboard_toggle_usk', key_index: 0, expected_on_air: false, target_on_air: true, me: 0 });
+  assert.equal(d.upstreamKeyers[0].pending, true);
+  d.updateState(hardware({ usk: [true, false] }));
+  assert.equal(d.upstreamKeyers[0], keyer);
+  assert.equal(d.upstreamKeyers[0].pending, false);
+  assert.equal(d.upstreamKeyers[0].statusText, 'ON AIR');
+  assert.equal(d.keyerToggleReason(d.upstreamKeyers[0]), '');
+  d.toggleUSK(0);
+  assert.deepEqual(sent[1], { command: 'dashboard_toggle_usk', key_index: 0, expected_on_air: true, target_on_air: false, me: 0 });
+  d.updateState(hardware({ usk: [false, false] }));
+  assert.equal(d.upstreamKeyers[0].pending, false);
+  assert.equal(d.upstreamKeyers[0].statusText, 'OFF AIR');
+});
+
+test('upstream keyers retain independent pending targets and reconcile separately', () => {
+  const { dashboard: d, sent } = controller();
+  d.updateState(hardware());
+  d.toggleUSK(0);
+  d.toggleUSK(1);
+  assert.equal(sent.length, 2);
+  d.updateState(hardware({ usk: [true, false] }));
+  assert.equal(d.upstreamKeyers[0].pending, false);
+  assert.equal(d.upstreamKeyers[1].pending, true);
+  d.updateState(hardware({ usk: [true, true] }));
+  assert.equal(d.upstreamKeyers[1].pending, false);
+  assert.equal(d.upstreamKeyers[0].statusText, 'ON AIR');
+});
+
+test('keyer timeout acts on the current reconciled object and blocks repeat toggles', () => {
+  const { dashboard: d, sent, timers } = controller();
+  d.updateState(hardware());
+  d.toggleUSK(0);
+  d.updateState(hardware()); // replaces the keyer object before timeout
+  for (const callback of [...timers.values()]) callback();
+  assert.equal(d.upstreamKeyers[0].unconfirmed, true);
+  assert.equal(d.upstreamKeyers[0].pending, false);
+  d.toggleUSK(0);
+  assert.equal(sent.length, 1);
+  d.updateState(hardware({ usk: [true, false] }));
+  assert.equal(d.upstreamKeyers[0].unconfirmed, false);
+  assert.equal(d.upstreamKeyers[0].statusText, 'ON AIR');
+});
+
+test('unknown keyer state blocks a hardware toggle', () => {
+  const { dashboard: d, sent } = controller();
+  const state = hardware();
+  delete state.dashboardSafety.usk['0'];
+  d.updateState(state);
+  assert.match(d.keyerToggleReason(d.upstreamKeyers[0]), /not been observed/);
+  d.toggleUSK(0);
+  assert.equal(sent.length, 0);
 });
