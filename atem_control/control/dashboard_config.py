@@ -1,6 +1,8 @@
 """Revisioned dashboard configuration keyed by the connected ATEM WhoI ID."""
 
 import re
+from copy import deepcopy
+from weakref import WeakKeyDictionary
 
 from django.db import IntegrityError
 from django.db import transaction
@@ -8,6 +10,11 @@ from django.db.models import F
 from django.utils import timezone
 
 from atem_control.models import DashboardDeviceConfig, dashboard_device_defaults
+
+
+# Keep an observed takeover through a pending route review on the pooled connection.
+# Bind it to the saved revision so it cannot retire a newer, deliberate assignment.
+_primary_retirements = WeakKeyDictionary()
 
 
 class DashboardConfigError(ValueError):
@@ -139,6 +146,8 @@ def update_config_for_connection(connection, expected_revision, config, ip=None)
         if pending_reason:
             raise DashboardConfigError(pending_reason)
         device_id = device_id_from_connection(connection)
+        if pending_primary_retirements(connection, {'deviceId': device_id, 'revision': expected_revision}):
+            raise DashboardConfigError('Primary destinations are being reconciled. Wait for refreshed settings.')
         conflicts = validate_config_against_state(
             connection.mixerstate, config,
             state_fresh=dashboard_switching.state_is_fresh(connection))
@@ -149,6 +158,49 @@ def update_config_for_connection(connection, expected_revision, config, ip=None)
             raise DashboardConfigError(
                 'Configuration conflicts with discovered ATEM state: ' + ', '.join(labels))
         return update_config(device_id, expected_revision, config, ip=ip)
+
+
+def pending_primary_retirements(connection, snapshot):
+    if not snapshot:
+        return ()
+    identity = (snapshot.get('deviceId'), snapshot.get('revision'))
+    saved_identity, channels = _primary_retirements.get(connection, (None, ()))
+    return channels if saved_identity == identity else ()
+
+
+def reconcile_primary_assignments(connection, snapshot, ip=None):
+    """Retire saved virtual claims that a confirmed Primary route supersedes."""
+    from atem_control.control import dashboard_switching
+    from atem_control.control.dashboard_ownership import VIRTUAL_GROUPS, project_routes
+
+    with dashboard_switching.configuration_update_lock():
+        if not dashboard_switching.state_is_fresh(connection):
+            return None
+        device_id = device_id_from_connection(connection)
+        if device_id != snapshot['deviceId']:
+            return None
+        projection = project_routes(connection.mixerstate, snapshot,
+                                    retired_channels=pending_primary_retirements(connection, snapshot))
+        if (projection['capabilities']['outputMappingStatus'] != 'ready' or
+                projection['capabilities']['programOutputSourceId'] is None):
+            return None
+        retired = projection['supersededVirtualOutputIds']
+        if not retired:
+            return None
+        channels = frozenset(output_id - 1 for output_id in retired)
+        _primary_retirements[connection] = ((device_id, snapshot['revision']), channels)
+        if dashboard_switching.configuration_update_block_reason(connection):
+            return None
+        current = get_config(device_id)
+        if current['revision'] != snapshot['revision']:
+            return current, []
+        config = deepcopy(current['config'])
+        for group_id in VIRTUAL_GROUPS:
+            group = config['virtualSwitchers'][group_id]
+            group['outputs'] = [channel for channel in group['outputs'] if channel not in channels]
+        saved = update_config(device_id, current['revision'], config, ip=ip)
+        _primary_retirements.pop(connection, None)
+        return saved, retired
 
 
 def identity_snapshot(connection):

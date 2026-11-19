@@ -94,6 +94,8 @@ def _three_c_connection(routes=None):
     c.mixerstate['topology'] = NS(aux_outputs=6, downstream_keyers=2, dves=1, stingers=1)
     c.mixerstate['transition-settings'][0].style = 0
     c.mixerstate['input-properties'].update({
+        1000: NS(name='Color Bars', short_name='Bars', port_type=2,
+                 available_aux=True, available_me1=False),
         90010: NS(name='M/E 1 Program', short_name='PGM', port_type=128,
                   available_aux=True, available_me1=False),
         90011: NS(name='M/E 1 Preview', short_name='PVW', port_type=128,
@@ -198,7 +200,7 @@ def test_background_auto_keeps_program_source_confirmation(monkeypatch):
     assert ('me', 0) not in switching._operations.get(c, {})
 
 
-def test_take_all_key_only_auto_returns_observed_key_confirmation_targets(monkeypatch):
+def test_take_all_rejects_legacy_auto_requests_without_writes(monkeypatch):
     c = _three_c_connection()
     c.mixerstate['transition-settings'][0].style = 0
     c.mixerstate['transition-settings'][0].next_transition_bkgd = False
@@ -215,14 +217,9 @@ def test_take_all_key_only_auto_returns_observed_key_confirmation_targets(monkey
 
     ok, result = switching.dispatch_take_all(c, request, config)
 
-    assert ok
-    assert result['primary']['command'] == 'auto'
-    assert result['primary']['before'] == result['primary']['target'] == 1
-    assert result['primary']['key_before'] == {'0': False}
-    assert result['primary']['key_targets'] == {'0': True}
-    assert result['virtual']['virtual1']['status'] == 'skipped'
-    assert result['virtual']['virtual2']['status'] == 'skipped'
-    assert sent == ['auto']
+    assert not ok
+    assert 'CUT only' in result
+    assert sent == []
 
 
 def test_take_all_dispatches_primary_and_both_virtual_groups_once(monkeypatch):
@@ -271,20 +268,73 @@ def test_take_all_consumer_uses_guarded_dispatch_and_returns_per_switcher_result
     assert consumer.sent == [{'type': 'dashboard_take_all_started', **outcome}]
 
 
-def test_take_all_executes_selected_auto_and_skips_empty_virtual_groups(monkeypatch):
+def test_take_all_uses_cut_with_a_non_cut_style_and_skips_empty_groups(monkeypatch):
     c = _three_c_connection()
     c.mixerstate['transition-settings'][0].style = 2
     config = _three_c_config(virtual1={'outputs': [], 'previewSource': 2, 'programTarget': 1})
     sent = []
     monkeypatch.setattr(switching, 'dispatch', lambda _c, command, data: sent.append(command) or (True, None))
 
-    ok, result = switching.dispatch_take_all(c, _take_all_request('auto'), config)
+    ok, result = switching.dispatch_take_all(c, _take_all_request(), config)
 
     assert ok
-    assert result['primary']['command'] == 'auto'
+    assert result['primary']['command'] == 'cut'
     assert result['virtual']['virtual1']['status'] == 'skipped'
     assert result['virtual']['virtual2']['status'] == 'skipped'
-    assert sent == ['auto']
+    assert sent == ['cut']
+
+
+def test_take_all_dispatches_after_the_requested_primary_preview_is_observed(monkeypatch):
+    c = _three_c_connection()
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda _c, command, data: sent.append(command) or (True, None))
+    assert switching.dispatch_me_preview(c, {'me': 0, 'source': 3, 'expected_preview': 2}) == (True, None)
+    c.mixerstate['preview-bus-input'][0].source = 3
+
+    ok, result = switching.dispatch_take_all(c, {**_take_all_request(), 'expected_preview': 3}, _three_c_config())
+
+    assert ok, result
+    assert result['primary']['target'] == 3
+    assert sent == ['set_preview', 'cut']
+
+
+def test_take_all_exposes_an_unconfirmed_preview_until_read_only_review(monkeypatch):
+    c = _three_c_connection()
+    config = _three_c_config()
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda _c, command, data: sent.append(command) or (True, None))
+    assert switching.dispatch_me_preview(c, {'me': 0, 'source': 3, 'expected_preview': 2})[0]
+    [pending] = switching.safety_snapshot(c)['takeAllBlockers']
+    assert pending['label'] == 'M/E Preview'
+    assert pending['reviewable'] is False
+
+    switching._operations[c][('me_preview', 0)]['since'] -= switching.PENDING_SECONDS + 1
+    [unconfirmed] = switching.safety_snapshot(c)['takeAllBlockers']
+    assert unconfirmed['reviewable'] is True
+    assert switching.dispatch_take_all(c, _take_all_request(), config) == (False, unconfirmed['message'])
+    assert sent == ['set_preview']
+
+    assert switching.review_unconfirmed(c, 'me_preview') == (True, None)
+    assert switching.safety_snapshot(c)['takeAllBlockers'] == []
+    assert sent == ['set_preview']
+    assert switching.dispatch_take_all(c, _take_all_request(), config)[0]
+    assert sent == ['set_preview', 'cut']
+
+
+def test_take_all_waits_for_a_pending_downstream_keyer_to_finish_transitioning(monkeypatch):
+    c = _three_c_connection()
+    dsk = NS(on_air=True, is_transitioning=True, is_autotransitioning=False)
+    c.mixerstate['dkey-state'] = {0: dsk}
+    switching._record(c, ('dsk', 0), False, True)
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda _c, command, data: sent.append(command) or (True, None))
+    ok, reason = switching.dispatch_take_all(c, _take_all_request(), _three_c_config())
+    assert not ok and 'Downstream keyer 1' in reason
+    assert sent == []
+
+    dsk.is_transitioning = False
+    assert switching.dispatch_take_all(c, _take_all_request(), _three_c_config())[0]
+    assert sent == ['cut']
 
 
 def test_take_all_empty_group_is_skipped_even_when_its_saved_queue_is_unavailable(monkeypatch):
@@ -433,17 +483,127 @@ def test_route_dispatch_rechecks_config_revision_and_blocks_config_edits_until_r
     assert saved['config']['customNames']['virtual1'] == 'Other session'
 
 
-def test_primary_output_release_routes_to_current_background_and_protects_last_destination(monkeypatch):
+def test_primary_output_release_routes_to_verified_bars_and_protects_last_destination(monkeypatch):
     c = _three_c_connection(routes={0: 90010, 1: 90010, 2: 2, 3: 1, 4: 2, 5: 1})
     config = _three_c_config()
     sent = []
     monkeypatch.setattr(switching, 'dispatch', lambda _c, command, data: sent.append((command, data)) or (True, None))
     request = {'config_revision': 7, 'output_id': 1, 'mode': 'primary_release',
-               'expected_live': 90010, 'input_source': 1}
+               'expected_live': 90010, 'input_source': 1000}
+    c.mixerstate['input-properties'][1000].available_aux = False
+    assert 'Color Bars' in switching.dispatch_output_route(c, {**request, 'input_source': 1}, config)[1]
+    assert sent == []
+    c.mixerstate['input-properties'][1000].available_aux = True
     assert switching.dispatch_output_route(c, request, config)[0]
-    assert sent == [('set_aux_output', {'aux_channel': 0, 'input_source': 1})]
-    c.mixerstate['aux-output-source'][0].source = 1
+    assert sent == [('set_aux_output', {'aux_channel': 0, 'input_source': 1000})]
+    c.mixerstate['aux-output-source'][0].source = 1000
     assert 'final Primary' in switching.dispatch_output_route(c, {**request, 'output_id': 2}, config)[1]
+
+
+@pytest.mark.django_db
+def test_primary_reconciliation_preserves_routes_and_unblocks_first_virtual_assignment(monkeypatch):
+    c = _three_c_connection(routes={0: 90010, 1: 90010, 2: 90010, 3: 90010, 4: 2, 5: 1})
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda *args: sent.append(args) or (True, None))
+    initial = dashboard_config.get_config_for_connection(c)
+    old = _three_c_config(virtual1={'outputs': [1, 2, 3], 'previewSource': 2, 'programTarget': 1})['config']
+    snapshot = dashboard_config.update_config(initial['deviceId'], initial['revision'], old)
+    saved, retired = dashboard_config.reconcile_primary_assignments(c, snapshot)
+    assert retired == [2, 3, 4]
+    assert saved['config']['virtualSwitchers']['virtual1'] == {
+        'outputs': [], 'previewSource': 2, 'programTarget': 1,
+    }
+    assert dashboard_config.reconcile_primary_assignments(c, saved) is None
+    request = {'config_revision': saved['revision'], 'output_id': 6, 'mode': 'virtual_assign',
+               'group_id': 'virtual2', 'expected_live': 1, 'input_source': 1}
+    assert switching.dispatch_output_route(c, request, saved)[1]['no_op']
+    proposed = saved['config']
+    proposed['virtualSwitchers']['virtual2'].update(outputs=[5], programTarget=1)
+    dashboard_config.update_config_for_connection(c, saved['revision'], proposed)
+    assert sent == []
+    assert c.mixerstate['aux-output-source'][2].source == 90010
+
+
+@pytest.mark.django_db
+def test_primary_reconciliation_remembers_takeover_through_pending_route(monkeypatch):
+    c = _three_c_connection()
+    initial = dashboard_config.get_config_for_connection(c)
+    config = _three_c_config(virtual1={'outputs': [2], 'previewSource': 3, 'programTarget': 2})['config']
+    snapshot = dashboard_config.update_config(initial['deviceId'], initial['revision'], config)
+    monkeypatch.setattr(switching, 'dispatch', lambda *args: (True, None))
+    request = {'config_revision': snapshot['revision'], 'output_id': 6, 'mode': 'other_route',
+               'expected_live': 1, 'input_source': 2}
+    assert switching.dispatch_output_route(c, request, snapshot)[0]
+    c.mixerstate['aux-output-source'][2].source = 90010
+    assert dashboard_config.reconcile_primary_assignments(c, snapshot) is None
+    assert dashboard_config.pending_primary_retirements(c, snapshot) == {2}
+
+    c.mixerstate['aux-output-source'][2].source = 2
+    assert 'superseded virtual assignment' in switching.output_route_readiness(
+        c, {**request, 'output_id': 3, 'expected_live': 2, 'input_source': 1}, snapshot)[0]
+    c.mixerstate['aux-output-source'][5].source = 2
+    switching.safety_snapshot(c)
+    saved, retired = dashboard_config.reconcile_primary_assignments(c, snapshot)
+    assert retired == [3]
+    assert saved['config']['virtualSwitchers']['virtual1']['outputs'] == []
+    assert dashboard_config.pending_primary_retirements(c, saved) == ()
+    assert c.mixerstate['aux-output-source'][2].source == 2
+
+
+def test_mixed_virtual_cut_uses_reviewed_routes_and_skips_an_output_already_on_target(monkeypatch):
+    c = _three_c_connection()
+    config = _three_c_config(virtual1={'outputs': [1, 2], 'previewSource': 2, 'programTarget': 1})
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda _c, command, data: sent.append((command, data)) or (True, None))
+    request = {'config_revision': 7, 'group_id': 'virtual1', 'input_source': 2,
+               'expected_routes': [{'channel': 1, 'source': 3}, {'channel': 2, 'source': 2}]}
+    assert 'OUT 2 changed' in switching.dispatch_virtual_group_cut(c, request, config)[1]
+    assert sent == []
+    request['expected_routes'][0]['source'] = 1
+    ok, result = switching.dispatch_virtual_group_cut(c, request, config)
+    assert ok and result['previous'] is None
+    assert [(item['before'], item.get('no_op', False)) for item in result['outcomes']] == [(1, False), (2, True)]
+    assert sent == [('set_aux_output', {'aux_channel': 1, 'input_source': 2})]
+
+
+def test_virtual_direct_routes_bars_without_using_or_overwriting_queued_preview(monkeypatch):
+    c = _three_c_connection()
+    config = _three_c_config(virtual1={'outputs': [1, 2], 'previewSource': 3, 'programTarget': 1})
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda _c, command, data: sent.append((command, data)) or (True, None))
+    request = {'config_revision': 7, 'group_id': 'virtual1', 'input_source': 1000,
+               'expected_routes': [{'channel': 1, 'source': 1}, {'channel': 2, 'source': 2}]}
+    assert 'Queued Preview changed' in switching.dispatch_virtual_group_cut(c, request, config)[1]
+    request['mode'] = 'direct'
+    assert 'identity changed' in switching.dispatch_virtual_group_cut(c, request, config)[1]
+    request['device_id'] = config['deviceId']
+    c.mixerstate['input-properties'][1000].available_aux = False
+    assert 'not directly routable' in switching.dispatch_virtual_group_cut(c, request, config)[1]
+    c.mixerstate['input-properties'][1000].available_aux = True
+    assert 'Primary M/E Program' in switching.dispatch_virtual_group_cut(c, {**request, 'input_source': 90010}, config)[1]
+    assert sent == []
+
+    ok, result = switching.dispatch_virtual_group_cut(c, request, config)
+    assert ok and result['mode'] == 'direct'
+    assert sent == [('set_aux_output', {'aux_channel': channel, 'input_source': 1000}) for channel in (1, 2)]
+    assert config['config']['virtualSwitchers']['virtual1']['previewSource'] == 3
+    assert 'awaiting hardware confirmation' in switching.dispatch_virtual_group_cut(c, request, config)[1]
+
+
+def test_take_all_preflights_mixed_routes_before_sending_primary_cut(monkeypatch):
+    c = _three_c_connection()
+    config = _three_c_config(virtual1={'outputs': [1, 2], 'previewSource': 2, 'programTarget': 1})
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda _c, command, data: sent.append((command, data)) or (True, None))
+    payload = _take_all_request()
+    payload['groups']['virtual1'] = {'preview': 2, 'routes': [{'channel': 1, 'source': 3}, {'channel': 2, 'source': 2}]}
+    assert 'OUT 2 changed' in switching.dispatch_take_all(c, payload, config)[1]
+    assert sent == []
+    payload['groups']['virtual1']['routes'][0]['source'] = 1
+    ok, result = switching.dispatch_take_all(c, payload, config)
+    assert ok
+    assert result['virtual']['virtual1']['previous'] is None
+    assert [command for command, _ in sent] == ['cut', 'set_aux_output']
 
 
 def test_virtual_group_cut_preflights_all_routes_then_dispatches_independently(monkeypatch):
@@ -868,6 +1028,7 @@ function makeState(routes) {
   const sourceNames = [
     {source: 1, short: 'IN1', long: 'Input 1', port_type: 0, available_aux: true, available_me1: true},
     {source: 2, short: 'IN2', long: 'Input 2', port_type: 0, available_aux: true, available_me1: true},
+    {source: 1000, short: 'Bars', long: 'Color Bars', port_type: 2, available_aux: true, available_me1: false},
     {source: 90010, short: 'PGM', long: 'M/E 1 Program', port_type: 128, available_aux: true, available_me1: false},
   ];
   const outputs = routes.map((liveSourceId, channel) => ({
@@ -889,7 +1050,7 @@ function makeState(routes) {
     dashboardSafety: {fresh: true, meCut: {reason: '', program: 1, preview: 2}, aux: {}, usk: {}, dsk: {}},
     dashboardRouting: {
       deviceId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', revision: 7, stateFresh: true,
-      capabilities: {outputMappingStatus: 'ready', outputMappingReason: '', programOutputSourceId: 90010},
+      capabilities: {outputMappingStatus: 'ready', outputMappingReason: '', programOutputSourceId: 90010, colorBarsSourceId: 1000},
       outputs, groups: {virtual1: {...emptyGroup}, virtual2: {...emptyGroup}}, conflicts: [],
       programBackgroundSourceId: 1,
     },
@@ -903,7 +1064,7 @@ window.addEventListener('load', async () => {
     dashboard.updateState(makeState([90010, 90010, 2, 1, 2, 1]));
     await Alpine.nextTick();
     const cards = root.querySelectorAll('.switcher-card');
-    const changeButton = card => [...card.querySelectorAll('button')].find(button => button.textContent.trim() === 'Change');
+    const changeButton = card => card.querySelector('button[aria-label*="output assignments"]');
     const configUnavailableDisabled = changeButton(cards[0]).disabled;
     const configUnavailableReason = dashboard.assignmentChangeReason();
     const staleState = makeState([90010, 90010, 2, 1, 2, 1]);
@@ -958,8 +1119,8 @@ window.addEventListener('load', async () => {
     assignmentDialog.querySelector('.modal-action .btn-primary').click(); await Alpine.nextTick();
     const primaryReleaseCommand = window.sentCommands.find(command =>
       command.command === 'dashboard_output_route' && command.output_id === 2);
-    dashboard.handleMessage({type: 'dashboard_output_route_accepted', output_id: 2, input_source: 1});
-    dashboard.updateState(makeState([90010, 1, 2, 1, 2, 1])); await Alpine.nextTick();
+    dashboard.handleMessage({type: 'dashboard_output_route_accepted', output_id: 2, input_source: 1000});
+    dashboard.updateState(makeState([90010, 1000, 2, 1, 2, 1])); await Alpine.nextTick();
     const primaryReleaseConfirmed = dashboard.routeBatch === null && !dashboard.assignmentDialogOpen;
 
     changeButton(cards[1]).click(); await Alpine.nextTick();
@@ -987,20 +1148,21 @@ window.addEventListener('load', async () => {
     assignmentDialog.querySelector('.modal-action .btn-ghost').click(); await Alpine.nextTick();
 
     const conflictState = makeState([90010, 90010, 2, 1, 2, 1]);
-    conflictState.dashboardRouting.outputs[1].owner = 'unresolved';
+    conflictState.dashboardRouting.outputs[1].owner = 'primary';
     conflictState.dashboardRouting.outputs[1].observedRouteOwner = 'primary';
     conflictState.dashboardRouting.outputs[1].savedOwners = ['virtual1'];
     conflictState.dashboardRouting.outputs[1].conflicts = [{type: 'primary_virtual_ownership_conflict', outputId: 2}];
     conflictState.dashboardRouting.conflicts = conflictState.dashboardRouting.outputs[1].conflicts;
+    conflictState.dashboardRouting.supersededVirtualOutputIds = [2];
     dashboard.updateState(conflictState);
     dashboard.dashboardConfig.config.virtualSwitchers.virtual1.outputs = [1];
     await Alpine.nextTick();
     changeButton(cards[1]).click(); await Alpine.nextTick();
     const conflictedOutput = [...assignmentDialog.querySelectorAll('label')].find(label => label.textContent.includes('OUT 2'));
     const conflictCheckbox = conflictedOutput?.querySelector('input[type="checkbox"]');
-    const conflictCanBeReleased = !!conflictCheckbox && conflictCheckbox.checked && !conflictCheckbox.disabled;
-    conflictCheckbox?.click(); await Alpine.nextTick();
-    const conflictReleaseSelection = !!conflictCheckbox && !conflictCheckbox.checked && conflictCheckbox.disabled;
+    const primaryOwnsConflictedOutput = dashboard.primarySwitcherOutputs.some(output => output.outputId === 2) &&
+      !dashboard.otherOutputViews.some(output => output.outputId === 2);
+    const conflictExcludedFromVirtual = !!conflictCheckbox && !conflictCheckbox.checked && conflictCheckbox.disabled;
     assignmentDialog.querySelector('.modal-action .btn-ghost').click(); await Alpine.nextTick();
 
     dashboard.keyedAutoConfirmOpen = true; await Alpine.nextTick();
@@ -1026,19 +1188,24 @@ window.addEventListener('load', async () => {
     dashboard.dashboardConfig.config.virtualSwitchers.virtual1 = {outputs: [1], previewSource: 2, programTarget: 1};
     dashboard.dashboardConfig.config.virtualSwitchers.virtual2 = {outputs: [2], previewSource: 1, programTarget: 2};
     dashboard.updateState(takeState); await Alpine.nextTick();
+    const liveStyle = button => ({background: getComputedStyle(button).backgroundColor,
+      color: getComputedStyle(button).color, opacity: getComputedStyle(button).opacity,
+      disabled: button.disabled});
+    const primaryLiveStyle = liveStyle(cards[0].querySelectorAll('.source-grid')[1].querySelector('.btn-live-source'));
+    const virtualLiveStyle = liveStyle(cards[1].querySelectorAll('.source-grid')[1].querySelector('.btn-live-source'));
+    const outputBadgeStyle = {background: getComputedStyle(cards[0].querySelector('.output-badge')).backgroundColor,
+      color: getComputedStyle(cards[0].querySelector('.output-badge')).color};
     const takeAllCard = root.querySelector('[aria-label="TAKE ALL"]');
     const takeAllButton = [...takeAllCard.querySelectorAll('button')].find(button => button.textContent.trim() === 'TAKE ALL');
     const takeAllReady = !takeAllButton.disabled && dashboard.takeAllReason() === '';
-    dashboard.takeAllPrimaryAction = 'auto';
     const keyedState = makeState(takeRoutes);
     keyedState.mes[0].transition.selection.key1 = true;
+    keyedState.dashboardSafety.meCut.reason = 'M/E CUT blocked: KEY 1 tied to next transition.';
     keyedState.dashboardRouting = takeState.dashboardRouting;
     dashboard.updateState(keyedState); await Alpine.nextTick();
+    const commandsBeforeTiedCut = window.sentCommands.length;
     dashboard.takeAll(); await Alpine.nextTick();
-    const keyedTakeAllDialog = root.querySelector('[aria-label="Confirm keyed AUTO for TAKE ALL"]');
-    const keyedTakeAllScoped = visible(keyedTakeAllDialog);
-    keyedTakeAllDialog.querySelector('.modal-action .btn-ghost').click(); await Alpine.nextTick();
-    dashboard.takeAllPrimaryAction = 'cut';
+    const tiedTakeAllBlocked = takeAllButton.disabled && window.sentCommands.length === commandsBeforeTiedCut;
     dashboard.updateState(takeState); await Alpine.nextTick();
     takeAllButton.click(); await Alpine.nextTick();
     const takeAllCommand = window.sentCommands.find(command => command.command === 'dashboard_take_all');
@@ -1079,9 +1246,10 @@ window.addEventListener('load', async () => {
       assignmentFinished, keyedDialogScoped, alignmentDialogScoped, hardwareCommands,
       configUnavailableDisabled, configUnavailableReason,
       primaryCancelled, staleDisabled, staleReason, topologyDisabled, topologyReason,
-      configErrorDisabled, configErrorReason, conflictCanBeReleased, conflictReleaseSelection,
-      primaryVisibilityDebug, takeAllReady, takeAllCommand, keyedTakeAllScoped,
+      configErrorDisabled, configErrorReason, primaryOwnsConflictedOutput, conflictExcludedFromVirtual,
+      primaryVisibilityDebug, takeAllReady, takeAllCommand, tiedTakeAllBlocked,
       takeAllResultVisible, takeAllResultText, takeAllResultDebug, otherOverflow, otherDirectButtons,
+      primaryLiveStyle, virtualLiveStyle, outputBadgeStyle,
     });
   } catch (error) {
     document.getElementById('result').textContent = JSON.stringify({error: String(error), stack: error.stack});
@@ -1089,8 +1257,13 @@ window.addEventListener('load', async () => {
 });
 """
     fixture = tmp_path / 'rendered_dashboard_assignment_dom.html'
+    static_root = Path(__file__).parents[2] / 'atem_control/static'
+    css_links = ''.join(
+        f'<link rel="stylesheet" href="{(static_root / path).as_uri()}">'
+        for path in ('vendor/webatem.css', 'vendor/bootstrap-icons/bootstrap-icons.min.css', 'brand/brand.css')
+    )
     fixture.write_text(
-        '<!doctype html><meta charset="utf-8"><style>[x-cloak]{display:none!important}</style>' + dashboard_styles
+        '<!doctype html><html data-theme="dark"><meta charset="utf-8"><style>[x-cloak]{display:none!important}</style>' + dashboard_styles + css_links
         + '<script>window.sentCommands=[];</script>' + component_html
         + '<output id="result">waiting</output>'
         + f'<script src="{dashboard_js}"></script><script>{harness}</script>'
@@ -1108,9 +1281,9 @@ window.addEventListener('load', async () => {
     assert 'error' not in observed, observed
     assert observed['primaryOpened'] is True, observed['primaryVisibilityDebug']
     assert observed['primaryCancelled'] is True
-    assert 'Release to IN1' in observed['primaryReleaseReview']
+    assert 'Release to Color Bars' in observed['primaryReleaseReview']
     assert observed['primaryReleaseCommand']['mode'] == 'primary_release'
-    assert observed['primaryReleaseCommand']['input_source'] == 1
+    assert observed['primaryReleaseCommand']['input_source'] == 1000
     assert observed['primaryReleaseConfirmed'] is True
     assert observed['virtualOneOpened'] is True
     assert observed['virtualTwoOpened'] is True
@@ -1130,21 +1303,29 @@ window.addEventListener('load', async () => {
     assert 'revision conflict' in observed['configErrorReason'].lower()
     assert observed['takeAllReady'] is True
     assert observed['takeAllCommand']['primary_action'] == 'cut'
-    assert observed['keyedTakeAllScoped'] is True
+    assert observed['tiedTakeAllBlocked'] is True
     assert observed['takeAllResultVisible'] is True, observed['takeAllResultDebug']
     assert 'pending' in observed['takeAllResultText']
     assert observed['otherOverflow'] == 'auto'
     assert observed['otherDirectButtons'] is True
-    assert observed['conflictCanBeReleased'] is True
-    assert observed['conflictReleaseSelection'] is True
+    for style in (observed['primaryLiveStyle'], observed['virtualLiveStyle']):
+        assert style == {'background': 'rgb(220, 38, 38)', 'color': 'rgb(255, 255, 255)',
+                         'opacity': '1', 'disabled': True}
+    assert observed['outputBadgeStyle'] == {'background': 'rgb(229, 231, 235)',
+                                            'color': 'rgb(17, 24, 39)'}
+    assert observed['primaryOwnsConflictedOutput'] is True
+    assert observed['conflictExcludedFromVirtual'] is True
 
 
 @pytest.mark.django_db
 def test_rendered_dashboard_keeps_live_program_visible_and_cut_reasons(client):
     html = client.get('/atem/dashboard/').content.decode('utf-8')
-    assert 'Observed M/E Program' in html
-    assert 'Observed M/E Preview' in html
+    assert 'Observed M/E Program' not in html
+    assert 'Observed M/E Preview' not in html
     assert 'outputSourceId(output)' in html
     assert 'outputStatus(output)' in html
-    assert 'MIXED ROUTING' in html
+    assert 'x-show="view.routeWarning"' in html
+    assert 'x-text="view.routeWarning?.title"' in html
+    assert 'Observed hardware routes' not in html
+    assert 'All assigned outputs:' not in html
     assert 'CUT ALL OUTPUTS' not in html

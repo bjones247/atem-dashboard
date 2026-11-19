@@ -34,7 +34,7 @@ def test_dashboard_milestone_3b_keeps_deferred_switching_controls_out_of_ui(clie
 
     assert 'Primary Switcher' in content
     assert 'virtualSwitcherViews' in content
-    assert 'Other Outputs' in content
+    assert 'Unswitched Outputs' in content
     assert '@click="cut(panel)"' not in content
     assert '@click="toggleUSK(k.keyIndex)"' not in content
     assert 'CUT ALL OUTPUTS' not in content

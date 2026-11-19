@@ -64,13 +64,13 @@ document.addEventListener('alpine:init', () => {
         assignmentDialogOpen: false,
         assignmentOwner: null,
         assignmentSelection: {},
+        assignmentReview: null,
         assignmentBusy: false,
         groupCutOperations: {},
         groupAlignOperations: {},
         groupAlignDraft: null,
         keyedAutoConfirmOpen: false,
-        takeAllKeyedConfirmOpen: false,
-        takeAllPrimaryAction: 'cut',
+        virtualDirect: { virtual1: false, virtual2: false },
         takeAllOperation: null,
         takeAllSequence: 0,
         configSavePurpose: null,
@@ -295,6 +295,10 @@ document.addEventListener('alpine:init', () => {
                     break;
 
                 case 'error':
+                    if (data.command === 'dashboard_take_all' && this.takeAllOperation && !this.takeAllOperation.started) {
+                        this.rejectTakeAll(data.message || 'TAKE ALL was blocked. No commands were dispatched.');
+                        break;
+                    }
                     this.showError(data.message || 'ATEM command rejected');
                     if (data.command === 'dashboard_config_update') {
                         if (this.dashboardConfigSaveTimer !== null) clearTimeout(this.dashboardConfigSaveTimer);
@@ -338,7 +342,7 @@ document.addEventListener('alpine:init', () => {
                         const operation = this.groupCutOperations[data.group_id];
                         if (operation) {
                             operation.status = 'blocked';
-                            operation.error = data.message || 'Group CUT was blocked.';
+                            operation.error = data.message || 'Virtual switching was blocked.';
                         }
                     }
                     if (data.command === 'dashboard_align_virtual_group' && data.group_id) {
@@ -348,7 +352,6 @@ document.addEventListener('alpine:init', () => {
                             operation.error = data.message || 'Mixed-route alignment was blocked.';
                         }
                     }
-                    if (data.command === 'dashboard_take_all') this.rejectTakeAll(data.message || 'TAKE ALL was blocked. No commands were dispatched.');
                     if (data.command === 'dashboard_set_preview_me') {
                         this.previewPending = false;
                         this.previewUnconfirmed = false;
@@ -458,6 +461,13 @@ document.addEventListener('alpine:init', () => {
                     this.acceptDashboardConfig(data);
                     break;
 
+                case 'dashboard_primary_destinations_reconciled':
+                    if (data.outputs?.length) {
+                        this.showNotice('Removed saved virtual assignments for Primary destinations: ' +
+                            data.outputs.map(id => `OUT ${id}`).join(', ') + '.');
+                    }
+                    break;
+
                 case 'dashboard_output_route_accepted':
                     this.acceptOutputRoute(data);
                     break;
@@ -477,6 +487,15 @@ document.addEventListener('alpine:init', () => {
         },
 
         updateState(state) {
+            for (const groupId of ['virtual1', 'virtual2']) {
+                if (!this.virtualDirect[groupId]) continue;
+                const previous = this.routingProjection;
+                const next = state.dashboardRouting;
+                if (!state.is_connected || previous?.deviceId !== next?.deviceId ||
+                    JSON.stringify(previous?.groups?.[groupId]?.outputIds) !== JSON.stringify(next?.groups?.[groupId]?.outputIds)) {
+                    this.virtualDirect[groupId] = false;
+                }
+            }
             this.state = state;
             this.connected = !!state.is_connected;
             this.outputMappingError = state.dashboardRouting?.capabilities?.outputMappingReason || '';
@@ -1107,12 +1126,15 @@ document.addEventListener('alpine:init', () => {
         get categorizedSources() {
             const physical = [];
             const black = [];
+            const bars = [];
             const colors = [];
             const media = [];
 
             this.sources.forEach(s => {
                 if (s.port_type === 0) {
                     physical.push(s);
+                } else if (s.port_type === 2) {
+                    bars.push(s);
                 } else if (s.source === 0 || (s.short || '').toUpperCase() === 'BLK' || (s.long || '').toLowerCase().includes('black')) {
                     black.push(s);
                 } else if (s.port_type === 4 || s.source === 2001 || s.source === 2002 || (s.short || '').startsWith('COL')) {
@@ -1126,7 +1148,58 @@ document.addEventListener('alpine:init', () => {
             colors.sort((a, b) => a.source - b.source);
             media.sort((a, b) => a.source - b.source);
 
-            return [...physical, ...black, ...colors, ...media];
+            return [...physical, ...black, ...bars, ...colors, ...media];
+        },
+
+        get sourceButtonChoices() {
+            return this.categorizedSources.filter(source =>
+                source.port_type !== 5 && source.source !== 3011 && source.source !== 3021);
+        },
+
+        get meButtonSources() {
+            return this.sourceButtonChoices.filter(source => source.available_me1 === true || source.port_type === 2);
+        },
+
+        get primaryBusLayout() {
+            return this.sourceBusLayout(this.meButtonSources);
+        },
+
+        get virtualBusLayout() {
+            return this.sourceBusLayout(this.auxButtonSources);
+        },
+
+        sourceBusLayout(sources) {
+            const inputs = [];
+            const black = [];
+            const bars = [];
+            const colors = [];
+            const media = [];
+            for (const source of sources) {
+                if (source.port_type === 0) inputs.push(source);
+                else if (source.port_type === 2) bars.push(source);
+                else if (source.source === 0 || source.port_type === 1) black.push(source);
+                else if (source.port_type === 3) colors.push(source);
+                else media.push(source);
+            }
+
+            const split = Math.ceil(inputs.length / 2);
+            const inputColumns = Math.max(split, 1);
+            const middleColumns = Math.max(black.length, bars.length, 1);
+            const rightColumns = Math.max(colors.length, media.length, 1);
+            // The spacer tracks separate inputs, Black/Bars, and colors/media.
+            const sectionStarts = [1, inputColumns + 2, inputColumns + middleColumns + 3];
+            const rows = [[inputs.slice(0, split), black, colors], [inputs.slice(split), bars, media]];
+            const buttons = rows.flatMap((sections, row) => sections.flatMap((items, section) =>
+                items.map((source, column) => ({ source, row: row + 1, column: sectionStarts[section] + column }))));
+            return {
+                columns: { '--input-columns': inputColumns, '--middle-columns': middleColumns,
+                    '--right-columns': rightColumns },
+                buttons,
+            };
+        },
+
+        get auxButtonSources() {
+            return this.sourceButtonChoices.filter(source => source.available_aux === true || source.port_type === 2);
         },
 
         isSourceUsable(panel, source) {
@@ -1164,9 +1237,7 @@ document.addEventListener('alpine:init', () => {
         },
 
         get primarySwitcherOutputs() {
-            // The header badge follows the observed M/E Program route even if
-            // a saved virtual claim makes effective ownership unresolved.
-            return this.projectedOutputs.filter(output => output.observedRouteOwner === 'primary');
+            return this.projectedOutputs.filter(output => output.owner === 'primary');
         },
 
         get virtualSwitcherViews() {
@@ -1179,6 +1250,7 @@ document.addEventListener('alpine:init', () => {
                     // Only validated ownership is shown as an assignment badge.
                     outputs: this.projectedOutputs.filter(output => output.owner === key),
                     group,
+                    routeWarning: this.groupRouteWarning(key),
                     invalidAssignments: this.invalidAssignmentsFor(key),
                 };
             });
@@ -1366,6 +1438,67 @@ document.addEventListener('alpine:init', () => {
             return this.groupCutOperations[groupId]?.channels?.find(item => item.channel === auxIndex) || null;
         },
 
+        groupRouteWarning(groupId) {
+            const group = this.routingProjection?.groups?.[groupId];
+            if (!Array.isArray(group?.outputIds)) return null;
+            const alignment = this.groupAlignOperations[groupId];
+            const cut = this.groupCutOperations[groupId];
+            const active = status => ['pending', 'partial', 'unconfirmed', 'saving'].includes(status);
+            const configFailedOnCurrentRoute = operation => operation?.status === 'confirmed_config_failed' &&
+                group.routeStatus === 'uniform' && group.liveSourceId === operation.target;
+            const operation = active(cut?.status) ? cut : active(alignment?.status) ? alignment
+                : configFailedOnCurrentRoute(cut) ? cut
+                    : configFailedOnCurrentRoute(alignment) ? alignment : null;
+            if (!group.outputIds.length && !operation) return null;
+            if (operation?.status === 'pending' && !operation.showMismatchWhilePending &&
+                !operation.channels?.some(item => ['failed', 'unconfirmed'].includes(item.status))) return null;
+            const savedTarget = this.dashboardConfigDeviceId === this.routingProjection.deviceId &&
+                this.dashboardConfig?.revision > this.routingProjection.revision
+                ? this.dashboardConfig.config.virtualSwitchers[groupId].programTarget : group.savedProgramTargetId;
+            const expectedSourceId = Number.isInteger(operation?.target)
+                ? operation.target : savedTarget;
+            const expectedKnown = Number.isInteger(expectedSourceId);
+            const routes = new Map((group.outputs || []).map(route => [route.outputId, route]));
+            for (const { channel } of operation?.channels || []) {
+                const outputId = channel + 1;
+                if (!routes.has(outputId)) {
+                    routes.set(outputId, this.projectedOutputs.find(output => output.outputId === outputId) || { outputId });
+                }
+            }
+            const outputs = [...routes.values()].map(route => {
+                const observed = route.routeStatus === 'observed' && Number.isInteger(route.liveSourceId);
+                const matchesExpected = observed && expectedKnown ? route.liveSourceId === expectedSourceId : null;
+                const channel = Number.isInteger(route.outputId) ? route.outputId - 1 : null;
+                const result = operation?.channels?.find(item => item.channel === channel);
+                return {
+                    outputId: route.outputId,
+                    marker: matchesExpected === null ? '?' : matchesExpected ? '✓' : '×',
+                    matchesExpected,
+                    observed,
+                    label: observed ? this.sourceStateLabel(route.liveSourceId)
+                        : route.routeStatus === 'stale'
+                            ? `stale; last seen ${this.sourceStateLabel(route.lastObservedSourceId)}`
+                            : this.outputStatus(route),
+                    error: result && ['failed', 'unconfirmed'].includes(result.status) ? result.error : '',
+                    reviewable: result?.status === 'unconfirmed',
+                };
+            });
+            const mismatch = outputs.some(output => output.matchesExpected === false);
+            const missingOutputs = group.outputIds.some(id => !routes.has(id));
+            const unknown = missingOutputs ||
+                outputs.some(output => output.matchesExpected === null);
+            const operationIssue = operation && ['partial', 'unconfirmed', 'confirmed_config_failed'].includes(operation.status);
+            if (!mismatch && !unknown && !operationIssue && expectedKnown && group.routeStatus === 'uniform') return null;
+            return {
+                title: mismatch ? 'Output mismatch warning:' : unknown || !expectedKnown
+                    ? 'Output state warning:' : 'Output confirmation warning:',
+                expected: expectedKnown ? this.sourceStateLabel(expectedSourceId) : 'unknown',
+                outputs,
+                missingOutputs,
+                error: operationIssue ? operation.error || '' : '',
+            };
+        },
+
         sendDashboardConfig(config, purpose = null) {
             if (!this.dashboardConfig || this.dashboardConfigSaving || !this.ws ||
                 this.ws.readyState !== WebSocket.OPEN ||
@@ -1431,7 +1564,8 @@ document.addEventListener('alpine:init', () => {
                 !['virtual1', 'virtual2'].includes(groupId) ||
                 this.routingProjection?.groups?.[groupId]?.routeStatus !== 'empty') return;
             const source = this.sources.find(item => item.source === sourceId);
-            if (!Number.isInteger(sourceId) || !source || source.available_aux !== true) return;
+            if (!Number.isInteger(sourceId) || !source || source.available_aux !== true ||
+                sourceId === this.routingProjection?.capabilities?.programOutputSourceId) return;
             const config = JSON.parse(JSON.stringify(this.dashboardConfig.config));
             config.virtualSwitchers[groupId].programTarget = sourceId;
             this.sendDashboardConfig(config, 'program-target');
@@ -1633,39 +1767,63 @@ document.addEventListener('alpine:init', () => {
                 this.outputMappingError || !this.hardwareReady || this.dashboardConfigSaving || this.assignmentBusy) return;
             this.assignmentOwner = owner;
             const selected = {};
+            const outputs = {};
             for (const output of this.physicalOutputs) {
                 selected[String(output.outputId)] = owner === 'primary'
-                    ? output.observedRouteOwner === 'primary'
-                    : (this.dashboardConfig.config.virtualSwitchers[owner].outputs || []).includes(output.outputId - 1);
+                    ? output.owner === 'primary'
+                    : output.owner !== 'primary' &&
+                      (this.dashboardConfig.config.virtualSwitchers[owner].outputs || []).includes(output.auxIndex);
+                outputs[output.outputId] = {
+                    selected: selected[output.outputId], owner: output.owner,
+                    live: output.liveSourceId, status: output.routeStatus,
+                };
             }
+            const group = this.routingProjection?.groups?.[owner];
+            this.assignmentReview = {
+                deviceId: this.dashboardConfig.deviceId,
+                revision: this.dashboardConfig.revision,
+                programId: this.routingProjection?.capabilities?.programOutputSourceId,
+                barsId: this.routingProjection?.capabilities?.colorBarsSourceId,
+                groupStatus: group?.routeStatus, groupLive: group?.liveSourceId,
+                groupTarget: group?.savedProgramTargetId, outputs,
+            };
             this.assignmentSelection = selected;
             this.assignmentDialogOpen = true;
+        },
+
+        virtualAssignmentTarget(group, output) {
+            if (group?.routeStatus === 'uniform') return group.liveSourceId;
+            if (group?.routeStatus !== 'empty') return null;
+            if (Number.isInteger(group.savedProgramTargetId)) return group.savedProgramTargetId;
+            const source = this.sources.find(item => item.source === output.liveSourceId);
+            return output.owner === 'other' && output.routeStatus === 'observed' && source?.available_aux === true
+                ? source.source : null;
         },
 
         stagedAssignmentDescription(output) {
             if (!this.assignmentOwner || !this.dashboardConfig || !output) return '';
             const checked = !!this.assignmentSelection[String(output.outputId)];
+            const before = this.assignmentReview?.outputs[output.outputId];
+            if (!before || checked === before.selected) return '';
+            if (output.owner !== before.owner || output.liveSourceId !== before.live || output.routeStatus !== before.status) {
+                return 'Output changed. Reopen the assignment dialog to review.';
+            }
             if (this.assignmentOwner === 'primary') {
-                const currentlyPrimary = output.observedRouteOwner === 'primary';
-                if (checked && !currentlyPrimary) {
+                if (checked) {
                     return `Route ${this.sourceStateLabel(output.liveSourceId)} → M/E PROGRAM`;
                 }
-                if (!checked && currentlyPrimary) {
-                    return `Release to ${this.sourceStateLabel(this.routingProjection?.programBackgroundSourceId)} (background only; key overlays removed)`;
-                }
-                return '';
+                return Number.isInteger(this.routingProjection?.capabilities?.colorBarsSourceId)
+                    ? 'Release to Color Bars' : 'Cannot release: Color Bars unavailable.';
             }
             const group = this.routingProjection?.groups?.[this.assignmentOwner];
-            const assigned = (this.dashboardConfig.config.virtualSwitchers[this.assignmentOwner]?.outputs || [])
-                .includes(output.auxIndex);
-            if (checked && !assigned) {
-                const target = group?.routeStatus === 'empty' ? group.savedProgramTargetId : group?.liveSourceId;
+            if (checked) {
+                const target = this.virtualAssignmentTarget(group, output);
                 return Number.isInteger(target)
-                    ? `Route ${this.sourceStateLabel(output.liveSourceId)} → ${this.sourceStateLabel(target)}`
+                    ? target === output.liveSourceId ? `Assign; keep ${this.sourceStateLabel(target)}`
+                        : `Route ${this.sourceStateLabel(output.liveSourceId)} → ${this.sourceStateLabel(target)}`
                     : 'Cannot assign: set a valid Program target first.';
             }
-            if (!checked && assigned) return `Release; preserve ${this.sourceStateLabel(output.liveSourceId)}`;
-            return '';
+            return `Release; preserve ${this.sourceStateLabel(output.liveSourceId)}`;
         },
 
         closeAssignmentDialog() {
@@ -1673,42 +1831,61 @@ document.addEventListener('alpine:init', () => {
             this.assignmentDialogOpen = false;
             this.assignmentOwner = null;
             this.assignmentSelection = {};
+            this.assignmentReview = null;
         },
 
         applyAssignmentChanges() {
             if (!this.assignmentDialogOpen || this.assignmentBusy || !this.dashboardConfig ||
                 !this.hardwareReady || this.outputMappingError) return;
             const owner = this.assignmentOwner;
-            const config = this.dashboardConfig.config;
+            const review = this.assignmentReview;
+            if (!review || review.deviceId !== this.dashboardConfig.deviceId ||
+                review.revision !== this.dashboardConfig.revision) {
+                this.showError('Output assignments changed. Close and reopen the assignment dialog to review.');
+                return;
+            }
             const ops = [];
             const removals = [];
             const programId = this.routingProjection?.capabilities?.programOutputSourceId;
+            const bars = this.routingProjection?.capabilities?.colorBarsSourceId;
             for (const output of this.physicalOutputs) {
                 const checked = !!this.assignmentSelection[String(output.outputId)];
+                const before = review.outputs[output.outputId];
+                if (!before || checked === before.selected) continue;
+                if (output.owner !== before.owner || output.liveSourceId !== before.live || output.routeStatus !== before.status) {
+                    this.showError(`OUT ${output.outputId} changed. Close and reopen the assignment dialog to review.`);
+                    return;
+                }
                 const channel = output.outputId - 1;
                 if (owner === 'primary') {
-                    const currently = output.observedRouteOwner === 'primary';
-                    if (checked === currently) continue;
                     if (checked) {
-                        if (!Number.isInteger(programId)) { this.showError('M/E Program feed identity is unavailable.'); return; }
+                        if (!Number.isInteger(programId) || programId !== review.programId) {
+                            this.showError('M/E Program feed changed or is unavailable. Reopen the assignment dialog to review.'); return;
+                        }
                         ops.push({ outputId: output.outputId, mode: 'primary_assign', targetOwner: 'primary', target: programId,
                             expectedLive: output.liveSourceId,
                             transferFrom: output.owner === 'virtual1' || output.owner === 'virtual2' ? output.owner : null });
                     } else {
-                        const background = this.routingProjection?.programBackgroundSourceId;
-                        if (!Number.isInteger(background)) { this.showError('Current M/E Program background is unavailable.'); return; }
+                        if (!Number.isInteger(bars) || bars !== review.barsId) {
+                            this.showError('Color Bars changed or is unavailable. Reopen the assignment dialog to review.'); return;
+                        }
                         ops.push({ outputId: output.outputId, mode: 'primary_release', targetOwner: 'other',
-                            target: background, expectedLive: output.liveSourceId });
+                            target: bars, expectedLive: output.liveSourceId });
                     }
                 } else {
-                    const assigned = (config.virtualSwitchers[owner].outputs || []).includes(channel);
-                    if (checked === assigned) continue;
                     if (!checked) { removals.push({ groupId: owner, channel }); continue; }
                     const group = this.routingProjection?.groups?.[owner];
+                    if (group?.routeStatus !== review.groupStatus || group?.liveSourceId !== review.groupLive ||
+                        group?.savedProgramTargetId !== review.groupTarget) {
+                        this.showError('The virtual switcher target changed. Reopen the assignment dialog to review.'); return;
+                    }
                     if (!group || ['mixed', 'unknown'].includes(group.routeStatus)) {
                         this.showError(`${owner} routing must be uniform and observed before adding an output.`); return;
                     }
-                    const target = group.routeStatus === 'empty' ? group.savedProgramTargetId : group.liveSourceId;
+                    if (group.routeStatus === 'empty' && group.savedProgramTargetId == null && ops.length) {
+                        this.showError('Assign the first output by itself so the virtual switcher can keep its current feed.'); return;
+                    }
+                    const target = this.virtualAssignmentTarget(group, output);
                     if (!Number.isInteger(target)) { this.showError(`Set a valid ${owner} Program target before assigning an output.`); return; }
                     const transferFrom = ['primary', 'virtual1', 'virtual2'].includes(output.owner) ? output.owner : null;
                     ops.push({ outputId: output.outputId, mode: 'virtual_assign', targetOwner: owner,
@@ -1717,7 +1894,8 @@ document.addEventListener('alpine:init', () => {
             }
             if (!ops.length && !removals.length) { this.closeAssignmentDialog(); return; }
             this.assignmentBusy = true;
-            this.routeBatch = { owner, operations: ops.map(operation => ({ ...operation, status: 'queued' })),
+            this.routeBatch = { owner, revision: review.revision,
+                operations: ops.map(operation => ({ ...operation, status: 'queued' })),
                 removals, confirmed: [], savingConfig: false, error: '' };
             this.dispatchNextAssignmentRoute();
         },
@@ -1737,7 +1915,7 @@ document.addEventListener('alpine:init', () => {
                 next.status = 'unconfirmed';
                 this.showError(`OUT ${next.outputId} route timed out; hardware result is unconfirmed. Review it before continuing.`);
             }, 4000);
-            this.ws.send(JSON.stringify({ command: 'dashboard_output_route', config_revision: this.dashboardConfig.revision,
+            this.ws.send(JSON.stringify({ command: 'dashboard_output_route', config_revision: this.routeBatch.revision,
                 output_id: next.outputId, mode: next.mode, group_id: next.groupId || null,
                 transfer_from: next.transferFrom || null, expected_live: next.expectedLive,
                 input_source: next.target }));
@@ -1801,7 +1979,8 @@ document.addEventListener('alpine:init', () => {
                 const remove = new Set(batch.removals.filter(item => item.groupId === groupId).map(item => item.channel));
                 for (const operation of batch.confirmed) {
                     const channel = operation.outputId - 1;
-                    if (operation.targetOwner === 'primary' || operation.transferFrom === groupId || operation.targetOwner === groupId) remove.add(channel);
+                    if (operation.targetOwner !== 'primary' &&
+                        (operation.transferFrom === groupId || operation.targetOwner === groupId)) remove.add(channel);
                 }
                 const nextOutputs = outputs.filter(channel => !remove.has(channel));
                 if (nextOutputs.length !== outputs.length) changed = true;
@@ -1819,6 +1998,12 @@ document.addEventListener('alpine:init', () => {
             if (!changed) {
                 this.routeBatch = null; this.assignmentBusy = false; this.assignmentDialogOpen = false;
                 if (batch.error) this.showError(batch.error); else this.showNotice('Output routing changes confirmed.');
+                return;
+            }
+            if (batch.revision !== this.dashboardConfig.revision) {
+                this.routeBatch = null;
+                this.assignmentBusy = false;
+                this.showError('The routes changed, but settings were revised during assignment. Reopen the dialog to review.');
                 return;
             }
             batch.savingConfig = true;
@@ -1847,23 +2032,68 @@ document.addEventListener('alpine:init', () => {
         },
 
         groupCutReason(groupId) {
+            const group = this.routingProjection?.groups?.[groupId];
+            return this.groupRouteReason(groupId, group?.previewSourceId);
+        },
+
+        virtualProgramReason(groupId, sourceId) {
+            const group = this.routingProjection?.groups?.[groupId];
+            const source = this.sources.find(item => item.source === sourceId);
+            if (!source || source.available_aux !== true) return 'Source is not available to AUX outputs.';
+            if (sourceId === this.routingProjection?.capabilities?.programOutputSourceId) return 'A virtual switcher cannot route Primary M/E Program.';
+            if (!group) return 'Virtual switcher state is unavailable.';
+            if (group.routeStatus === 'empty') {
+                return !this.hardwareReady || !this.dashboardConfig || this.dashboardConfigSaving ||
+                    this.assignmentBusy ? 'Switcher or saved configuration is unavailable.' : '';
+            }
+            if (!this.virtualDirect[groupId]) return 'Enable Direct to select a live source.';
+            return this.groupRouteReason(groupId, sourceId, true);
+        },
+
+        groupRouteReason(groupId, target, direct = false) {
             if (!this.hardwareReady || !this.dashboardConfig) return 'Switcher or saved configuration is unavailable.';
+            if (this.dashboardConfigDeviceId !== this.routingProjection?.deviceId) return 'Verified switcher settings are unavailable.';
             if (this.outputMappingError) return this.outputMappingError;
-            if (this.assignmentBusy) return 'An output ownership change is pending.';
+            if (this.dashboardConfigSaving || this.assignmentBusy) return 'A settings update or output ownership change is pending.';
+            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return 'Dashboard connection is not ready.';
             const pending = this.groupCutOperations[groupId];
-            if (pending && ['pending', 'unconfirmed', 'partial'].includes(pending.status)) return 'Previous group CUT is pending or incomplete; review actual routes.';
+            if (pending && ['pending', 'unconfirmed', 'partial', 'saving'].includes(pending.status)) return 'Previous virtual switch is pending or incomplete; review actual routes.';
             const alignment = this.groupAlignOperations[groupId];
             if (alignment && ['pending', 'unconfirmed', 'partial', 'saving'].includes(alignment.status)) return 'Mixed-route alignment is pending or incomplete; review actual routes.';
             const group = this.routingProjection?.groups?.[groupId];
             if (!group || !Array.isArray(group.outputIds) || !group.outputIds.length) return 'Assign at least one output before CUT.';
-            if (group.routeStatus === 'mixed') return 'MIXED ROUTING must be resolved before group CUT.';
-            if (group.routeStatus !== 'uniform') return 'All assigned output routes must be current and observed.';
-            if (group.previewSourceValid !== true || !Number.isInteger(group.previewSourceId)) return 'Select a valid directly routable Preview source.';
-            if (group.previewSourceId === group.liveSourceId) return 'Queued Preview is already live.';
+            if (!['uniform', 'mixed'].includes(group.routeStatus) ||
+                group.outputIds.some(id => !group.outputs?.some(output =>
+                    output.outputId === id && output.routeStatus === 'observed' && Number.isInteger(output.liveSourceId)))) {
+                return 'All assigned output routes must be current and observed.';
+            }
+            const savedOutputs = this.dashboardConfig.config.virtualSwitchers[groupId].outputs;
+            if (savedOutputs.length !== group.outputIds.length ||
+                savedOutputs.some(channel => !group.outputIds.includes(channel + 1))) {
+                return 'Output assignments changed; wait for the latest verified settings.';
+            }
+            if (!direct && (group.previewSourceValid !== true || !Number.isInteger(target))) return 'Select a valid directly routable Preview source.';
+            if (target === this.routingProjection.capabilities?.programOutputSourceId) return 'A virtual switcher cannot route Primary M/E Program.';
+            if (target === group.liveSourceId) return 'The selected source is already live.';
             const assigned = new Set(group.outputIds);
             if ((this.routingProjection?.conflicts || []).some(item =>
                 assigned.has(item.outputId) || assigned.has((item.auxIndex ?? -1) + 1))) return 'Output ownership or routing conflict must be resolved first.';
             return '';
+        },
+
+        groupRouteSnapshot(group) {
+            return group.outputs.map(output => ({ channel: output.outputId - 1, source: output.liveSourceId }));
+        },
+
+        get takeAllBlockers() {
+            return this.state?.dashboardSafety?.takeAllBlockers || [];
+        },
+
+        reviewTakeAllBlocker(blocker) {
+            if (!this.hardwareReady || !blocker?.reviewable) return;
+            if (blocker.kind === 'me_preview') this.reviewPrimaryPreview();
+            if (blocker.kind === 'usk') this.reviewKeyer(blocker.index);
+            if (blocker.kind === 'dsk') this.reviewDSK(blocker.index);
         },
 
         takeAllReason() {
@@ -1881,16 +2111,11 @@ document.addEventListener('alpine:init', () => {
                     ['virtual1', 'virtual2'].includes(conflict.group) &&
                     this.routingProjection?.groups?.[conflict.group]?.outputIds?.length === 0));
             if (blockingConflicts.length) return 'Output ownership or routing conflicts must be resolved before TAKE ALL.';
+            if (this.takeAllBlockers.length) return this.takeAllBlockers[0].message;
             if (this.previewPending || this.previewUnconfirmed || this.stylePending || this.styleUnconfirmed) {
                 return 'A Primary Preview or transition-style change is pending or unconfirmed.';
             }
-            const style = this.hardwareMe?.transition?.style;
-            if (this.takeAllPrimaryAction === 'auto' &&
-                (!Number.isInteger(style) || !this.transitionStyleSupported(style))) {
-                return 'The selected Primary AUTO transition style is unavailable or unknown.';
-            }
-            const primaryReason = this.takeAllPrimaryAction === 'auto'
-                ? this.primaryAutoReason() : this.primaryCutReason();
+            const primaryReason = this.primaryCutReason();
             if (primaryReason) return primaryReason;
             for (const groupId of ['virtual1', 'virtual2']) {
                 const group = this.routingProjection?.groups?.[groupId];
@@ -1909,21 +2134,6 @@ document.addEventListener('alpine:init', () => {
         takeAll() {
             const reason = this.takeAllReason();
             if (reason) { this.showError(reason); return; }
-            if (this.takeAllPrimaryAction === 'auto' && this.meTiedKeyList.length) {
-                this.takeAllKeyedConfirmOpen = true;
-                return;
-            }
-            this.dispatchTakeAll(false);
-        },
-
-        dispatchTakeAll(allowKeyed) {
-            this.takeAllKeyedConfirmOpen = false;
-            const reason = this.takeAllReason();
-            if (reason || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
-                if (reason) this.showError(reason);
-                return;
-            }
-            const action = this.takeAllPrimaryAction;
             const transition = this.hardwareMe?.transition;
             const selection = transition?.selection;
             if (!selection) { this.showError('M/E next-transition selection is unavailable.'); return; }
@@ -1931,30 +2141,28 @@ document.addEventListener('alpine:init', () => {
             const groups = {};
             for (const groupId of ['virtual1', 'virtual2']) {
                 const group = this.routingProjection.groups[groupId];
-                groups[groupId] = { live: group.liveSourceId, preview: group.previewSourceId };
+                groups[groupId] = { routes: this.groupRouteSnapshot(group), preview: group.previewSourceId };
             }
-            const keyOnlyState = action === 'auto' ? this.primaryKeyOnlyAutoState() : null;
-            const primary = { status: 'pending', action, before: this.hardwareProgramSourceId,
-                target: keyOnlyState ? this.hardwareProgramSourceId : this.hardwarePreviewSourceId,
-                style: transition.style, error: '',
-                keyBefore: keyOnlyState?.before || null, keyTargets: keyOnlyState?.targets || null };
-            this.takeAllOperation = { id, status: 'preflight', action, primary,
+            const primary = { status: 'pending', before: this.hardwareProgramSourceId,
+                target: this.hardwarePreviewSourceId, error: '' };
+            this.takeAllOperation = { id, status: 'preflight', primary,
                 virtual1: { status: groups.virtual1 ? 'pending' : 'failed', outputIds: this.routingProjection.groups.virtual1.outputIds.slice(), channels: [] },
                 virtual2: { status: groups.virtual2 ? 'pending' : 'failed', outputIds: this.routingProjection.groups.virtual2.outputIds.slice(), channels: [] },
                 started: false, configSaved: false, error: '' };
             this.assignmentBusy = true;
             this.primaryActionPending = { kind: 'take_all', takeAllId: id,
-                target: primary.target, before: primary.before,
-                keyBefore: primary.keyBefore, keyTargets: primary.keyTargets };
+                target: primary.target, before: primary.before };
             this.armPrimaryOperationTimeout();
             for (const groupId of ['virtual1', 'virtual2']) {
                 const participant = this.takeAllOperation[groupId];
                 if (!participant.outputIds.length) { participant.status = 'skipped'; continue; }
                 const group = this.routingProjection.groups[groupId];
                 const operation = this.groupCutOperations[groupId] = {
-                    status: 'pending', target: group.previewSourceId, previous: group.liveSourceId,
+                        status: 'pending', target: group.previewSourceId, previous: group.liveSourceId,
+                        showMismatchWhilePending: groups[groupId].routes.some(route => route.source !== group.savedProgramTargetId),
                     takeAllId: id,
-                    channels: group.outputIds.map(outputId => ({ channel: outputId - 1, status: 'dispatching', error: '' })),
+                    channels: groups[groupId].routes.map(({ channel, source }) =>
+                        ({ channel, before: source, status: 'dispatching', error: '' })),
                     configSaved: false, timer: null,
                 };
                 operation.timer = setTimeout(() => {
@@ -1990,12 +2198,11 @@ document.addEventListener('alpine:init', () => {
                 }
             }, 5500);
             this.ws.send(JSON.stringify({ command: 'dashboard_take_all', device_id: this.dashboardConfigDeviceId,
-                config_revision: this.dashboardConfig.revision, primary_action: action,
+                config_revision: this.dashboardConfig.revision, primary_action: 'cut',
                 expected_program: this.hardwareProgramSourceId, expected_preview: this.hardwarePreviewSourceId,
                 expected_selection: { background: selection.background, key1: selection.key1,
                     key2: selection.key2, key3: selection.key3, key4: selection.key4 },
-                expected_key_states: keyOnlyState?.before,
-                allow_keyed: allowKeyed === true, groups }));
+                groups }));
         },
 
         rejectTakeAll(message) {
@@ -2011,15 +2218,10 @@ document.addEventListener('alpine:init', () => {
                     if (groupOperation.timer !== null) clearTimeout(groupOperation.timer);
                     delete this.groupCutOperations[groupId];
                 }
-                operation[groupId].status = 'failed';
-                operation[groupId].error = 'Not dispatched: TAKE ALL preflight failed.';
             }
-            operation.primary.status = 'failed';
-            operation.primary.error = 'Not dispatched: ' + message;
-            operation.status = 'failed';
+            operation.status = 'blocked';
             operation.error = message;
             this.assignmentBusy = false;
-            this.showError(message);
         },
 
         acceptTakeAll(data) {
@@ -2029,18 +2231,8 @@ document.addEventListener('alpine:init', () => {
             operation.timer = null;
             operation.started = true;
             const primary = data.primary || {};
-            operation.primary.action = primary.action || operation.action;
             operation.primary.before = primary.before;
             operation.primary.target = primary.target;
-            operation.primary.style = primary.style;
-            if (primary.key_targets && typeof primary.key_targets === 'object') {
-                operation.primary.keyTargets = primary.key_targets;
-                operation.primary.keyBefore = primary.key_before || {};
-                if (this.primaryActionPending?.takeAllId === operation.id) {
-                    this.primaryActionPending.keyTargets = primary.key_targets;
-                    this.primaryActionPending.keyBefore = primary.key_before || {};
-                }
-            }
             operation.primary.status = primary.ok ? 'pending' : 'failed';
             operation.primary.error = primary.error || '';
             if (!primary.ok && this.primaryActionPending?.takeAllId === operation.id) {
@@ -2081,6 +2273,7 @@ document.addEventListener('alpine:init', () => {
                 for (const outcome of result.outcomes || []) {
                     const item = groupOperation.channels.find(channel => channel.channel === outcome.channel);
                     if (!item) continue;
+                    if (Number.isInteger(outcome.before)) item.before = outcome.before;
                     item.status = outcome.ok ? 'pending' : 'failed';
                     item.error = outcome.error || '';
                 }
@@ -2110,9 +2303,7 @@ document.addEventListener('alpine:init', () => {
                 for (const groupId of confirmedGroups) {
                     const participant = operation[groupId];
                     const group = config.virtualSwitchers[groupId];
-                    group.programTarget = participant.target;
-                    const prior = this.sources.find(source => source.source === participant.previous);
-                    if (prior?.available_aux === true) group.previewSource = participant.previous;
+                    this.applyConfirmedGroupTake(group, participant.target, participant.previous);
                 }
                 operation.status = 'saving';
                 operation.configSaveGroups = confirmedGroups;
@@ -2155,10 +2346,27 @@ document.addEventListener('alpine:init', () => {
         cutVirtualGroup(groupId) {
             const reason = this.groupCutReason(groupId);
             if (reason) { this.showError(reason); return; }
+            this.startVirtualRoute(groupId, this.routingProjection.groups[groupId].previewSourceId, 'cut');
+        },
+
+        selectVirtualProgram(groupId, sourceId) {
+            const reason = this.virtualProgramReason(groupId, sourceId);
+            if (reason) { this.showError(reason); return; }
+            if (this.routingProjection.groups[groupId].routeStatus === 'empty') {
+                this.setEmptyVirtualProgramTarget(groupId, sourceId);
+                return;
+            }
+            this.startVirtualRoute(groupId, sourceId, 'direct');
+        },
+
+        startVirtualRoute(groupId, target, mode) {
             const group = this.routingProjection.groups[groupId];
+            const routes = this.groupRouteSnapshot(group);
             const operation = this.groupCutOperations[groupId] = {
-                status: 'pending', target: group.previewSourceId, previous: group.liveSourceId,
-                channels: group.outputIds.map(outputId => ({ channel: outputId - 1, status: 'dispatching', error: '' })),
+                status: 'pending', target, mode, previous: group.liveSourceId,
+                showMismatchWhilePending: routes.some(route => route.source !== group.savedProgramTargetId),
+                channels: routes.map(({ channel, source }) =>
+                    ({ channel, before: source, status: 'dispatching', error: '' })),
                 configSaved: false, timer: null,
             };
             operation.timer = setTimeout(() => {
@@ -2168,20 +2376,24 @@ document.addEventListener('alpine:init', () => {
                     }
                     operation.status = operation.channels.some(item => item.status === 'failed') ? 'partial' : 'unconfirmed';
                     operation.timer = null;
-                    this.showError(`${this.switcherName(groupId, groupId)} CUT timed out; review each output route.`);
+                    this.showError(`${this.switcherName(groupId, groupId)} route timed out; review each output route.`);
                 }
             }, 5000);
             this.ws.send(JSON.stringify({ command: 'dashboard_cut_virtual_group', group_id: groupId,
-                config_revision: this.dashboardConfig.revision, input_source: group.previewSourceId }));
+                device_id: this.dashboardConfigDeviceId, config_revision: this.dashboardConfig.revision, input_source: target, mode,
+                expected_routes: routes }));
         },
 
         acceptGroupCut(data) {
             const operation = this.groupCutOperations[data.group_id];
             if (!operation) return;
+            if (operation.mode === 'direct' && (data.mode !== 'direct' || data.target !== operation.target)) return;
+            operation.accepted = true;
             operation.target = data.target; operation.previous = data.previous;
             for (const outcome of data.outcomes || []) {
                 const item = operation.channels.find(channel => channel.channel === outcome.channel);
                 if (!item) continue;
+                if (Number.isInteger(outcome.before)) item.before = outcome.before;
                 item.status = outcome.ok ? 'pending' : 'failed'; item.error = outcome.error || '';
             }
             this.reconcileThreeC();
@@ -2195,7 +2407,14 @@ document.addEventListener('alpine:init', () => {
             operation.configSaved = true; operation.status = 'complete';
             if (operation.timer !== null) clearTimeout(operation.timer);
             operation.timer = null;
-            this.showNotice(`${this.switcherName(groupId, groupId)} CUT confirmed on all outputs.`);
+            const action = operation.mode === 'direct' ? 'Direct Program' : 'CUT';
+            this.showNotice(`${this.switcherName(groupId, groupId)} ${action} confirmed on all outputs.`);
+        },
+
+        applyConfirmedGroupTake(group, target, previous) {
+            group.programTarget = target;
+            const prior = this.sources.find(source => source.source === previous);
+            group.previewSource = prior?.available_aux === true ? previous : null;
         },
 
         groupAlignReason(groupId) {
@@ -2300,7 +2519,7 @@ document.addEventListener('alpine:init', () => {
             }
             const takeAllPrimary = this.takeAllOperation?.primary;
             if (this.takeAllOperation?.started && takeAllPrimary?.status === 'unconfirmed' &&
-                takeAllPrimary.reviewRequested && !takeAllPrimary.keyTargets) {
+                takeAllPrimary.reviewRequested) {
                 if (this.hardwareProgramSourceId === takeAllPrimary.target) {
                     takeAllPrimary.status = 'confirmed';
                     takeAllPrimary.error = '';
@@ -2318,37 +2537,20 @@ document.addEventListener('alpine:init', () => {
                 if (op.keyTargets) {
                     const outcome = this.primaryKeyOnlyAutoOutcome(op);
                     if (outcome === 'confirmed') {
-                        if (op.takeAllId && this.takeAllOperation?.id === op.takeAllId) {
-                            this.takeAllOperation.primary.status = 'confirmed';
-                            this.takeAllOperation.primary.error = '';
-                        } else {
-                            this.showNotice('Primary key-only AUTO confirmed by observed keyer state.');
-                        }
+                        this.showNotice('Primary key-only AUTO confirmed by observed keyer state.');
                         this.primaryActionPending = null;
                         if (this.primaryActionTimer !== null) clearTimeout(this.primaryActionTimer);
                         this.primaryActionTimer = null;
-                        if (op.takeAllId) this.tryFinalizeTakeAll();
                     } else if (op.reviewRequested) {
                         op.reviewRequested = false;
                         if (outcome === 'unchanged') {
-                            if (op.takeAllId && this.takeAllOperation?.id === op.takeAllId) {
-                                this.takeAllOperation.primary.status = 'failed';
-                                this.takeAllOperation.primary.error = 'Key-only AUTO left the selected keyers unchanged after review.';
-                            } else {
-                                this.showError('Key-only AUTO left the selected keyers unchanged after review; no transition was confirmed.');
-                            }
+                            this.showError('Key-only AUTO left the selected keyers unchanged after review; no transition was confirmed.');
                             this.primaryActionPending = null;
                             if (this.primaryActionTimer !== null) clearTimeout(this.primaryActionTimer);
                             this.primaryActionTimer = null;
-                            if (op.takeAllId) this.tryFinalizeTakeAll();
                         } else {
                             op.unconfirmed = true;
-                            if (op.takeAllId && this.takeAllOperation?.id === op.takeAllId) {
-                                this.takeAllOperation.primary.status = 'unconfirmed';
-                                this.takeAllOperation.primary.error = 'Key-only AUTO remains unconfirmed; keyer state is partial, stale, or the M/E is not at rest.';
-                            } else {
-                                this.showError('Key-only AUTO remains unconfirmed; keyer state is partial, stale, or the M/E is not at rest.');
-                            }
+                            this.showError('Key-only AUTO remains unconfirmed; keyer state is partial, stale, or the M/E is not at rest.');
                         }
                     }
                 } else if (this.hardwareProgramSourceId === op.target && op.target !== op.before) {
@@ -2390,18 +2592,23 @@ document.addEventListener('alpine:init', () => {
             for (const [groupId, operation] of Object.entries(this.groupCutOperations)) {
                 if (!['pending', 'unconfirmed', 'partial'].includes(operation.status) || !Array.isArray(operation.channels)) continue;
                 for (const item of operation.channels) {
-                    if (!['pending', 'unconfirmed', 'dispatching'].includes(item.status) &&
+                    if (!['pending', 'unconfirmed', 'dispatching', 'confirmed'].includes(item.status) &&
                         !(operation.takeAllId && item.status === 'failed' && item.reviewRequested)) continue;
+                    if (operation.mode === 'direct' && !operation.accepted && !item.reviewRequested) continue;
                     const output = this.projectedOutputs.find(route => route.auxIndex === item.channel);
-                    if (output?.routeStatus === 'observed' && output.liveSourceId === operation.target) item.status = 'confirmed';
-                    else if (item.reviewRequested && output?.routeStatus === 'observed' && output.liveSourceId === operation.previous) {
-                        item.status = 'failed'; item.reviewed = true; item.error = `OUT ${output.outputId} remains on its previous route after review.`;
+                    const observed = output?.routeStatus === 'observed';
+                    if (observed && output.owner === groupId && output.liveSourceId === operation.target) item.status = 'confirmed';
+                    else if (item.reviewRequested && observed) {
+                        item.status = 'failed'; item.reviewed = true;
+                        item.error = output.owner !== groupId ? `OUT ${output.outputId} left the virtual switcher.`
+                            : `OUT ${output.outputId} is set to ${this.sourceStateLabel(output.liveSourceId)} after review.`;
                     }
-                    else if (output?.routeStatus === 'observed' && output.liveSourceId !== operation.previous) {
-                        item.status = 'unconfirmed'; item.error = `OUT ${output.outputId} changed to an unexpected source.`;
+                    else if (item.status === 'confirmed' || (observed &&
+                        (output.liveSourceId !== item.before || output.owner !== groupId))) {
+                        item.status = 'unconfirmed'; item.error = `OUT ${item.channel + 1} no longer matches the expected route or ownership.`;
                     }
                 }
-                if (operation.status === 'partial' &&
+                if (operation.status !== 'pending' && operation.channels.some(item => item.status === 'failed') &&
                     operation.channels.every(item => ['confirmed', 'failed'].includes(item.status)) &&
                     (!operation.takeAllId || operation.channels.every(item => item.status === 'confirmed' || item.reviewed))) {
                     // A uniform route alone does not prove a timed-out write
@@ -2452,9 +2659,8 @@ document.addEventListener('alpine:init', () => {
                     if (operation.timer !== null) clearTimeout(operation.timer);
                     const config = JSON.parse(JSON.stringify(this.dashboardConfig.config));
                     const group = config.virtualSwitchers[groupId];
-                    group.programTarget = operation.target;
-                    const previousSource = this.sources.find(source => source.source === operation.previous);
-                    if (previousSource?.available_aux === true) group.previewSource = operation.previous;
+                    if (operation.mode === 'direct') group.programTarget = operation.target;
+                    else this.applyConfirmedGroupTake(group, operation.target, operation.previous);
                     this.configSavePurpose = `group-cut:${groupId}`;
                     if (!this.sendDashboardConfig(config, this.configSavePurpose)) {
                         operation.status = 'confirmed_config_failed'; this.configSavePurpose = null;
@@ -2466,7 +2672,7 @@ document.addEventListener('alpine:init', () => {
                         if (operation.timer !== null) clearTimeout(operation.timer);
                         operation.timer = null;
                     }
-                    this.showError('Group CUT partially completed or was diverted. Actual routes are shown; Preview was not swapped.');
+                    this.showError('Virtual routing partially completed or was diverted. Review the actual output routes.');
                 }
             }
             for (const [groupId, operation] of Object.entries(this.groupAlignOperations)) {
@@ -2501,6 +2707,7 @@ document.addEventListener('alpine:init', () => {
         },
 
         markThreeCOperationsUnconfirmed(reason) {
+            this.virtualDirect = { virtual1: false, virtual2: false };
             if (this.dashboardConfigSaveTimer !== null) clearTimeout(this.dashboardConfigSaveTimer);
             this.dashboardConfigSaveTimer = null;
             if (this.dashboardConfigSaving) {

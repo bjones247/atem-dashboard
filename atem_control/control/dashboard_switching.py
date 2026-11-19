@@ -238,6 +238,36 @@ def dsk_toggle_readiness(connection, dsk_index, expected_on_air=None):
         return None, live
 
 
+def _take_all_pending_controls(connection, mx):
+    """Reconcile tracked controls against fresh hardware and report blockers."""
+    blockers = []
+    for (kind, index), operation in list(_operations.get(connection, {}).items()):
+        if kind == 'me_preview':
+            label = 'M/E Preview'
+            live = _source(mx, 'preview-bus-input', 0)
+        elif kind == 'usk':
+            label = f'Upstream keyer {index + 1}'
+            live = _usk_on_air(mx, index)
+        elif kind == 'dsk':
+            label = f'Downstream keyer {index + 1}'
+            state = _entry(mx, 'dkey-state', index)
+            count = getattr(mx.get('topology'), 'downstream_keyers', None)
+            live = None
+            if (_integer(count) and index < count and getattr(state, 'is_transitioning', None) is False and
+                    getattr(state, 'is_autotransitioning', None) is False):
+                live = _dsk_on_air(mx, index)
+        else:
+            continue
+        reason = _pending(connection, (kind, index), live)
+        if reason:
+            blockers.append({
+                'kind': kind, 'index': index, 'label': label,
+                'message': f'{label} is blocking TAKE ALL. {reason}',
+                'reviewable': live is not None and time.monotonic() - operation['since'] >= PENDING_SECONDS,
+            })
+    return blockers
+
+
 def safety_snapshot(connection):
     """UI projection from the same evaluation used at the command boundary."""
     with _lock:
@@ -264,6 +294,7 @@ def safety_snapshot(connection):
                 dsk[str(dsk_index)] = {'reason': dsk_reason, 'onAir': on_air}
         return {'fresh': freshness_reason is None,
                 'meCut': {'reason': reason, 'program': program, 'preview': preview},
+                'takeAllBlockers': _take_all_pending_controls(connection, mx) if mx else [],
                 'aux': aux, 'usk': usk, 'dsk': dsk}
 
 
@@ -577,10 +608,11 @@ def _group(config, group_id):
     return item if isinstance(item, dict) else {}
 
 
-def _route_projection(mx, config, revision):
+def _route_projection(connection, mx, config_snapshot, revision):
+    from atem_control.control.dashboard_config import pending_primary_retirements
     from atem_control.control.dashboard_ownership import project_routes
-    return project_routes(mx, {'deviceId': None, 'revision': revision, 'config': config},
-                          revision, state_fresh=True)
+    return project_routes(mx, config_snapshot, revision,
+                          retired_channels=pending_primary_retirements(connection, config_snapshot))
 
 
 def output_route_readiness(connection, data, config_snapshot):
@@ -612,8 +644,7 @@ def output_route_readiness(connection, data, config_snapshot):
     if pending:
         return pending, None
 
-    from atem_control.control import dashboard_ownership
-    projection = dashboard_ownership.project_routes(mx, config_snapshot, revision, state_fresh=True)
+    projection = _route_projection(connection, mx, config_snapshot, revision)
     output = next((item for item in projection['outputs'] if item['outputId'] == output_id), None)
     if not output or not output.get('available') or output.get('routeStatus') != 'observed':
         return f'OUT {output_id} is unavailable or unresolved.', None
@@ -625,6 +656,8 @@ def output_route_readiness(connection, data, config_snapshot):
         return 'M/E Program output identity is ambiguous; ownership routing is blocked.', None
     if owner == 'unresolved' or owner == 'unknown' or len(saved_owners) > 1:
         return f'OUT {output_id} has an ownership conflict that must be resolved first.', None
+    if output_id in projection['supersededVirtualOutputIds']:
+        return f'OUT {output_id} has a superseded virtual assignment. Wait for ownership to refresh.', None
 
     if mode == 'primary_assign':
         if target != program_id:
@@ -647,12 +680,11 @@ def output_route_readiness(connection, data, config_snapshot):
         if me['in_transition'] or me['position_value'] != 0 or \
                 _pending(connection, ('me', 0), me['program']):
             return 'Cannot release an M/E Program output while M/E is transitioning or a command is pending.', None
-        background = _source(mx, 'program-bus-input', 0)
-        bg_source = _entry(mx, 'input-properties', background) if background is not None else None
-        if background is None or bg_source is None or getattr(bg_source, 'available_aux', None) is not True:
-            return 'Current M/E Program background is unknown or cannot be routed directly; output release is blocked.', None
-        if target != background:
-            return 'Primary release target changed; it must remain the current M/E Program background.', None
+        bars = projection['capabilities']['colorBarsSourceId']
+        if bars is None:
+            return 'Color Bars is unavailable or cannot be verified as AUX-routable; output release is blocked.', None
+        if target != bars:
+            return 'Primary release must route to the verified Color Bars source.', None
         if config.get('minimumPrimaryDestinations', True):
             count = sum(1 for item in projection['outputs'] if item['observedRouteOwner'] == 'primary')
             if count <= 1:
@@ -664,6 +696,8 @@ def output_route_readiness(connection, data, config_snapshot):
         group = _group(config, group_id)
         if not isinstance(group.get('outputs'), list):
             return 'Saved virtual switcher assignments are malformed.', None
+        if any(output_id - 1 in group['outputs'] for output_id in projection['supersededVirtualOutputIds']):
+            return 'Virtual switcher ownership is being reconciled. Wait for refreshed settings.', None
         if channel in group['outputs']:
             return f'OUT {output_id} is already assigned to this virtual switcher.', None
         other_group = 'virtual2' if group_id == 'virtual1' else 'virtual1'
@@ -674,6 +708,8 @@ def output_route_readiness(connection, data, config_snapshot):
         elif owner == 'primary':
             if data.get('transfer_from') != 'primary':
                 return f'OUT {output_id} carries M/E Program; initiate an explicit transfer from Primary.', None
+            if config.get('minimumPrimaryDestinations', True) and len(projection['primaryOutputIds']) <= 1:
+                return 'Cannot transfer the final Primary Program destination while the minimum-destination policy is enabled.', None
         elif owner != 'other':
             return f'OUT {output_id} is not available for virtual assignment.', None
         if projection['groups'][group_id]['routeStatus'] in ('mixed', 'unknown'):
@@ -683,6 +719,8 @@ def output_route_readiness(connection, data, config_snapshot):
         expected_target = projection['groups'][group_id]['liveSourceId']
         if projection['groups'][group_id]['routeStatus'] == 'empty':
             expected_target = group.get('programTarget')
+            if expected_target is None and owner == 'other' and not saved_owners:
+                expected_target = live
         if target != expected_target:
             return f'{group_id} assignment target changed; review the current live or saved Program target.', None
         if target is None:
@@ -744,40 +782,72 @@ def _virtual_group_cut_plan(connection, data, config_snapshot):
         return 'Virtual switcher has duplicate or unavailable output assignments.', None
     if getattr(mx.get('topology'), 'aux_outputs', None) != 6:
         return 'Physical OUT routing is unavailable unless exactly six AUX channels are reported.', None
-    target = group.get('previewSource')
-    if not _integer(target) or data.get('input_source') != target:
-        return 'Queued Preview changed or is invalid; reload the virtual switcher state.', None
-    if data.get('expected_preview', target) != target:
-        return 'Queued Preview changed; review the virtual switcher state.', None
-    source = _entry(mx, 'input-properties', target)
+    mode = data.get('mode', 'cut')
+    if mode not in ('cut', 'direct'):
+        return 'Unknown virtual switcher routing mode.', None
+    if mode == 'direct':
+        if not config_snapshot.get('deviceId') or data.get('device_id') != config_snapshot['deviceId']:
+            return 'Connected switcher identity changed; reload before Direct Program.', None
+        target = data.get('input_source')
+        if 'expected_routes' not in data:
+            return 'Direct Program requires the observed route of every assigned output.', None
+    else:
+        target = group.get('previewSource')
+        if not _integer(target) or data.get('input_source') != target or data.get('expected_preview', target) != target:
+            return 'Queued Preview changed or is invalid; reload the virtual switcher state.', None
+    source = _entry(mx, 'input-properties', target) if _integer(target) else None
     if source is None or getattr(source, 'available_aux', None) is not True:
-        return 'Queued Preview source is not directly routable to the assigned outputs.', None
-    from atem_control.control.dashboard_ownership import project_routes
-    projection = project_routes(mx, config_snapshot, revision, state_fresh=True)
+        return 'The selected source is not directly routable to the assigned outputs.', None
+    projection = _route_projection(connection, mx, config_snapshot, revision)
     projected = projection['groups'][group_id]
-    if projected['routeStatus'] != 'uniform' or projected['liveSourceId'] is None:
-        return 'Virtual switcher routes are mixed or unknown; resolve routing before CUT.', None
-    if any(item.get('owner') != group_id for item in projection['outputs']
-           if item.get('auxIndex') in channels):
-        return 'Virtual switcher output ownership is conflicted; resolve ownership before CUT.', None
-    previous = projected['liveSourceId']
-    if data.get('expected_live', previous) != previous:
-        return 'Virtual switcher routes changed; review the observed outputs before TAKE ALL.', None
-    if target == previous:
-        return 'Queued Preview source is already live.', None
+    program_id = projection['capabilities']['programOutputSourceId']
+    if program_id is None or target == program_id:
+        return 'Virtual switching cannot target an unknown or Primary M/E Program feed.', None
+    if projected['routeStatus'] not in ('uniform', 'mixed'):
+        return 'All assigned output routes must be current and observed before CUT.', None
+    if 'expected_routes' in data:
+        expected_by_channel = _reviewed_routes(data['expected_routes'], channels)
+        if expected_by_channel is None:
+            return 'The reviewed routes are malformed or no longer match group ownership.', None
+    elif projected['routeStatus'] == 'uniform':
+        # Older dashboard sessions can still submit a uniform group.
+        expected_by_channel = dict.fromkeys(channels, data.get('expected_live', projected['liveSourceId']))
+    else:
+        return 'Review the current route of every output before cutting a mixed group.', None
+    outputs = {output['auxIndex']: output for output in projection['outputs']}
+    before = {}
     for channel in channels:
+        output = outputs.get(channel)
         live = _source(mx, 'aux-output-source', channel)
-        if live != previous:
-            return 'A virtual switcher route changed during group preflight; refresh and review.', None
+        if not output or output['owner'] != group_id or output['routeStatus'] != 'observed':
+            return f'OUT {channel + 1} is unavailable, stale, or ownership-conflicted.', None
+        if live is None or live != expected_by_channel[channel]:
+            return f'OUT {channel + 1} changed after the routes were reviewed.', None
         pending = _pending(connection, ('aux', channel), live)
         if pending:
             return pending, None
-    return None, {'mx': mx, 'group_id': group_id, 'channels': channels,
-                  'target': target, 'previous': previous, 'revision': revision}
+        before[channel] = live
+    if all(live == target for live in before.values()):
+        return 'The selected source is already live.', None
+    return None, {'group_id': group_id, 'channels': channels,
+                  'target': target, 'before': before, 'previous': projected['liveSourceId'],
+                  'revision': revision}
+
+
+def _reviewed_routes(expected, channels):
+    if not isinstance(expected, list) or len(expected) != len(channels):
+        return None
+    routes = {}
+    for item in expected:
+        if (not isinstance(item, dict) or not _integer(item.get('channel')) or
+                not _integer(item.get('source')) or item['channel'] in routes):
+            return None
+        routes[item['channel']] = item['source']
+    return routes if set(routes) == set(channels) else None
 
 
 def dispatch_virtual_group_cut(connection, data, config_snapshot, require_current_revision=False):
-    """Preflight a uniform virtual group then enqueue one route per output.
+    """Preflight a virtual group then enqueue one route per changed output.
 
     The commands are independent and may partially succeed. This function
     returns an outcome for every destination and never retries a failure.
@@ -792,14 +862,24 @@ def dispatch_virtual_group_cut(connection, data, config_snapshot, require_curren
             return False, reason
         outcomes = []
         for channel in plan['channels']:
-            live = _source(plan['mx'], 'aux-output-source', channel)
+            live = plan['before'][channel]
+            mx, reason = _raw(connection)
+            if reason or getattr(mx.get('topology'), 'aux_outputs', None) != 6 or \
+                    _source(mx, 'aux-output-source', channel) != live:
+                outcomes.append({'channel': channel, 'ok': False, 'before': live,
+                                 'error': reason or f'OUT {channel + 1} changed during CUT dispatch.'})
+                continue
+            if live == plan['target']:
+                outcomes.append({'channel': channel, 'ok': True, 'no_op': True, 'before': live, 'error': None})
+                continue
             ok, error = dispatch(connection, 'set_aux_output', {
                 'aux_channel': channel, 'input_source': plan['target']})
             if ok:
                 _record(connection, ('aux', channel), live, plan['target'])
-            outcomes.append({'channel': channel, 'ok': ok, 'error': error})
+            outcomes.append({'channel': channel, 'ok': ok, 'before': live, 'error': error})
         return True, {'group_id': plan['group_id'], 'target': plan['target'],
                       'previous': plan['previous'], 'revision': plan['revision'],
+                      'mode': data.get('mode', 'cut'),
                       'outcomes': outcomes}
 
 
@@ -825,14 +905,13 @@ def take_all_readiness(connection, data, config_snapshot, require_current_revisi
             return 'Dashboard configuration revision is stale or unavailable.', None
         if getattr(mx.get('topology'), 'aux_outputs', None) != 6:
             return 'TAKE ALL requires the expected six-AUX output topology.', None
-        action = data.get('primary_action')
-        if action not in ('cut', 'auto'):
-            return 'Choose CUT or AUTO for the Primary TAKE ALL action.', None
+        if data.get('primary_action', 'cut') != 'cut':
+            return 'TAKE ALL supports CUT only.', None
         if configuration_update_block_reason(connection):
             return 'An output routing operation is pending or unconfirmed; review it before TAKE ALL.', None
-        pending = _operations.get(connection, {})
-        if any(key[0] in ('me_preview', 'usk', 'dsk') for key in pending):
-            return 'A Preview or keyer operation is pending or unconfirmed; review it before TAKE ALL.', None
+        blockers = _take_all_pending_controls(connection, mx)
+        if blockers:
+            return blockers[0]['message'], None
 
         me, reason = _me_state(mx)
         if reason:
@@ -845,26 +924,12 @@ def take_all_readiness(connection, data, config_snapshot, require_current_revisi
                               **{f'key{i + 1}': value for i, value in enumerate(me['selection'][1:])}}
         if not isinstance(expected_selection, dict) or expected_selection != observed_selection:
             return 'M/E next-transition selection changed; review it before TAKE ALL.', None
-        primary_data = {'me': 0, 'expected_program': me['program'],
-                        'expected_preview': me['preview'],
-                        'expected_selection': observed_selection,
-                        'allow_keyed': data.get('allow_keyed') is True,
-                        'expected_style': getattr(me['settings'], 'style', None),
-                        'expected_key_states': data.get('expected_key_states')}
-        if action == 'cut':
-            reason, _program, _preview = me_cut_readiness(connection)
-            if reason:
-                return reason, None
-        else:
-            reason, auto_state = me_auto_readiness(connection, primary_data)
-            if reason:
-                return reason, None
-            if auto_state.get('key_targets') is not None:
-                primary_data['key_before'] = auto_state['key_before']
-                primary_data['key_targets'] = auto_state['key_targets']
+        primary_data = {'me': 0, 'expected_program': me['program'], 'expected_preview': me['preview']}
+        reason, _program, _preview = me_cut_readiness(connection)
+        if reason:
+            return reason, None
 
-        from atem_control.control.dashboard_ownership import project_routes
-        projection = project_routes(mx, config_snapshot, revision, state_fresh=True)
+        projection = _route_projection(connection, mx, config_snapshot, revision)
         if projection['capabilities'].get('programOutputSourceId') is None:
             return 'M/E Program output identity is ambiguous; TAKE ALL is blocked.', None
         empty_groups = {group_id for group_id in ('virtual1', 'virtual2')
@@ -896,17 +961,17 @@ def take_all_readiness(connection, data, config_snapshot, require_current_revisi
                 return f'{group_id} route state is unavailable; refresh before TAKE ALL.', None
             cut_data = {'group_id': group_id, 'config_revision': revision,
                         'input_source': group.get('previewSource'),
-                        'expected_preview': expected.get('preview'),
-                        'expected_live': expected.get('live')}
+                        'expected_preview': expected.get('preview')}
+            if 'routes' in expected:
+                cut_data['expected_routes'] = expected['routes']
+            else:
+                cut_data['expected_live'] = expected.get('live')
             reason, group_plan = _virtual_group_cut_plan(connection, cut_data, config_snapshot)
             if reason:
                 return f'{group_id}: {reason}', None
             virtual[group_id] = group_plan
         return None, {'device_id': device_id, 'revision': revision,
-                      'primary_action': action, 'primary': primary_data,
-                      'primary_before': me['program'],
-                      'primary_target': (me['preview'] if me['selection'][0] else me['program']),
-                      'primary_style': primary_data['expected_style'], 'virtual': virtual}
+                      'primary': primary_data, 'virtual': virtual}
 
 
 def dispatch_take_all(connection, data, config_snapshot, require_current_revision=False):
@@ -917,17 +982,10 @@ def dispatch_take_all(connection, data, config_snapshot, require_current_revisio
         if reason:
             return False, reason
 
-        if plan['primary_action'] == 'cut':
-            primary_ok, primary_error = dispatch_me_cut(connection, plan['primary'])
-            primary_command = 'cut'
-        else:
-            primary_ok, primary_error = dispatch_me_auto(connection, plan['primary'])
-            primary_command = 'auto'
-        primary = {'ok': primary_ok, 'action': plan['primary_action'],
-                   'command': primary_command, 'before': plan['primary_before'],
-                   'target': plan['primary_target'], 'style': plan['primary_style'],
-                   'key_before': plan['primary'].get('key_before'),
-                   'key_targets': plan['primary'].get('key_targets'),
+        primary_ok, primary_error = dispatch_me_cut(connection, plan['primary'])
+        primary = {'ok': primary_ok, 'action': 'cut', 'command': 'cut',
+                   'before': plan['primary']['expected_program'],
+                   'target': plan['primary']['expected_preview'],
                    'error': primary_error if not primary_ok else ''}
 
         virtual = {}
@@ -939,7 +997,8 @@ def dispatch_take_all(connection, data, config_snapshot, require_current_revisio
             group_data = {'group_id': group_id, 'config_revision': plan['revision'],
                           'input_source': group_plan['target'],
                           'expected_preview': group_plan['target'],
-                          'expected_live': group_plan['previous']}
+                          'expected_routes': [{'channel': channel, 'source': live}
+                                              for channel, live in group_plan['before'].items()]}
             ok, result = dispatch_virtual_group_cut(
                 connection, group_data, config_snapshot,
                 require_current_revision=require_current_revision)
@@ -993,25 +1052,16 @@ def dispatch_virtual_group_align(connection, data, config_snapshot, require_curr
         source = _entry(mx, 'input-properties', target) if _integer(target) else None
         if source is None or getattr(source, 'available_aux', None) is not True:
             return False, 'Alignment target is not directly routable to the assigned outputs.'
-        from atem_control.control.dashboard_ownership import project_routes
-        projection = project_routes(mx, config_snapshot, revision, state_fresh=True)
+        projection = _route_projection(connection, mx, config_snapshot, revision)
         group_projection = projection['groups'][group_id]
         if group_projection['routeStatus'] != 'mixed':
             return False, 'Alignment is only available for a currently mixed virtual group.'
         program_id = projection['capabilities'].get('programOutputSourceId')
         if program_id is None or target == program_id:
             return False, 'Alignment cannot target an unknown or Primary M/E Program feed.'
-        expected = data.get('expected_routes')
-        if not isinstance(expected, list) or len(expected) != len(channels):
-            return False, 'The reviewed per-output route snapshot is missing or incomplete.'
-        expected_by_channel = {}
-        for item in expected:
-            if not isinstance(item, dict) or type(item.get('channel')) is not int or \
-                    type(item.get('source')) is not int or item['channel'] in expected_by_channel:
-                return False, 'The reviewed per-output route snapshot is malformed.'
-            expected_by_channel[item['channel']] = item['source']
-        if set(expected_by_channel) != set(channels):
-            return False, 'The reviewed per-output route snapshot no longer matches group ownership.'
+        expected_by_channel = _reviewed_routes(data.get('expected_routes'), channels)
+        if expected_by_channel is None:
+            return False, 'The reviewed routes are malformed or no longer match group ownership.'
         current_routes = {}
         for channel in channels:
             output = next((item for item in projection['outputs'] if item.get('auxIndex') == channel), None)

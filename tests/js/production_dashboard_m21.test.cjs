@@ -213,16 +213,44 @@ test('disconnect makes pending command unconfirmed and reconnect waits for fresh
   assert.equal(panel.queuedPreviewSourceId, 2);
 });
 
-test('live source remains hardware-derived, including a source outside the grid', () => {
+test('Bars appears on both buses while hardware availability still guards selection', () => {
   const { dashboard: d } = controller();
   d.updateState(hardware({ program: 2, aux3: 1000 }));
   assert.equal(d.panels[0].onAirSourceId, 2);
   assert.equal(d.panels[2].onAirSourceId, 1000);
-  assert.equal(d.categorizedSources.some((source) => source.source === 1000), false);
+  assert.equal(d.meButtonSources.some((source) => source.source === 1000), true);
+  assert.equal(d.auxButtonSources.some((source) => source.source === 1000), true);
+  assert.match(d.primaryPreviewReason(1000), /not available to M\/E 1/);
   assert.equal(d.getSourceNameById(1000), 'Color Bars');
   d.updateState(hardware({ program: 1, aux3: 3 }));
   assert.equal(d.panels[0].onAirSourceId, 1);
   assert.equal(d.panels[2].onAirSourceId, 3);
+});
+
+test('switcher layouts and Unswitched Outputs hide media key choices', () => {
+  const { dashboard: d } = controller();
+  const state = hardware({ program: 3011 });
+  const source = (id, short, port_type) =>
+    ({ source: id, short, port_type, available_me1: true, available_aux: true });
+  state.sources.push(
+    ...Array.from({ length: 7 }, (_, i) => source(i + 4, `IN${i + 4}`, 0)),
+    source(0, 'BLK', 1), source(2001, 'COL1', 3), source(2002, 'COL2', 3),
+    source(3010, 'MP1', 4), source(3020, 'MP2', 4),
+    source(3011, 'MP1K', 5), source(3021, 'MP2K', 5),
+  );
+  d.updateState(state);
+  const layout = Array.from(d.primaryBusLayout.buttons,
+    button => [button.source.source, button.row, button.column]);
+  assert.deepEqual(layout, [
+    [1, 1, 1], [2, 1, 2], [3, 1, 3], [4, 1, 4], [5, 1, 5], [0, 1, 7], [2001, 1, 9], [2002, 1, 10],
+    [6, 2, 1], [7, 2, 2], [8, 2, 3], [9, 2, 4], [10, 2, 5], [1000, 2, 7], [3010, 2, 9], [3020, 2, 10],
+  ]);
+  assert.equal(d.sourceStateLabel(d.hardwareProgramSourceId), 'MP1K');
+  const virtualLayout = Array.from(d.virtualBusLayout.buttons,
+    button => [button.source.source, button.row, button.column]);
+  assert.deepEqual(virtualLayout, layout);
+  assert.equal(d.auxButtonSources.length, 16);
+  assert.equal(d.auxButtonSources.some(source => [3011, 3021].includes(source.source)), false);
 });
 
 test('one upstream keyer turns on then off after its own observed confirmations', () => {
@@ -302,6 +330,72 @@ test('Milestone 3B projection keeps hardware M/E state separate from saved virtu
   assert.equal(d.outputSourceId(d.otherOutputViews[1]), 2); // stale is labeled last-observed
   assert.match(d.outputConflictText(d.otherOutputViews[2]), /Ownership conflict/);
   assert.deepEqual(sent, [{ command: 'dashboard_config_get' }]);
+});
+
+test('virtual CUT warning shows only divergent or uncertain observed routes', () => {
+  const { dashboard: d } = controller();
+  const state = projectedHardware();
+  d.updateState(state);
+  let warning = d.groupRouteWarning('virtual1');
+  assert.equal(warning.title, 'Output mismatch warning:');
+  assert.equal(warning.expected, 'IN1');
+  assert.deepEqual(Array.from(warning.outputs, row => [row.outputId, row.marker, row.label]),
+    [[2, '✓', 'IN1'], [6, '×', 'IN2']]);
+
+  state.dashboardRouting.groups.virtual1.outputs[1].liveSourceId = 1;
+  state.dashboardRouting.groups.virtual1.routeStatus = 'uniform';
+  state.dashboardRouting.groups.virtual1.liveSourceId = 1;
+  d.updateState(state);
+  assert.equal(d.groupRouteWarning('virtual1'), null);
+
+  state.dashboardRouting.groups.virtual1.outputs[0].liveSourceId = 2;
+  state.dashboardRouting.groups.virtual1.outputs[1].liveSourceId = 2;
+  state.dashboardRouting.groups.virtual1.liveSourceId = 2;
+  d.updateState(state);
+  warning = d.groupRouteWarning('virtual1');
+  assert.deepEqual(Array.from(warning.outputs, row => row.marker), ['×', '×']);
+  d.groupCutOperations.virtual1 = { status: 'complete', target: 3, channels: [] };
+  assert.equal(d.groupRouteWarning('virtual1').expected, 'IN1');
+  delete d.groupCutOperations.virtual1;
+
+  state.dashboardRouting.groups.virtual1.outputs[0].liveSourceId = 3;
+  d.updateState(state);
+  d.groupCutOperations.virtual1 = { status: 'pending', target: 3, channels: [
+    { channel: 1, status: 'confirmed' }, { channel: 5, status: 'failed', error: 'Route rejected.' },
+  ] };
+  assert.notEqual(d.groupRouteWarning('virtual1'), null);
+  d.groupCutOperations.virtual1.channels[1].status = 'pending';
+  assert.equal(d.groupRouteWarning('virtual1'), null);
+  d.groupCutOperations.virtual1.channels[1].status = 'failed';
+  d.groupCutOperations.virtual1.status = 'partial';
+  warning = d.groupRouteWarning('virtual1');
+  assert.equal(warning.expected, 'IN3');
+  assert.deepEqual(Array.from(warning.outputs, row => [row.marker, row.error]),
+    [['✓', ''], ['×', 'Route rejected.']]);
+
+  delete d.groupCutOperations.virtual1;
+  state.dashboardRouting.groups.virtual1.outputs[1].liveSourceId = 3;
+  state.dashboardRouting.groups.virtual1.routeStatus = 'uniform';
+  state.dashboardRouting.groups.virtual1.liveSourceId = 3;
+  d.updateState(state);
+  d.groupCutOperations.virtual1 = { status: 'unconfirmed', target: 3, channels: [
+    { channel: 1, status: 'confirmed' }, { channel: 5, status: 'unconfirmed', error: 'Review hardware state.' },
+  ] };
+  warning = d.groupRouteWarning('virtual1');
+  assert.equal(warning.title, 'Output confirmation warning:');
+  assert.equal(warning.outputs[1].reviewable, true);
+
+  delete d.groupCutOperations.virtual1;
+  state.dashboardRouting.groups.virtual1.outputs[0].liveSourceId = 1;
+  state.dashboardRouting.groups.virtual1.outputs[1] = {
+    outputId: 6, routeStatus: 'stale', liveSourceId: null, lastObservedSourceId: 2,
+  };
+  state.dashboardRouting.groups.virtual1.routeStatus = 'unknown';
+  state.dashboardRouting.groups.virtual1.liveSourceId = null;
+  d.updateState(state);
+  warning = d.groupRouteWarning('virtual1');
+  assert.deepEqual(Array.from(warning.outputs, row => row.marker), ['✓', '?']);
+  assert.match(warning.outputs[1].label, /stale; last seen IN2/);
 });
 
 test('Milestone 3B custom names use revision-checked software config only', () => {
@@ -404,7 +498,8 @@ function threeCProjection({ routes = [90010, 1, 2, 1, 2, 1], virtual1 = [], virt
   };
   return {
     deviceId: 'a'.repeat(32), revision: 7, stateFresh: true,
-    capabilities: { outputMappingStatus: 'ready', outputMappingReason: '', programOutputSourceId: 90010 },
+    capabilities: { outputMappingStatus: 'ready', outputMappingReason: '',
+      programOutputSourceId: 90010, colorBarsSourceId: 1000 },
     outputs, groups: { virtual1: group('virtual1', virtual1), virtual2: group('virtual2', virtual2) },
     conflicts: [], programBackgroundSourceId: 1,
   };
@@ -537,7 +632,7 @@ test('3C Preview is saved in revisioned configuration without a routing command'
   assert.equal(sent.some(item => item.command === 'set_aux_output' || item.command === 'dashboard_cut_aux'), false);
 });
 
-test('3D TAKE ALL sends selected Primary action once and reports each participant after confirmation', () => {
+test('TAKE ALL sends Primary CUT once and reports each participant after confirmation', () => {
   const { dashboard: d, sent } = controller();
   configureThreeC(d, { routes: [90010, 1, 2, 1, 2, 1], virtual1: [1], virtual2: [2] });
   d.dashboardConfig.config.virtualSwitchers.virtual1 = { outputs: [1], previewSource: 3, programTarget: 1 };
@@ -548,7 +643,10 @@ test('3D TAKE ALL sends selected Primary action once and reports each participan
   assert.equal(sent.length, 1);
   assert.equal(sent[0].command, 'dashboard_take_all');
   assert.equal(sent[0].primary_action, 'cut');
-  assert.deepEqual(sent[0].groups, { virtual1: { live: 1, preview: 3 }, virtual2: { live: 2, preview: 3 } });
+  assert.deepEqual(sent[0].groups, {
+    virtual1: { routes: [{ channel: 1, source: 1 }], preview: 3 },
+    virtual2: { routes: [{ channel: 2, source: 2 }], preview: 3 },
+  });
   d.handleMessage({ type: 'dashboard_take_all_started', device_id: 'a'.repeat(32),
     primary: { ok: true, action: 'cut', command: 'cut', before: 1, target: 2, style: 0 },
     virtual: {
@@ -570,86 +668,40 @@ test('3D TAKE ALL sends selected Primary action once and reports each participan
   assert.equal(sent.filter(message => message.command === 'dashboard_take_all').length, 1);
 });
 
-test('3D keyed AUTO requires separate confirmation and uncertain results prevent retries', () => {
+test('TAKE ALL blocks a tied key and sends nothing', () => {
   const { dashboard: d, sent } = controller();
-  configureThreeC(d, { routes: [90010, 1, 2, 1, 2, 1], virtual1: [1], virtual2: [2] });
-  d.dashboardConfig.config.virtualSwitchers.virtual1 = { outputs: [1], previewSource: 3, programTarget: 1 };
-  d.dashboardConfig.config.virtualSwitchers.virtual2 = { outputs: [2], previewSource: 3, programTarget: 1 };
-  const state = hardware();
-  state.mes[0].transition.position = 0;
-  state.mes[0].transition.style = 2;
+  configureThreeC(d, { virtual1: [1] });
+  const state = hardware({ meReason: 'M/E CUT blocked: KEY 1 tied to next transition.' });
   state.mes[0].transition.selection.key1 = true;
-  state.dashboardRouting = threeCProjection({ routes: [90010, 1, 2, 1, 2, 1], virtual1: [1], virtual2: [2] });
+  state.dashboardRouting = threeCProjection({ virtual1: [1] });
   d.updateState(state);
-  d.takeAllPrimaryAction = 'auto';
   sent.length = 0;
   d.takeAll();
-  assert.equal(d.takeAllKeyedConfirmOpen, true);
-  assert.equal(sent.length, 0);
-  d.dispatchTakeAll(true);
-  assert.equal(sent[0].command, 'dashboard_take_all');
-  assert.equal(sent[0].primary_action, 'auto');
-  assert.equal(sent[0].allow_keyed, true);
-  d.takeAllOperation.status = 'unconfirmed';
-  assert.match(d.takeAllReason(), /previous TAKE ALL/i);
-  d.takeAll();
-  assert.equal(sent.filter(message => message.command === 'dashboard_take_all').length, 1);
+  assert.match(d.takeAllReason(), /KEY 1/);
+  assert.deepEqual(sent, []);
 });
 
-test('3D TAKE ALL key-only AUTO reports Primary confirmed from observed keyer state', () => {
+test('TAKE ALL reports a blocked preflight and offers read-only review for a server blocker', () => {
   const { dashboard: d, sent } = controller();
   configureThreeC(d);
-  const initial = keyOnlyAutoState();
-  initial.dashboardRouting = threeCProjection();
-  d.updateState(initial);
-  d.takeAllPrimaryAction = 'auto';
   sent.length = 0;
-
   d.takeAll();
-  assert.equal(d.takeAllKeyedConfirmOpen, true);
-  d.dispatchTakeAll(true);
-  const command = sent.find(message => message.command === 'dashboard_take_all');
-  assert.deepEqual(command.expected_key_states, { '0': false });
-  d.handleMessage({ type: 'dashboard_take_all_started', device_id: 'a'.repeat(32),
-    primary: { ok: true, action: 'auto', command: 'auto', before: 1, target: 2, style: 0,
-      key_before: { '0': false }, key_targets: { '0': true } },
-    virtual: { virtual1: { status: 'skipped', outcomes: [] },
-      virtual2: { status: 'skipped', outcomes: [] } } });
-  const confirmed = keyOnlyAutoState({ keyOnAir: true });
-  confirmed.dashboardRouting = threeCProjection();
-  d.updateState(confirmed);
+  const blocker = { kind: 'me_preview', index: 0, label: 'M/E Preview',
+    message: 'M/E Preview is blocking TAKE ALL. Previous command is unconfirmed.', reviewable: true };
+  d.handleMessage({ type: 'error', command: 'dashboard_take_all', message: blocker.message });
+  assert.equal(d.takeAllOperation.status, 'blocked');
+  assert.equal(d.assignmentBusy, false);
+  assert.equal(d.actionError, '');
 
-  assert.equal(d.takeAllOperation.primary.status, 'confirmed');
-  assert.equal(d.takeAllOperation.status, 'complete');
-  assert.equal(d.hardwareProgramSourceId, 1);
-});
-
-test('3D key-only TAKE ALL stays unconfirmed when reviewed key state did not change', () => {
-  const { dashboard: d, sent, timers } = controller();
-  configureThreeC(d);
-  const initial = keyOnlyAutoState();
-  initial.dashboardRouting = threeCProjection();
-  d.updateState(initial);
-  d.takeAllPrimaryAction = 'auto';
-  sent.length = 0;
-  d.dispatchTakeAll(true);
-  d.handleMessage({ type: 'dashboard_take_all_started', device_id: 'a'.repeat(32),
-    primary: { ok: true, action: 'auto', command: 'auto', before: 1, target: 2, style: 0,
-      key_before: { '0': false }, key_targets: { '0': true } },
-    virtual: { virtual1: { status: 'skipped', outcomes: [] },
-      virtual2: { status: 'skipped', outcomes: [] } } });
-  timers.get(d.primaryActionTimer)();
-  assert.equal(d.takeAllOperation.status, 'unconfirmed');
-  assert.notEqual(d.takeAllOperation.status, 'complete');
-  d.reviewPrimaryOperation();
-  d.handleMessage({ type: 'dashboard_reviewed', kind: 'me' });
-  const unchanged = keyOnlyAutoState();
-  unchanged.dashboardRouting = threeCProjection();
-  d.updateState(unchanged);
-
-  assert.equal(d.takeAllOperation.primary.status, 'failed');
-  assert.equal(d.takeAllOperation.status, 'partial');
-  assert.equal(sent.filter(message => message.command === 'dashboard_take_all').length, 1);
+  const state = hardware();
+  state.dashboardRouting = threeCProjection();
+  state.dashboardSafety.takeAllBlockers = [blocker];
+  d.updateState(state);
+  assert.equal(d.takeAllReason(), blocker.message);
+  d.takeAll();
+  d.reviewTakeAllBlocker({ ...blocker, reviewable: false });
+  d.reviewTakeAllBlocker(d.takeAllBlockers[0]);
+  assert.deepEqual(sent.map(item => item.command), ['dashboard_take_all', 'dashboard_review_me_preview']);
 });
 
 test('3D an empty virtual group with an unavailable saved source does not block other participants', () => {
@@ -754,24 +806,137 @@ test('3C partial assignment preserves the failed-output warning after confirmed 
   assert.notEqual(d.actionNotice, 'Output ownership changes saved.');
 });
 
-test('3C Primary release routes only the selected destination to current M/E background', () => {
+test('Primary release goes to Color Bars and stays in Primary until confirmed', () => {
   const { dashboard: d, sent } = controller();
   configureThreeC(d, { routes: [90010, 90010, 2, 1, 2, 1] });
   sent.length = 0;
   d.openAssignmentDialog('primary');
   d.assignmentSelection['2'] = false;
-  assert.match(d.stagedAssignmentDescription(d.projectedOutputs[1]), /Release to IN1 \(background only; key overlays removed\)/);
+  assert.equal(d.stagedAssignmentDescription(d.projectedOutputs[1]), 'Release to Color Bars');
   d.applyAssignmentChanges();
   assert.equal(sent[0].command, 'dashboard_output_route');
   assert.equal(sent[0].mode, 'primary_release');
   assert.equal(sent[0].output_id, 2);
-  assert.equal(sent[0].input_source, 1);
+  assert.equal(sent[0].input_source, 1000);
+  assert.equal(d.primarySwitcherOutputs.some(output => output.outputId === 2), true);
+  assert.equal(d.otherOutputViews.some(output => output.outputId === 2), false);
   const confirmed = hardware({ program: 1, preview: 2, aux3: 2 });
-  confirmed.auxOutputs.aux2 = 1;
-  confirmed.dashboardRouting = threeCProjection({ routes: [90010, 1, 2, 1, 2, 1] });
+  confirmed.auxOutputs.aux2 = 1000;
+  confirmed.dashboardRouting = threeCProjection({ routes: [90010, 1000, 2, 1, 2, 1] });
   d.updateState(confirmed);
   assert.equal(d.routeOperations['2'], undefined);
   assert.equal(d.routeBatch, null);
+  assert.equal(d.otherOutputViews.some(output => output.outputId === 2), true);
+});
+
+test('first virtual assignment keeps its feed and rejects an out-of-date review', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d);
+  const state = hardware();
+  state.dashboardRouting = threeCProjection();
+  state.dashboardRouting.groups.virtual2.savedProgramTargetId = null;
+  d.dashboardConfig.config.virtualSwitchers.virtual2.programTarget = null;
+  d.updateState(state);
+  sent.length = 0;
+  d.openAssignmentDialog('virtual2');
+  d.assignmentSelection['6'] = true;
+  assert.equal(d.stagedAssignmentDescription(d.projectedOutputs[5]), 'Assign; keep IN1');
+  state.dashboardRouting.outputs[5].liveSourceId = 2;
+  d.updateState(state);
+  d.applyAssignmentChanges();
+  assert.equal(sent.length, 0);
+  assert.match(d.actionError, /OUT 6 changed/);
+  d.closeAssignmentDialog();
+  d.openAssignmentDialog('virtual2');
+  d.assignmentSelection['6'] = true;
+  d.applyAssignmentChanges();
+  assert.equal(sent[0].input_source, 2);
+  assert.equal(sent[0].expected_live, 2);
+  d.handleMessage({ type: 'dashboard_output_route_accepted', output_id: 6, input_source: 2, no_op: true });
+  assert.deepEqual(sent[1].config.virtualSwitchers.virtual2.outputs, [5]);
+  assert.equal(sent[1].config.virtualSwitchers.virtual2.programTarget, 2);
+});
+
+test('Virtual Direct selects Bars for its own group and keeps Preview after confirmation', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d, { virtual1: [1, 2], virtual2: [4] });
+  sent.length = 0;
+  d.selectVirtualProgram('virtual1', 1000);
+  assert.deepEqual(sent, []);
+  d.virtualDirect.virtual1 = true;
+  assert.match(d.virtualProgramReason('virtual2', 1000), /enable direct/i);
+  d.selectVirtualProgram('virtual1', 1000);
+  d.selectVirtualProgram('virtual1', 3);
+  assert.deepEqual(sent, [{
+    command: 'dashboard_cut_virtual_group', group_id: 'virtual1', device_id: 'a'.repeat(32), config_revision: 7,
+    input_source: 1000, mode: 'direct',
+    expected_routes: [{ channel: 1, source: 1 }, { channel: 2, source: 2 }],
+  }]);
+  const after = hardware();
+  after.dashboardRouting = threeCProjection({ routes: [90010, 1000, 2, 1, 2, 1], virtual1: [1, 2], virtual2: [4] });
+  d.updateState(after);
+  d.handleMessage({ type: 'dashboard_group_cut_started', group_id: 'virtual1', mode: 'direct',
+    target: 1000, previous: null, outcomes: [{ channel: 1, before: 1, ok: true }, { channel: 2, before: 2, ok: true }] });
+  assert.equal(sent.length, 1);
+  after.dashboardRouting = threeCProjection({ routes: [90010, 1000, 1000, 1, 2, 1], virtual1: [1, 2], virtual2: [4] });
+  d.updateState(after);
+  assert.equal(sent[1].command, 'dashboard_config_update');
+  assert.equal(sent[1].config.virtualSwitchers.virtual1.programTarget, 1000);
+  assert.equal(sent[1].config.virtualSwitchers.virtual1.previewSource, 3);
+  assert.equal(sent[1].config.virtualSwitchers.virtual2.programTarget, 1);
+  const reassigned = hardware();
+  reassigned.dashboardRouting = threeCProjection({ routes: [90010, 1000, 90010, 1, 2, 1], virtual1: [1], virtual2: [4] });
+  d.updateState(reassigned);
+  assert.equal(d.virtualDirect.virtual1, false);
+});
+
+test('mixed virtual CUT clears the warning and Preview only after the last output confirms', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d, { routes: [90010, 1, 2, 1, 2, 1], virtual1: [1, 2] });
+  assert.equal(d.groupRouteWarning('virtual1').title, 'Output mismatch warning:');
+  assert.equal(d.groupCutReason('virtual1'), '');
+  sent.length = 0;
+  d.cutVirtualGroup('virtual1');
+  assert.deepEqual(sent[0].expected_routes, [{ channel: 1, source: 1 }, { channel: 2, source: 2 }]);
+  d.handleMessage({ type: 'dashboard_group_cut_started', group_id: 'virtual1', target: 3, previous: null,
+    outcomes: [{ channel: 1, before: 1, ok: true }, { channel: 2, before: 2, ok: true }] });
+  const state = hardware();
+  state.dashboardRouting = threeCProjection({ routes: [90010, 3, 2, 1, 2, 1], virtual1: [1, 2] });
+  d.updateState(state);
+  assert.equal(d.groupCutOperations.virtual1.channels[1].status, 'pending');
+  assert.equal(d.groupRouteWarning('virtual1').title, 'Output mismatch warning:');
+  assert.equal(sent.length, 1);
+  state.dashboardRouting = threeCProjection({ routes: [90010, 3, 3, 1, 2, 1], virtual1: [1, 2] });
+  d.updateState(state);
+  const save = sent.find(item => item.command === 'dashboard_config_update');
+  assert.equal(save.config.virtualSwitchers.virtual1.previewSource, null);
+  assert.equal(save.config.virtualSwitchers.virtual1.programTarget, 3);
+  d.handleMessage({ type: 'dashboard_config', deviceId: 'a'.repeat(32), revision: 8, config: save.config });
+  state.dashboardRouting.revision = 8;
+  state.dashboardRouting.groups.virtual1.savedProgramTargetId = 3;
+  d.updateState(state);
+  assert.equal(d.groupRouteWarning('virtual1'), null);
+});
+
+test('a diverted mixed CUT retains the staged target and permits a new CUT after review', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d, { routes: [90010, 1, 2, 1, 2, 1], virtual1: [1, 2] });
+  sent.length = 0;
+  d.cutVirtualGroup('virtual1');
+  d.handleMessage({ type: 'dashboard_group_cut_started', group_id: 'virtual1', target: 3, previous: null,
+    outcomes: [{ channel: 1, before: 1, ok: true }, { channel: 2, before: 2, ok: true }] });
+  const diverted = hardware();
+  diverted.dashboardRouting = threeCProjection({ routes: [90010, 3, 1000, 1, 2, 1], virtual1: [1, 2] });
+  d.updateState(diverted);
+  assert.equal(d.groupRouteWarning('virtual1').outputs[1].reviewable, true);
+  assert.match(d.groupCutReason('virtual1'), /incomplete/);
+  d.reviewOutputOperation(3);
+  d.handleMessage({ type: 'dashboard_reviewed', kind: 'aux', aux_channel: 2 });
+  d.updateState(diverted);
+  assert.equal(d.groupCutReason('virtual1'), '');
+  assert.equal(d.groupRouteWarning('virtual1').title, 'Output mismatch warning:');
+  assert.equal(d.dashboardConfig.config.virtualSwitchers.virtual1.previewSource, 3);
+  assert.deepEqual(sent.map(item => item.command), ['dashboard_cut_virtual_group', 'dashboard_review_aux']);
 });
 
 test('3C group CUT confirms each physical route before swapping saved target/Preview', () => {

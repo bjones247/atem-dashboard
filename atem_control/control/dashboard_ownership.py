@@ -12,6 +12,7 @@ from collections import defaultdict
 VIRTUAL_GROUPS = ('virtual1', 'virtual2')
 PORT_ME_OUTPUT = 128
 PORT_AUX_OUTPUT = 129
+PORT_COLOR_BARS = 2
 PHYSICAL_OUTPUT_COUNT = 6
 
 
@@ -58,6 +59,14 @@ def _program_output_id(sources):
         if 'program' in label or 'pgm' in label:
             candidates.append(source_id)
     return candidates[0] if len(candidates) == 1 else None
+
+
+def _color_bars_id(sources):
+    candidates = [source_id for source_id, source in sources.items()
+                  if source['portType'] == PORT_COLOR_BARS]
+    if len(candidates) == 1 and sources[candidates[0]]['availableAux']:
+        return candidates[0]
+    return None
 
 
 def _aux_capability_count(mx):
@@ -152,7 +161,7 @@ def _config_conflicts(mx, config, destinations, sources, program_output_id, stat
     return conflicts, claims
 
 
-def project_routes(mixerstate, config=None, revision=None, state_fresh=True):
+def project_routes(mixerstate, config=None, revision=None, state_fresh=True, retired_channels=()):
     """Project observed AUX routes and reconcile them with saved ownership.
 
     Saved assignment IDs and command channels remain zero-based AUX indices.
@@ -223,14 +232,15 @@ def project_routes(mixerstate, config=None, revision=None, state_fresh=True):
             owner = 'unresolved'
         elif not state_fresh or not observed or live_source_id is None:
             owner = 'unknown'
+        elif topology_valid and is_program_route:
+            owner = 'primary'
         elif (not topology_valid or
                 ('duplicate_ownership', channel) in conflict_keys or
-                ('primary_virtual_ownership_conflict', channel) in conflict_keys or
                 ('primary_route_identity_unknown', channel) in conflict_keys or
                 source_info is None):
             owner = 'unresolved'
-        elif is_program_route:
-            owner = 'primary'
+        elif channel in retired_channels:
+            owner = 'other'
         elif len(owners) == 1:
             owner = owners[0]
         else:
@@ -272,16 +282,21 @@ def project_routes(mixerstate, config=None, revision=None, state_fresh=True):
 
     output_by_aux_index = {item['auxIndex']: item for item in outputs
                            if item['physicalOutputNumber'] is not None}
+    superseded_channels = {item['auxIndex'] for item in output_by_aux_index.values()
+                           if item['savedOwners'] and
+                           (item['owner'] == 'primary' or item['auxIndex'] in retired_channels)}
     groups = {}
     for group_id in VIRTUAL_GROUPS:
         saved = _saved_group(config, group_id)
         assignment_ids = saved.get('outputs', [])
         if not isinstance(assignment_ids, list):
             assignment_ids = []
+        assignment_ids = [channel for channel in assignment_ids if not (
+            _nonnegative_int(channel) and channel in superseded_channels)]
         assigned = [output_by_aux_index[o] for o in assignment_ids
                     if _nonnegative_int(o) and o in output_by_aux_index]
         route_ids = [item['liveSourceId'] for item in assigned
-                     if item['routeObserved'] and item['liveSourceId'] is not None]
+                     if item['routeStatus'] == 'observed']
         has_unknown = len(assigned) != len(route_ids)
         distinct_routes = set(route_ids)
         if not assigned:
@@ -312,7 +327,8 @@ def project_routes(mixerstate, config=None, revision=None, state_fresh=True):
         preview = saved.get('previewSource')
         groups[group_id] = {
             'outputIds': [_physical_output_number(o) for o in assignment_ids],
-            'outputs': [{'outputId': item['outputId'], 'liveSourceId': item['liveSourceId'],
+            'outputs': [{'outputId': item['outputId'], 'auxIndex': item['auxIndex'],
+                         'owner': item['owner'], 'liveSourceId': item['liveSourceId'],
                          'lastObservedSourceId': item['lastObservedSourceId'],
                          'routeStatus': item['routeStatus']} for item in assigned],
             'previewSourceId': preview,
@@ -347,6 +363,7 @@ def project_routes(mixerstate, config=None, revision=None, state_fresh=True):
                                      if source['portType'] == PORT_AUX_OUTPUT),
             'programOutputSourceId': program_id,
             'programOutputStatus': 'observed' if program_id is not None else 'unknown',
+            'colorBarsSourceId': _color_bars_id(sources),
             'connectorMapping': 'installation_convention',
         },
         'programBackgroundSourceId': program_background,
@@ -357,6 +374,7 @@ def project_routes(mixerstate, config=None, revision=None, state_fresh=True):
         'primaryOutputIds': [item['outputId'] for item in outputs
                              if item['observedRouteOwner'] == 'primary'],
         'otherOutputIds': [item['outputId'] for item in outputs if item['owner'] == 'other'],
+        'supersededVirtualOutputIds': sorted(channel + 1 for channel in superseded_channels),
         'conflicts': conflicts,
         'minimumPrimaryDestinations': config.get('minimumPrimaryDestinations', True),
         'primaryDestinationWarning': (

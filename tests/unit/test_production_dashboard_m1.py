@@ -47,12 +47,50 @@ def test_dashboard_template_contains_read_only_three_switcher_layout(client):
 
     # Hardware M/E and two virtual switchers are separate from output cards.
     assert 'HARDWARE M/E' in content
-    assert 'Observed M/E Program' in content
-    assert 'Observed M/E Preview' in content
+    assert 'Observed M/E Program' not in content
+    assert 'Observed M/E Preview' not in content
+    assert 'Program stale; last observed:' in content
+    assert 'Preview stale; last observed:' in content
+    assert 'badge badge-sm badge-primary primary-switcher-badge shrink-0">HARDWARE M/E</span>' in content
+    assert 'badge badge-sm badge-primary virtual-switcher-badge shrink-0">VIRTUAL</span>' in content
+    assert 'background: #bbf7d0' in content
+    assert 'background: #dc2626' in content
+    assert 'aria-label="Rename Primary Switcher"' in content
+    assert 'aria-label="Change Primary output assignments"' in content
     assert 'x-for="view in virtualSwitcherViews"' in content
-    assert 'Saved Preview' in content
-    assert 'Saved Program target' in content
-    assert 'Other Outputs' in content
+    assert content.count('SENDING PROGRAM TO:') == 1
+    assert content.count('SENDING VIRTUAL SWITCH TO:') == 1
+    assert content.count('class="source-grid"') == 4
+    assert content.count(':style="virtualBusLayout.columns"') == 2
+    assert content.count('class="btn btn-xs font-bold direct-mode-button"') == 2
+    assert 'rounded-lg border border-base-300 p-3" role="group" aria-label="Primary transition controls"' in content
+    assert content.index('@click="primaryCut()"') < content.index('@click="primaryAuto()"') < content.index('aria-label="AUTO transition type"') < content.index("'transition-style-'")
+    assert 'AUTO TRANSITION TYPE:' not in content
+    assert content.count('class="btn btn-error btn-sm font-bold dashboard-cut-button"') == 2
+    assert '.auto-style-buttons { margin-left: 3rem; }' in content
+    assert 'M/E PROGRAM</div>' not in content
+    assert 'LOGICAL PREVIEW / PROGRAM' not in content
+    assert 'border-success/40' not in content
+    assert 'text-xs font-bold uppercase text-success mb-1">STAGED FOR TARGET' in content
+    assert 'text-xs font-bold uppercase text-success">LIVE ON TARGET' in content
+    assert 'Saved Preview' not in content
+    assert 'Saved Program target' not in content
+    assert 'Logical selection; does not change hardware routing.' not in content
+    assert 'getSourceNameById(view.group.' not in content
+    assert 'M/E transition status' not in content
+    assert content.index('virtual-switcher-area">') < content.index('x-for="view in virtualSwitcherViews"') < content.index('aria-label="TAKE ALL"') < content.index('</main>')
+    assert 'class="btn btn-error font-bold" :disabled="!!takeAllReason()"' in content
+    assert '>Operation:</span>' not in content
+    assert 'Blocked before dispatch.' in content
+    assert 'Unswitched Outputs' in content
+    assert '.route-source-grid { display: grid; grid-template-columns: repeat(4, 3.125rem);' in content
+    assert 'badge badge-sm badge-primary unswitched-output-badge shrink-0">OUTPUT</span>' in content
+    assert 'aria-labelledby="primary-keyers-heading"' in content
+    assert '@click="selectVirtualProgram(view.key, button.source.source)"' in content
+    assert 'take-all-primary-action' not in content
+    assert 'getSourceNameById(outputSourceId(output))' in content
+    assert 'Observed live source' not in content
+    assert 'Hardware route confirmed' not in content
     assert 'output.displayName' in content
     assert 'output.owner' in content
 

@@ -427,7 +427,7 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
                                       'dsk': data.get('dsk')})
                 await self.send_current_state()
             else:
-                await self.send_json({'type': 'error', 'message': err})
+                await self.send_json({'type': 'error', 'command': command, 'message': err})
             return
         if command == 'dashboard_take_all':
             try:
@@ -443,6 +443,7 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
                 dashboard_switching.dispatch_take_all, thread_sensitive=True)(
                     self.connection, data, saved_config, require_current_revision=True)
             if not ok:
+                logger.info('TAKE ALL blocked before dispatch: %s', result)
                 await self.send_json({'type': 'error', 'command': command, 'message': result})
                 return
             primary = result['primary']
@@ -450,7 +451,7 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
                 self._record_atem_command(primary['command'], {'me': 0})
             for group in result['virtual'].values():
                 for outcome in group.get('outcomes', []):
-                    if outcome['ok']:
+                    if outcome['ok'] and not outcome.get('no_op'):
                         self._record_atem_command('set_aux_output', {
                             'aux_channel': outcome['channel'],
                             'input_source': group['target']})
@@ -940,11 +941,7 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
                 current_state['dashboardSafety'] = dashboard_switching.safety_snapshot(self.connection)
                 current_state['dashboardDevice'] = dashboard_config.identity_snapshot(self.connection)
                 saved_config = await self._ensure_dashboard_config()
-                current_state['dashboardRouting'] = dashboard_ownership.project_routes(
-                    getattr(self.connection, 'mixerstate', None), saved_config,
-                    (saved_config or {}).get('revision'),
-                    state_fresh=(current_state.get('is_connected') is True and
-                                 current_state['dashboardSafety'].get('fresh') is True))
+                current_state['dashboardRouting'] = await self._project_dashboard_routes(current_state, saved_config)
                 t_build = time.monotonic() - t0
 
                 # ATEM-side reachability transition: atemwire's protocol clears
@@ -984,11 +981,7 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
                     elif not was_atem_reachable and atem_reachable:
                         logger.info("ATEM reachable again; notifying frontend")
                         saved_config = await self._ensure_dashboard_config(force_reload=True)
-                        current_state['dashboardRouting'] = dashboard_ownership.project_routes(
-                            getattr(self.connection, 'mixerstate', None), saved_config,
-                            (saved_config or {}).get('revision'),
-                            state_fresh=(current_state.get('is_connected') is True and
-                                         current_state['dashboardSafety'].get('fresh') is True))
+                        current_state['dashboardRouting'] = await self._project_dashboard_routes(current_state, saved_config)
                         try:
                             await self.send_json({
                                 'type': 'connection_status',
@@ -1153,7 +1146,32 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
                 dashboard_config.get_config, thread_sensitive=True)(device_id, self.current_ip)
         return self._dashboard_config
 
-    async def _broadcast_dashboard_config_revision(self, config):
+    async def _project_dashboard_routes(self, state, saved_config):
+        fresh = state.get('is_connected') is True and state['dashboardSafety'].get('fresh') is True
+        mixerstate = getattr(self.connection, 'mixerstate', None)
+        projection = dashboard_ownership.project_routes(
+            mixerstate, saved_config, state_fresh=fresh,
+            retired_channels=dashboard_config.pending_primary_retirements(self.connection, saved_config))
+        if not fresh or not saved_config or not projection['supersededVirtualOutputIds']:
+            return projection
+        try:
+            result = await sync_to_async(dashboard_config.reconcile_primary_assignments, thread_sensitive=True)(
+                self.connection, saved_config, self.current_ip)
+        except dashboard_config.DashboardConfigError:
+            logger.warning('Could not reconcile saved virtual output ownership', exc_info=True)
+            return projection
+        if not result:
+            return projection
+        self._dashboard_config, retired = result
+        if retired:
+            await self._broadcast_dashboard_config_revision(self._dashboard_config, retired)
+            await self.send_json({'type': 'dashboard_primary_destinations_reconciled', 'outputs': retired})
+        return dashboard_ownership.project_routes(
+            getattr(self.connection, 'mixerstate', None), self._dashboard_config,
+            state_fresh=dashboard_switching.state_is_fresh(self.connection),
+            retired_channels=dashboard_config.pending_primary_retirements(self.connection, self._dashboard_config))
+
+    async def _broadcast_dashboard_config_revision(self, config, retired=None):
         group = self._dashboard_config_group
         if not group:
             return
@@ -1163,6 +1181,7 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
                 'device_id': config['deviceId'],
                 'revision': config['revision'],
                 'sender': self.channel_name,
+                'retired': retired,
             })
         except Exception:
             # Saving already succeeded. A missing push notification is visible
@@ -1187,6 +1206,9 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
             'revision': current['revision'],
             'config': current['config'],
         })
+        if event.get('retired'):
+            await self.send_json({'type': 'dashboard_primary_destinations_reconciled',
+                                  'outputs': event['retired']})
         await self.send_current_state()
 
     async def send_current_state(self):
@@ -1204,11 +1226,7 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
             state['dashboardSafety'] = dashboard_switching.safety_snapshot(self.connection)
             state['dashboardDevice'] = dashboard_config.identity_snapshot(self.connection)
             saved_config = await self._ensure_dashboard_config()
-            state['dashboardRouting'] = dashboard_ownership.project_routes(
-                getattr(self.connection, 'mixerstate', None), saved_config,
-                (saved_config or {}).get('revision'),
-                state_fresh=(state.get('is_connected') is True and
-                             state['dashboardSafety'].get('fresh') is True))
+            state['dashboardRouting'] = await self._project_dashboard_routes(state, saved_config)
 
             if state.get('is_connected'):
                 await self.send_json({

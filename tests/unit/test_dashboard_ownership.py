@@ -195,18 +195,19 @@ def test_stale_state_exposes_last_observed_routes_without_claiming_current_owner
     assert projected['primaryDestinationStatus'] == 'unknown'
 
 
-def test_external_route_change_updates_projection_and_reports_primary_conflict():
+def test_external_program_route_wins_over_a_saved_virtual_assignment():
     config = config_with(virtual1={'outputs': [1], 'programTarget': 1})
     first = project_routes(state(routes={0: 90010, 1: 1}), config)
-    # Another operator changes channel 1 to the M/E Program feed. The saved
-    # group assignment remains untouched and ownership becomes unresolved.
     external = project_routes(state(routes={0: 90010, 1: 90010}), config)
 
     assert first['groups']['virtual1']['programStatus'] == 'matched'
-    assert external['outputs'][1]['owner'] == 'unresolved'
+    assert external['outputs'][1]['owner'] == 'primary'
     assert external['outputs'][1]['observedRouteOwner'] == 'primary'
     assert external['primaryOutputIds'] == [1, 2]
-    assert external['groups']['virtual1']['programStatus'] == 'divergent'
+    assert external['groups']['virtual1']['programStatus'] == 'no_outputs'
+    assert external['groups']['virtual1']['outputIds'] == []
+    assert external['supersededVirtualOutputIds'] == [2]
+    assert 2 not in external['otherOutputIds']
     assert any(c['type'] == 'primary_virtual_ownership_conflict'
                for c in external['conflicts'])
     assert config['virtualSwitchers']['virtual1']['outputs'] == [1]
