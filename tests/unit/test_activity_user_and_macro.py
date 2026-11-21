@@ -9,8 +9,9 @@ and said "Ran macro None".
 import asyncio
 import struct
 import types
+from unittest.mock import Mock
 
-from atemwire.messages.macros import MacroPropertiesField
+from atemwire.messages.macros import MacroPlayStatusField, MacroPropertiesField
 from django.contrib.auth.models import AnonymousUser
 
 from atem_control import hooks
@@ -59,6 +60,49 @@ def test_another_slots_default_name_is_a_real_name():
 
 def test_never_none():
     assert 'None' not in A.summarize('execute_macro', {})
+
+
+def test_dashboard_snapshot_lists_only_saved_macros_at_their_original_slots():
+    connection = types.SimpleNamespace(mixerstate=_mx(
+        _mprp(82, ' Wrap Up '), _mprp(5, 'Removed', used=False), _mprp(2, 'Open'), _mprp(11, ''),
+    ))
+
+    state = ATEMConsumer().build_full_state(connection)
+
+    assert state['dashboardMacros'] == [
+        {'number': 3, 'name': 'Open'},
+        {'number': 12, 'name': 'Macro 12'},
+        {'number': 83, 'name': 'Wrap Up'},
+    ]
+    assert state['macros'][5] == {'number': 6, 'name': 'Macro 6'}
+
+
+def test_dashboard_macro_playback_tracks_waiting_and_repeated_runs_between_polls():
+    connection = types.SimpleNamespace(mixerstate=_mx(_mprp(0, 'Intro')), protocol=Mock())
+    consumer = ATEMConsumer()
+    consumer.connection = connection
+    consumer._sync_macro_playback_listener()
+    event, observe = connection.protocol.on.call_args.args
+
+    def playback(flags, index):
+        status = MacroPlayStatusField(struct.pack('>BBH', flags, 0, index))
+        connection.mixerstate['macro-play-status'] = status
+        observe(status)
+
+    playback(1, 0)
+    playback(2, 0)  # Waiting for a continue is still active and the same run.
+    assert consumer.build_full_state(connection)['dashboardMacroPlayback'] == {
+        'activeNumber': 1, 'sequence': 1, 'lastStartedNumber': 1,
+    }
+    playback(0, MacroPlayStatusField.IDLE)
+    playback(1, 0)
+    playback(0, MacroPlayStatusField.IDLE)
+    assert consumer.build_full_state(connection)['dashboardMacroPlayback'] == {
+        'activeNumber': None, 'sequence': 2, 'lastStartedNumber': 1,
+    }
+
+    asyncio.run(consumer.stop_monitoring())
+    connection.protocol.off.assert_called_once_with(event, connection.protocol.on.return_value)
 
 
 # --- who did it -----------------------------------------------------------------

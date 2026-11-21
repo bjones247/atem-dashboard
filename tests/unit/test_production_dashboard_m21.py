@@ -167,10 +167,11 @@ def _take_all_request(action='cut'):
 
 
 def test_assignment_dialog_layout_and_hidden_cut_feedback():
-    template = (Path(__file__).resolve().parents[2] / 'atem_control' / 'templates' / 'dashboard.html').read_text()
+    directory = Path(__file__).resolve().parents[2] / 'atem_control/templates/dashboard'
+    template = (directory / '_styles.html').read_text() + (directory / '_surface.html').read_text()
     assert 'grid-template-columns: 4.5rem 5rem minmax(9rem, 1fr) 7rem' in template
     assert '<span>SELECT</span><span>Output</span><span>Current Output Source</span><span>Switcher</span>' in template
-    assert "other: 'Unswitched'" in template
+    assert 'x-text="outputOwnerLabel(output.owner)"' in template
     dialog = template[template.index('aria-label="Change output assignments"'):]
     assert dialog.index('>Save</button>') < dialog.index('>Cancel</button>')
     assert 'Review TAKE ALL results' not in template
@@ -1214,7 +1215,7 @@ function makeState(routes) {
   const outputs = routes.map((liveSourceId, channel) => ({
     outputId: channel + 1, auxIndex: channel, displayName: `OUT ${channel + 1}`,
     liveSourceId, lastObservedSourceId: null, routeStatus: 'observed',
-    owner: channel === 0 ? 'primary' : 'other',
+    owner: liveSourceId === 90010 ? 'primary' : 'other',
     observedRouteOwner: liveSourceId === 90010 ? 'primary' : 'other',
     savedOwners: [], available: true, conflicts: [],
   }));
@@ -1424,7 +1425,9 @@ window.addEventListener('load', async () => {
         for path in ('vendor/webatem.css', 'vendor/bootstrap-icons/bootstrap-icons.min.css', 'brand/brand.css')
     )
     fixture.write_text(
-        '<!doctype html><html data-theme="dark"><meta charset="utf-8"><style>[x-cloak]{display:none!important}</style>' + dashboard_styles + css_links
+        '<!doctype html><html data-theme="dark"><meta charset="utf-8">'
+        '<style>[x-cloak]{display:none!important}.production-dashboard .btn-live-source{transition:none!important}</style>'
+        + dashboard_styles + css_links
         + '<script>window.sentCommands=[];</script>' + component_html
         + '<output id="result">waiting</output>'
         + f'<script src="{dashboard_js}"></script><script>{harness}</script>'

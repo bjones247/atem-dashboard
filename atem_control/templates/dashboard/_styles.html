@@ -1,0 +1,59 @@
+<style>
+    .production-dashboard .switcher-grid { align-items: start; }
+    .production-dashboard .switcher-card { min-width: 0; }
+    .production-dashboard .virtual-switcher-area { min-width: 0; }
+    @media (min-width: 1024px) {
+        .production-dashboard .virtual-switcher-area {
+            grid-column: span 2;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            grid-template-rows: auto 1fr;
+            align-items: start;
+            align-self: stretch;
+        }
+        .production-dashboard .take-all-card { grid-column: 1 / -1; align-self: stretch; }
+    }
+    .production-dashboard .route-card { flex: 0 0 15rem; width: 15rem; min-width: 0; }
+    .production-dashboard .unswitched-output-badge { background: #fef3c7; border-color: #fde68a; color: #713f12; }
+    .production-dashboard .output-badge { background: #e5e7eb; border: 1px solid #9ca3af; color: #111827; font-family: var(--font-data, monospace); font-weight: 700; }
+    .production-dashboard .primary-switcher-badge { background: #bbf7d0; border-color: #86efac; color: #14532d; }
+    .production-dashboard .virtual-switcher-badge { background: #dc2626; border-color: #ef4444; color: white; }
+    .production-dashboard .source-value { overflow-wrap: anywhere; }
+    .production-dashboard .state-label { letter-spacing: .06em; }
+    .production-dashboard .other-output-list { overflow-x: auto; }
+    .production-dashboard .other-output-list-inner { min-width: max-content; }
+    .production-dashboard .switcher-source-bus { overflow-x: auto; padding: .2rem; }
+    .production-dashboard .source-grid {
+        display: grid;
+        grid-template-columns: repeat(var(--input-columns), minmax(2rem, 4rem)) .6rem
+            repeat(var(--middle-columns), minmax(2rem, 4rem)) .6rem
+            repeat(var(--right-columns), minmax(2rem, 4rem));
+        gap: .2rem;
+    }
+    .production-dashboard .source-grid .btn {
+        width: 100%; min-width: 0; min-height: 0; height: auto; aspect-ratio: 1;
+        padding: .125rem; font: 700 .75rem var(--font-data, monospace);
+    }
+    .production-dashboard .source-grid .btn span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .production-dashboard .direct-mode-button { border-radius: .5rem; }
+    .production-dashboard .btn.btn-live-source { background: #dc2626 !important; border-color: #ef4444 !important; color: white !important; box-shadow: 0 0 8px #dc262655; opacity: 1 !important; }
+    .production-dashboard .btn-preview-source { background: #059669 !important; border-color: #10b981 !important; color: white !important; }
+    .production-dashboard .keyer-grid { grid-auto-columns: minmax(2rem, 4rem); }
+    .production-dashboard .primary-rate-input { width: 4.25rem; }
+    .production-dashboard .primary-transition-row { margin-left: -10px; }
+    .production-dashboard .primary-rate-control { margin-left: 5px; }
+    .production-dashboard .dashboard-cut-button { min-width: 4.5rem; min-height: 2.5rem; height: 2.5rem; padding-inline: 1rem; }
+    .production-dashboard .auto-style-buttons { margin-left: 3rem; }
+    .production-dashboard .cut-reason { font-size: .7rem; line-height: 1.2; }
+    .production-dashboard .cut-feedback-hidden { display: none !important; }
+    .production-dashboard .route-source-grid { display: grid; grid-template-columns: repeat(4, 3.125rem); gap: .25rem; justify-content: center; }
+    .production-dashboard .route-source-grid .btn { width: 100%; min-width: 0; min-height: 0; height: 3.125rem; font: 600 .75rem var(--font-data, monospace); padding: .1rem .2rem; }
+    .production-dashboard .assignment-grid { display: grid; grid-template-columns: 4.5rem 5rem minmax(9rem, 1fr) 7rem; gap: .75rem; align-items: center; min-width: 28rem; }
+    .production-dashboard .assignment-grid-note { grid-column: 2 / -1; }
+    .production-dashboard .assignment-owner-badge { height: auto; min-height: 1rem; max-width: 100%; padding-block: .15rem; overflow-wrap: anywhere; justify-self: start; }
+    .production-dashboard .dashboard-dialog-box { padding: 1rem; }
+    .production-dashboard .dashboard-dialog-actions { display: flex; justify-content: flex-end; gap: .5rem; margin-top: 1rem; }
+    .production-dashboard .macros-dialog:not([open]) { display: none; }
+    .production-dashboard .macro-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .production-dashboard .macro-grid .btn { min-width: 0; height: auto; padding: .5rem; white-space: normal; overflow-wrap: anywhere; transition: none; }
+    [x-cloak] { display: none !important; }
+</style>

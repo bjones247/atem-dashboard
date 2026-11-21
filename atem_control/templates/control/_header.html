@@ -1,5 +1,5 @@
         <!-- Header -->
-        <div class="card bg-base-200 mb-6">
+        <div class="card bg-base-200 {% if virtual_workspace %}mb-4{% else %}mb-6{% endif %}">
             <div class="card-body py-6">
                 <!-- auto / 1fr / auto: title + connect controls take what they need,
                      the button row gets the rest (minmax(0,…) so it can shrink and
@@ -28,12 +28,23 @@
                          (tooltips remain) below 2xl so the row never overlaps the
                          title or the connect controls at laptop widths. -->
                     <div class="flex justify-center flex-wrap items-center gap-3">
+                        {% if not virtual_workspace %}
                         <a class="btn bg-base-300 hover:bg-base-content hover:text-base-100 border-0 gap-2 shadow-md"
-                           :href="'{% url 'atem_control:dashboard' %}' + ($store.atem.currentIP ? '?ip=' + encodeURIComponent($store.atem.currentIP) : '')"
-                           title="Switch to 3-Output Production Dashboard">
+                           :href="'{% url 'atem_control:workspace' %}' + ($store.atem.currentIP ? '?ip=' + encodeURIComponent($store.atem.currentIP) : '')"
+                           title="Open Virtual Switchers">
                             <i class="bi bi-grid-3x3-gap text-lg"></i>
                             <span class="font-semibold hidden 2xl:inline">Dashboard</span>
                         </a>
+                        {% endif %}
+                        {% if virtual_workspace %}
+                        <button type="button" class="btn bg-base-300 hover:bg-base-content hover:text-base-100 border-0 gap-2 shadow-md"
+                            @click="$dispatch('open-dashboard-macros')"
+                            :disabled="!$store.atem.connected || $store.atem.switcherAway"
+                            aria-label="Open Macros" aria-haspopup="dialog" title="Open Macros">
+                            <i class="bi bi-play-circle text-lg" aria-hidden="true"></i>
+                            <span class="font-semibold hidden 2xl:inline">Macros</span>
+                        </button>
+                        {% endif %}
                         <button class="btn bg-base-300 hover:bg-base-content hover:text-base-100 border-0 gap-2 shadow-md"
                             @click="mediaPoolOpen = true; ATEMControl.cmd && ATEMControl.cmd('media_pool_refresh')"
                             :class="!$store.atem.connected ? 'btn-disabled opacity-50' : ''"

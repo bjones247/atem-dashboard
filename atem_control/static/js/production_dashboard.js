@@ -15,7 +15,14 @@
  */
 
 document.addEventListener('alpine:init', () => {
-    Alpine.data('productionDashboard', () => ({
+    const switcherLabels = {
+        primary: 'Primary Switcher',
+        virtual1: 'Virtual Switcher 1',
+        virtual2: 'Virtual Switcher 2',
+        other: 'Unswitched',
+    };
+
+    const initialDashboardState = () => ({
         ipAddress: '',
         connected: false,
         reconnecting: false,
@@ -36,6 +43,12 @@ document.addEventListener('alpine:init', () => {
         sources: [],
         auxOutputs: {},
         mes: [],
+
+        macrosOpen: false,
+        macroDirect: false,
+        macroSelection: null,
+        macroRequest: null,
+        macroError: '',
 
         // Milestone 3B read-only view and per-device custom switcher names.
         dashboardConfig: null,
@@ -148,8 +161,21 @@ document.addEventListener('alpine:init', () => {
         labelStyle: 'both',
         programSelectionMode: 'preview_cut_only', // 'preview_cut_only' vs 'direct'
         masterSafetyMode: 'protected', // 'protected' vs 'instant'
+    });
+
+    Alpine.data('productionDashboard', () => ({
+        ...initialDashboardState(),
+        workspaceSocket: null,
+        workspaceCleanup: null,
+        workspaceDeviceId: null,
 
         init() {
+            if (this.$el?.hasAttribute('data-webatem-workspace')) {
+                this.$watch('$store.atem.currentIP', () => this.syncWorkspaceConnection());
+                this.$watch('$store.atem.connected && !$store.atem.switcherAway', () => this.syncWorkspaceConnection());
+                this.syncWorkspaceConnection();
+                return;
+            }
             // Read initial IP from query params, then fallback to localStorage
             const urlParams = new URLSearchParams(window.location.search);
             const queryIp = urlParams.get('ip');
@@ -190,6 +216,81 @@ document.addEventListener('alpine:init', () => {
             });
         },
 
+        syncWorkspaceConnection() {
+            const control = window.ATEMControl;
+            const host = this.$store.atem;
+            const ip = host.currentIP;
+            if (this.ipAddress && this.ipAddress !== ip) this.resetWorkspaceDevice(ip);
+            this.ipAddress = ip;
+
+            // The stock runtime owns opening, closing and replacing the socket.
+            const socket = host.connected && !host.switcherAway && control?.ws?.readyState === WebSocket.OPEN
+                ? control.ws : null;
+            if (socket === this.workspaceSocket) return;
+            this.workspaceCleanup?.();
+            this.workspaceCleanup = null;
+            this.workspaceSocket = socket;
+            if (!socket) {
+                this.handleMessage({ type: 'connection_status', connected: false, message: host.statusText });
+                this.ws = null;
+                return;
+            }
+
+            const current = () => control.ws === socket && socket.readyState === WebSocket.OPEN &&
+                host.currentIP === ip && host.connected && !host.switcherAway;
+            this.ws = {
+                get readyState() { return current() ? WebSocket.OPEN : WebSocket.CLOSED; },
+                send(payload) {
+                    if (!current()) return;
+                    const { command, ...params } = JSON.parse(payload);
+                    control.cmd(command, params);
+                },
+            };
+            const receive = event => {
+                if (!current()) return;
+                let data;
+                try { data = JSON.parse(event.data); } catch { return; }
+                if (data?.type === 'atem_state') {
+                    const deviceId = data.state?.dashboardDevice?.hardware_id;
+                    if (deviceId && this.workspaceDeviceId && deviceId !== this.workspaceDeviceId) {
+                        this.resetWorkspaceDevice(ip);
+                    }
+                    if (deviceId) this.workspaceDeviceId = deviceId;
+                } else if (!data?.type?.startsWith('dashboard_') &&
+                        !(data?.type === 'error' &&
+                          (data.command?.startsWith('dashboard_') || data.command === 'execute_macro'))) {
+                    return;
+                }
+                this.handleMessage(data);
+            };
+            socket.addEventListener('message', receive);
+            this.workspaceCleanup = () => socket.removeEventListener('message', receive);
+            // Get a full state if the stock runtime already received its first snapshot.
+            control.cmd('refresh');
+        },
+
+        resetWorkspaceDevice(ip) {
+            const transport = this.ws;
+            this.clearWorkspaceTimers();
+            Object.assign(this, initialDashboardState(), { ipAddress: ip, ws: transport });
+            this.primaryActionPending = null;
+            this.primaryActionTimer = null;
+            this.workspaceDeviceId = null;
+        },
+
+        clearWorkspaceTimers() {
+            this.clearAllPendingTimeouts();
+            this.clearMacroRequest();
+            this.markThreeCOperationsUnconfirmed();
+            clearTimeout(this.takeAllOperation?.timer);
+            clearTimeout(this.actionNoticeTimer);
+        },
+
+        destroy() {
+            if (this.workspaceCleanup) this.workspaceCleanup();
+            if (this.$el?.hasAttribute('data-webatem-workspace')) this.clearWorkspaceTimers();
+        },
+
         connectWebSocket() {
             if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
                 return;
@@ -222,6 +323,8 @@ document.addEventListener('alpine:init', () => {
             this.ws.onclose = () => {
                 this.connected = false;
                 this.state = null;
+                this.clearMacroRequest();
+                this.closeMacros();
                 this.reconnecting = true;
                 this.statusMessage = 'Disconnected. Reconnecting...';
                 this.panels.forEach(p => {
@@ -279,6 +382,8 @@ document.addEventListener('alpine:init', () => {
                     } else {
                         this.connected = false;
                         this.state = null;
+                        this.clearMacroRequest();
+                        this.closeMacros();
                         this.outputMappingError = '';
                         this.statusMessage = data.message || 'Connection failed.';
                         this.panels.forEach(p => {
@@ -296,6 +401,11 @@ document.addEventListener('alpine:init', () => {
                     break;
 
                 case 'error':
+                    if (data.command === 'execute_macro') {
+                        this.clearMacroRequest();
+                        this.macroError = data.message || 'ATEM rejected the macro command.';
+                        break;
+                    }
                     if (data.command === 'dashboard_take_all' && this.takeAllOperation && !this.takeAllOperation.started) {
                         this.rejectTakeAll(data.message || 'TAKE ALL was blocked. No commands were dispatched.');
                         break;
@@ -501,6 +611,13 @@ document.addEventListener('alpine:init', () => {
             }
             this.state = state;
             this.connected = !!state.is_connected;
+            if (this.connected) {
+                this.reconcileMacroPlayback();
+            } else {
+                this.clearMacroRequest();
+                this.closeMacros();
+            }
+            if (this.macroSelection && !this.selectedMacro) this.macroSelection = null;
             this.outputMappingError = state.dashboardRouting?.capabilities?.outputMappingReason || '';
             this.atemName = state.atem_name || (this.connected ? 'Connected ATEM' : 'Disconnected');
             this.sources = state.sources || [];
@@ -869,6 +986,80 @@ document.addEventListener('alpine:init', () => {
         get hardwareReady() {
             return !!(this.connected && this.ws && this.ws.readyState === WebSocket.OPEN &&
                 this.state?.is_connected && this.state?.dashboardSafety?.fresh);
+        },
+
+        get savedMacros() {
+            return this.state?.dashboardMacros || [];
+        },
+
+        get selectedMacro() {
+            const selection = this.macroSelection;
+            if (!selection) return null;
+            return this.savedMacros.find(macro => macro.number === selection.number &&
+                macro.name === selection.name) || null;
+        },
+
+        get activeMacroNumber() {
+            return this.hardwareReady ? this.state?.dashboardMacroPlayback?.activeNumber ?? null : null;
+        },
+
+        get macroControlsDisabled() {
+            return !this.hardwareReady || this.macroRequest !== null || this.activeMacroNumber !== null;
+        },
+
+        openMacros() {
+            this.macrosOpen = true;
+        },
+
+        closeMacros() {
+            this.macrosOpen = false;
+            this.macroDirect = false;
+            this.macroSelection = null;
+            this.macroError = '';
+        },
+
+        toggleMacroDirect() {
+            if (!this.macrosOpen || this.macroControlsDisabled || !this.savedMacros.length) return;
+            this.macroDirect = !this.macroDirect;
+            this.macroSelection = null;
+        },
+
+        chooseMacro(macro) {
+            if (!this.macrosOpen || this.macroControlsDisabled) return;
+            if (this.macroDirect || this.selectedMacro?.number === macro.number) this.runMacro(macro);
+            else this.macroSelection = macro;
+        },
+
+        runMacro(macro) {
+            if (!this.macrosOpen || this.macroControlsDisabled || !macro ||
+                !this.savedMacros.some(saved => saved.number === macro.number && saved.name === macro.name)) return;
+            this.macroSelection = null;
+            this.macroError = '';
+            this.macroRequest = {
+                number: macro.number,
+                sequence: this.state.dashboardMacroPlayback?.sequence ?? 0,
+                timer: setTimeout(() => {
+                    this.clearMacroRequest();
+                    this.macroError = 'The ATEM did not confirm macro playback.';
+                }, 3000),
+            };
+            this.ws.send(JSON.stringify({ command: 'execute_macro', macro_number: macro.number }));
+        },
+
+        reconcileMacroPlayback() {
+            const request = this.macroRequest;
+            const playback = this.state.dashboardMacroPlayback;
+            if (!request || !playback || !this.hardwareReady) return;
+            if (playback.activeNumber === request.number ||
+                (playback.sequence > request.sequence && playback.lastStartedNumber === request.number)) {
+                this.clearMacroRequest();
+            }
+        },
+
+        clearMacroRequest() {
+            if (this.macroRequest === null) return;
+            clearTimeout(this.macroRequest.timer);
+            this.macroRequest = null;
         },
 
         // Designate which M/E-fed output is primary dashboard control panel without altering hardware
@@ -1252,11 +1443,11 @@ document.addEventListener('alpine:init', () => {
 
         get virtualSwitcherViews() {
             const projection = this.routingProjection;
-            return ['virtual1', 'virtual2'].map((key, index) => {
+            return ['virtual1', 'virtual2'].map(key => {
                 const group = projection?.groups?.[key] || {};
                 return {
                     key,
-                    title: this.switcherName(key, `Virtual Switcher ${index + 1}`),
+                    title: this.switcherName(key),
                     // Only validated ownership is shown as an assignment badge.
                     outputs: this.projectedOutputs.filter(output => output.owner === key),
                     group,
@@ -1272,7 +1463,7 @@ document.addEventListener('alpine:init', () => {
         },
 
         get primarySwitcherName() {
-            return this.switcherName('primary', 'Primary Switcher');
+            return this.switcherName('primary');
         },
 
         get hardwareMe() {
@@ -1293,11 +1484,15 @@ document.addEventListener('alpine:init', () => {
             return this.routingProjection?.stateFresh === false || this.state?.dashboardSafety?.fresh === false;
         },
 
-        switcherName(key, fallback) {
+        switcherName(key, fallback = switcherLabels[key] ?? key) {
             const config = this.dashboardConfigDeviceId === this.routingProjection?.deviceId
                 ? this.dashboardConfig?.config : null;
             const value = config?.customNames?.[key];
             return typeof value === 'string' && value.trim() ? value.trim() : fallback;
+        },
+
+        outputOwnerLabel(owner) {
+            return ({ primary: 'Primary', virtual1: 'Virtual 1', virtual2: 'Virtual 2', other: 'Unswitched' })[owner] ?? owner;
         },
 
         invalidAssignmentsFor(key) {
@@ -2033,13 +2228,13 @@ document.addEventListener('alpine:init', () => {
                         this.showError('The virtual switcher target changed. Reopen the assignment dialog to review.'); return;
                     }
                     if (!group || ['mixed', 'unknown'].includes(group.routeStatus)) {
-                        this.showError(`${owner} routing must be uniform and observed before adding an output.`); return;
+                        this.showError(`${this.switcherName(owner)} routing must be uniform and observed before adding an output.`); return;
                     }
                     if (group.routeStatus === 'empty' && group.savedProgramTargetId == null && ops.length) {
                         this.showError('Assign the first output by itself so the virtual switcher can keep its current feed.'); return;
                     }
                     const target = this.virtualAssignmentTarget(group, output);
-                    if (!Number.isInteger(target)) { this.showError(`Set a valid ${owner} Program target before assigning an output.`); return; }
+                    if (!Number.isInteger(target)) { this.showError(`Set a valid ${this.switcherName(owner)} Program target before assigning an output.`); return; }
                     const transferFrom = ['primary', 'virtual1', 'virtual2'].includes(output.owner) ? output.owner : null;
                     ops.push({ outputId: output.outputId, mode: 'virtual_assign', targetOwner: owner,
                         groupId: owner, target, expectedLive: output.liveSourceId, transferFrom });

@@ -6,7 +6,7 @@ const vm = require('node:vm');
 
 const source = fs.readFileSync(path.resolve(__dirname, '../../atem_control/static/js/production_dashboard.js'), 'utf8');
 
-function controller() {
+function controller(window = {}) {
   let factory;
   let nextTimer = 1;
   const timers = new Map();
@@ -15,7 +15,8 @@ function controller() {
   const context = {
     document: { addEventListener: (_event, callback) => callback() },
     Alpine: { data: (_name, callback) => { factory = callback; } },
-    WebSocket: { OPEN: 1 },
+    WebSocket: { OPEN: 1, CLOSED: 3 },
+    window,
     localStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
     sessionStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
     setTimeout: (callback) => { const id = nextTimer++; timers.set(id, callback); return id; },
@@ -51,6 +52,178 @@ function hardware({ program = 1, preview = 2, aux3 = 1, meReason = null, auxReas
     },
   };
 }
+
+test('macros run on a second press or Run, and Direct runs on the first press', () => {
+  const { dashboard: d, sent } = controller();
+  const intro = { number: 3, name: 'Intro' };
+  const wrap = { number: 83, name: 'Wrap Up' };
+  const state = { ...hardware(), dashboardMacros: [intro, wrap] };
+  const observe = (activeNumber, sequence, lastStartedNumber) => d.updateState({
+    ...state, dashboardMacroPlayback: { activeNumber, sequence, lastStartedNumber },
+  });
+  observe(null, 0, null);
+  d.openMacros();
+
+  d.chooseMacro(intro);
+  assert.equal(d.selectedMacro, intro);
+  assert.deepEqual(sent, []);
+  d.chooseMacro(intro);
+  assert.equal(d.macroRequest.number, 3);
+  d.chooseMacro(intro);
+  assert.deepEqual(sent, [{ command: 'execute_macro', macro_number: 3 }]);
+  observe(null, 0, null);
+  assert.equal(d.macroRequest.number, 3); // Idle before start is not completion.
+  observe(3, 1, 3);
+  assert.equal(d.macroRequest, null);
+  assert.equal(d.activeMacroNumber, 3);
+  assert.equal(d.macroControlsDisabled, true);
+  observe(null, 1, 3);
+  assert.equal(d.macroControlsDisabled, false);
+
+  d.chooseMacro(wrap);
+  d.updateState({ ...d.state, dashboardMacros: [intro] });
+  assert.equal(d.selectedMacro, null);
+  d.runMacro(wrap);
+  assert.equal(sent.length, 1);
+  d.chooseMacro(intro);
+  d.runMacro(d.selectedMacro);
+  observe(null, 2, 3); // A repeat finished between polls.
+  assert.equal(d.macroRequest, null);
+  assert.equal(d.activeMacroNumber, null);
+
+  d.toggleMacroDirect();
+  assert.equal(d.macroDirect, true);
+  d.chooseMacro(wrap);
+  assert.deepEqual(sent.at(-1), { command: 'execute_macro', macro_number: 83 });
+  assert.equal(sent.length, 3);
+  d.closeMacros();
+  d.openMacros();
+  assert.equal(d.macroDirect, false);
+  assert.equal(d.macroControlsDisabled, true);
+  d.handleMessage({ type: 'connection_status', connected: false });
+  d.chooseMacro(intro);
+  assert.equal(d.macrosOpen, false);
+  assert.equal(d.macroRequest, null);
+  assert.equal(sent.length, 3);
+});
+
+test('unobserved playback clears the request with an error and sends no retry', () => {
+  const { dashboard: d, sent, timers } = controller();
+  const macro = { number: 1, name: 'Intro' };
+  d.updateState({ ...hardware(), dashboardMacros: [macro] });
+  d.openMacros();
+  d.toggleMacroDirect();
+  d.chooseMacro(macro);
+  timers.get(d.macroRequest.timer)();
+  assert.equal(d.macroRequest, null);
+  assert.match(d.macroError, /did not confirm/);
+  assert.deepEqual(sent, [{ command: 'execute_macro', macro_number: 1 }]);
+});
+
+test('the Virtual workspace shares the stock socket and separates device sessions', () => {
+  function socket() {
+    const listeners = new Set();
+    return {
+      readyState: 1,
+      listeners,
+      addEventListener: (event, fn) => { if (event === 'message') listeners.add(fn); },
+      removeEventListener: (event, fn) => { if (event === 'message') listeners.delete(fn); },
+      receive(message) {
+        for (const fn of listeners) fn({ data: JSON.stringify(message) });
+      },
+    };
+  }
+  const sent = [];
+  const host = { currentIP: '192.0.2.4', connected: false, switcherAway: false };
+  const stock = { ws: socket(), cmd(command, args) { sent.push({ command, ...args }); } };
+  const watched = new Map();
+  const { dashboard: d } = controller({ ATEMControl: stock });
+  d.ipAddress = '';
+  d.ws = null;
+  d.$el = { hasAttribute: name => name === 'data-webatem-workspace' };
+  d.$store = { atem: host };
+  d.$watch = (key, callback) => watched.set(key, callback);
+  d.init();
+  assert.deepEqual(sent, []);
+  const connectionChanged = watched.get('$store.atem.connected && !$store.atem.switcherAway');
+  host.connected = true;
+  connectionChanged();
+  assert.deepEqual(sent, [{ command: 'refresh' }]);
+  assert.equal(stock.ws.listeners.size, 1);
+  const staleListener = [...stock.ws.listeners][0];
+  stock.ws.receive({ type: 'websocket_ready' });
+  const state = hardware();
+  state.dashboardDevice = { hardware_id: 'a'.repeat(32) };
+  stock.ws.receive({ type: 'atem_state', state });
+  d.primaryCut();
+  assert.equal(sent.at(-1).command, 'dashboard_cut_me');
+  assert.ok(d.primaryActionPending);
+  stock.ws.receive({ type: 'error', command: 'set_video_mode', message: 'Stock panel error' });
+  assert.ok(d.primaryActionPending);
+  stock.ws.receive({ type: 'error', command: 'dashboard_cut_me', message: 'Dashboard cut refused' });
+  assert.equal(d.primaryActionPending, null);
+  assert.match(d.actionError, /Dashboard cut refused/);
+
+  // The same socket can pause/recover. Keep an outstanding write uncertain.
+  d.primaryCut();
+  host.switcherAway = true;
+  connectionChanged();
+  assert.equal(d.hardwareReady, false);
+  assert.equal(d.primaryActionPending.unconfirmed, true);
+  host.switcherAway = false;
+  connectionChanged();
+  assert.equal(stock.ws.listeners.size, 1);
+  stock.ws.receive({ type: 'atem_state', state });
+  assert.equal(d.primaryActionPending.unconfirmed, true);
+
+  const oldSocket = stock.ws;
+  stock.ws = socket();
+  host.currentIP = '192.0.2.9';
+  watched.get('$store.atem.currentIP')();
+  assert.equal(oldSocket.listeners.size, 0);
+  assert.equal(d.primaryActionPending, null);
+  assert.equal(d.hardwareReady, false);
+  staleListener({ data: JSON.stringify({ type: 'atem_state', state }) });
+  assert.equal(d.state, null);
+  const newState = hardware({ program: 3 });
+  const newId = 'b'.repeat(32);
+  newState.dashboardDevice = { hardware_id: newId };
+  newState.dashboardRouting = { ...threeCProjection({ virtual1: [1] }), deviceId: newId };
+  stock.ws.receive({ type: 'atem_state', state: newState });
+  assert.equal(d.hardwareProgramSourceId, 3);
+  assert.equal(sent.at(-1).command, 'dashboard_config_get');
+  stock.ws.receive({ type: 'dashboard_config', deviceId: newId, revision: 7, config: {
+    virtualSwitchers: {
+      virtual1: { outputs: [1], previewSource: 3, programTarget: 1 },
+      virtual2: { outputs: [], previewSource: 3, programTarget: 1 },
+    },
+  } });
+  d.takeAll();
+  assert.equal(sent.at(-1).command, 'dashboard_take_all');
+  stock.ws.receive({ type: 'dashboard_take_all_started', device_id: newId,
+    primary: { ok: true, before: 3, target: 2 },
+    virtual: { virtual1: { status: 'pending', target: 3, previous: 1, outcomes: [{ channel: 1, ok: true }] },
+      virtual2: { status: 'skipped', outcomes: [] } } });
+  const confirmed = hardware({ program: 2, preview: 3 });
+  confirmed.dashboardDevice = newState.dashboardDevice;
+  confirmed.dashboardRouting = { ...threeCProjection({ routes: [90010, 3, 2, 1, 2, 1], virtual1: [1] }), deviceId: newId };
+  stock.ws.receive({ type: 'atem_state', state: confirmed });
+  assert.equal(sent.at(-1).command, 'dashboard_config_update');
+  const save = sent.at(-1);
+  stock.ws.receive({ type: 'dashboard_config', deviceId: newId, revision: 8, config: save.config });
+  assert.equal(d.takeAllOperation.status, 'complete');
+  assert.equal(d.dashboardConfig.config.virtualSwitchers.virtual1.previewSource, 1);
+
+  // A replacement switcher can appear behind the same address.
+  confirmed.dashboardDevice = { hardware_id: 'c'.repeat(32) };
+  confirmed.dashboardRouting.deviceId = confirmed.dashboardDevice.hardware_id;
+  stock.ws.receive({ type: 'atem_state', state: confirmed });
+  assert.equal(d.takeAllOperation, null);
+  assert.equal(d.dashboardConfig, null);
+  d.destroy();
+  assert.equal(stock.ws.listeners.size, 0);
+  assert.equal(sent.some(message => message.command === 'connect' || message.command === 'disconnect'), false);
+});
 
 test('linked M/E panels have one live source and send one guarded CUT', () => {
   const { dashboard: d, sent } = controller();
@@ -449,6 +622,12 @@ test('Milestone 3B custom names use revision-checked software config only', () =
     config: { schemaVersion: 1, customNames: { primary: null, virtual1: null, virtual2: 'Studio Feed' }, preferences: {}, virtualSwitchers: {}, minimumPrimaryDestinations: true },
   });
   assert.equal(d.virtualSwitcherViews[1].title, 'Studio Feed');
+  assert.equal(d.switcherName('primary'), 'Primary Switcher');
+  assert.equal(d.switcherName('virtual2'), 'Studio Feed');
+  assert.equal(d.switcherName('other'), 'Unswitched');
+  assert.equal(d.outputOwnerLabel('primary'), 'Primary');
+  assert.equal(d.outputOwnerLabel('virtual1'), 'Virtual 1');
+  assert.equal(d.outputOwnerLabel('virtual2'), 'Virtual 2');
   d.beginNameEdit('virtual1', 'Virtual Switcher 1');
   d.nameDraft = 'Stage';
   d.saveSwitcherName('virtual1');

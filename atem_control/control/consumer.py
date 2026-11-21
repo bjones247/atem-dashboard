@@ -18,6 +18,7 @@ from atem_control.media_pool import watcher as media_pool_service
 from atemwire.state import ATEMStateMixin
 from atemwire.messages.audio_legacy import enable_audio_levels
 from atemwire.messages.fairlight import enable_fairlight_levels
+from atemwire.messages.macros import MacroPlayStatusField, macro_entry
 from atemwire.messages.system_info import device_name
 from atemwire.pool import ATEMInstanceManager
 from atemwire.transport import NoFreeConnection
@@ -66,6 +67,13 @@ CONNECT_ATTEMPTS = 1
 CONNECT_PROGRESS_EVERY = 0.5     # s between "Connecting…" updates to the page
 NO_FREE_CONNECTION_MESSAGE = ('No free connection on this switcher (ATEM Software Control, '
                               'panels or other clients are using all its slots)')
+MACRO_PLAYBACK_EVENT = 'change:macro-play-status'
+
+
+def _active_macro_number(status):
+    if status is not None and (status.running or status.waiting) and status.index != MacroPlayStatusField.IDLE:
+        return status.index + 1  # Browser slots are one-based.
+    return None
 
 
 class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketConsumer):
@@ -90,6 +98,7 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
     RECENT_COMMAND_WINDOW = 2.0     # Seconds after a command to use fast polling
     RECENT_CHANGE_WINDOW = 6.0     # Seconds after a state change to use fast polling
     IDLE_POLL_THRESHOLD = 10       # Consecutive unchanged polls before switching to slow
+    _macro_playback_listener = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -860,6 +869,7 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
     async def stop_monitoring(self):
         """Stop state polling."""
         self.is_monitoring = False
+        self._detach_macro_playback_listener()
         task, self.monitoring_task = self.monitoring_task, None
         if task is None or task.done():
             return
@@ -942,6 +952,7 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
 
                 # Get current state
                 t0 = time.monotonic()
+                self._sync_macro_playback_listener()
                 current_state = await sync_to_async(self.build_full_state, thread_sensitive=False)(self.connection)
                 current_state['dashboardSafety'] = dashboard_switching.safety_snapshot(self.connection)
                 current_state['dashboardDevice'] = dashboard_config.identity_snapshot(self.connection)
@@ -1056,6 +1067,60 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
                 'connected': False,
                 'message': 'ATEM monitoring failed; disconnected',
             })
+
+    def _sync_macro_playback_listener(self):
+        protocol = getattr(self.connection, 'protocol', None)
+        if self._macro_playback_listener and self._macro_playback_listener[0] is protocol:
+            return
+        self._detach_macro_playback_listener()
+        if protocol is None:
+            return
+
+        playback = None
+
+        def observe(status):
+            nonlocal playback
+            active = _active_macro_number(status)
+            sequence = playback['sequence'] if playback else 0
+            last_started = playback['lastStartedNumber'] if playback else None
+            if active is not None and (not playback or active != playback['activeNumber']):
+                sequence += 1
+                last_started = active
+            # A macro can start and finish between polls, even if it is the
+            # same slot as last time. Keep its start in the next idle snapshot.
+            playback = {'activeNumber': active, 'sequence': sequence, 'lastStartedNumber': last_started}
+
+        handler = protocol.on(MACRO_PLAYBACK_EVENT, observe)
+        self._macro_playback_listener = (protocol, handler, lambda: playback)
+
+    def _detach_macro_playback_listener(self):
+        listener, self._macro_playback_listener = self._macro_playback_listener, None
+        if listener:
+            protocol, handler, _ = listener
+            protocol.off(MACRO_PLAYBACK_EVENT, handler)
+
+    def build_full_state(self, connection):
+        state = super().build_full_state(connection)
+        if state['is_connected']:
+            # Classic's macros grid uses placeholder slots. The dashboard needs
+            # the observed, populated slots across the entire ATEM macro bank.
+            mx = connection.mixerstate or {}
+            saved = []
+            for index in sorted(mx.get('macro-properties') or {}):
+                entry = macro_entry(mx, index)
+                if entry['is_used']:
+                    number = index + 1  # execute_macro takes a one-based slot.
+                    saved.append({'number': number, 'name': entry['name'].strip() or f'Macro {number}'})
+            state['dashboardMacros'] = saved
+            status = mx.get('macro-play-status')
+            listener = self._macro_playback_listener
+            observed = listener[2]() if listener and listener[0] is getattr(connection, 'protocol', None) else None
+            state['dashboardMacroPlayback'] = (observed if status is not None and observed else {
+                'activeNumber': _active_macro_number(status),
+                'sequence': observed['sequence'] if observed else 0,
+                'lastStartedNumber': None,
+            })
+        return state
 
     def _calculate_poll_interval(self, current_state, consecutive_no_changes):
         """
@@ -1227,6 +1292,7 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
                 })
                 return
 
+            self._sync_macro_playback_listener()
             state = await sync_to_async(self.build_full_state, thread_sensitive=False)(self.connection)
             state['dashboardSafety'] = dashboard_switching.safety_snapshot(self.connection)
             state['dashboardDevice'] = dashboard_config.identity_snapshot(self.connection)

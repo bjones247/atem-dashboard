@@ -112,9 +112,11 @@ The explicit resolution workflow is implemented in 3C: choose a directly routabl
 
 ## 4. Operator interface
 
+Virtual Switchers is the default live workspace after selecting an ATEM. Use WebATEM's existing control page as the shell, with the Virtual dashboard in the switcher area under the stock toolbar. Media Pool, Audio, HyperDeck, Profile, Settings, and ATEM connection controls use the original WebATEM panels and the page's existing browser connection. Keep one reusable dashboard surface. The normal Connect flow opens `/atem/live/?ip=…`, Classic remains available at `/atem/control/?ip=…`, and `/atem/dashboard/` remains the standalone dashboard. There is no view toggle in the live workspace.
+
 ### 4.1 PRIMARY SWITCHER column
 
-Show M/E 1 Program background, Preview, transition style, upstream and downstream keyers, and destination badges derived from actual Program routes. CUT and AUTO show the reason when blocked. Keyed AUTO confirmation lists the affected keyers. The assignment pencil opens the output dialog, and zero destinations show a warning while the Primary panel remains available.
+Show M/E 1 Program background, Preview, transition style, upstream and downstream keyers, and destination badges derived from actual Program routes. CUT and AUTO show the reason when blocked. The assignment pencil opens the output dialog, and zero destinations show a warning while the Primary panel remains available.
 
 At the top, show **Primary Switcher** (or its Custom Name), then compact badges for every output actually routed to M/E Program, followed by **Change**. Show `M/E PROGRAM` directly beneath the header to identify the hardware engine. Badge examples such as `[OUT 1] [OUT 5]` are illustrative; derive all output names and membership from observed device routes. Custom Name changes presentation only, never the M/E identity, ownership, or routing.
 
@@ -186,6 +188,8 @@ Milestones 3A–3C provide state projection, the three-switcher interface, and i
   - This would update only the assigned monitoring windows through the shared ATEM connection. Live AUX routes stay under the existing switching controls. The monitor position identifies the virtual Preview. Verify what the native tally and labels show on the device. Browser video capture and Virtual Program windows are separate future considerations.
 
 - **View Log** would gather dashboard activity in one place. Show when each action was sent and when the ATEM confirmed it, with per-output outcomes for coordinated actions. Include blocked, failed, and unconfirmed actions so operators can review them alongside successful activity. Keep active warnings and review controls visible where they are needed.
+
+- **webATEM.vs display branding.** Update the wordmarks, browser titles, accessible logo labels, installed web app name, and desktop launcher branding. Cover the startup splash, tray, update and uninstall messages, and installer display names. Use the existing package and executable names, URL routes, data paths, and installation, startup, and update identifiers for compatibility with existing installs and future upstream merges. Retain upstream attribution.
 
 ## 7. Acceptance criteria and offline test plan
 

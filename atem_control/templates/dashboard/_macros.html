@@ -1,0 +1,32 @@
+<dialog class="modal macros-dialog" x-cloak aria-labelledby="dashboard-macros-title"
+        x-effect="if (macrosOpen && !$el.open) $el.showModal(); else if (!macrosOpen && $el.open) $el.close()"
+        @cancel.prevent="closeMacros()" @click.self="closeMacros()">
+    <div class="modal-box max-w-3xl dashboard-dialog-box">
+        <h2 id="dashboard-macros-title" class="font-bold text-xl">Macros</h2>
+        <p class="text-sm text-base-content/70 mt-2"
+           x-text="macroDirect ? 'Click a macro to run it immediately.' : 'Select a macro, then click Run or click it again.'"></p>
+        <button type="button" class="btn btn-xs font-bold direct-mode-button mt-3"
+                :class="macroDirect ? 'btn-warning' : 'btn-outline'"
+                :aria-pressed="macroDirect ? 'true' : 'false'"
+                :disabled="macroControlsDisabled || !savedMacros.length"
+                @click="toggleMacroDirect()" x-text="macroDirect ? 'Direct enabled' : 'Enable Direct'"></button>
+        <div class="mt-2 max-h-[55vh] overflow-auto rounded border border-base-300 p-4">
+            <p x-show="!savedMacros.length" class="text-sm text-base-content/70">No saved macros on this ATEM.</p>
+            <div class="grid macro-grid gap-2">
+                <template x-for="macro in savedMacros" :key="macro.number">
+                    <button type="button" class="btn btn-sm"
+                            :class="(activeMacroNumber ?? macroRequest?.number) === macro.number ? 'btn-live-source' : (selectedMacro?.number === macro.number ? 'btn-preview-source' : 'btn-outline')"
+                            :aria-pressed="macroDirect ? null : (selectedMacro?.number === macro.number ? 'true' : 'false')"
+                            :disabled="macroControlsDisabled"
+                            @click="chooseMacro(macro)" x-text="macro.name"></button>
+                </template>
+            </div>
+        </div>
+        <p x-show="macroError" role="alert" class="alert alert-error py-2 mt-3 text-sm" x-text="macroError"></p>
+        <div class="modal-action dashboard-dialog-actions">
+            <button type="button" class="btn btn-primary" x-show="!macroDirect"
+                    :disabled="macroControlsDisabled || !selectedMacro" @click="runMacro(selectedMacro)">Run</button>
+            <button type="button" class="btn btn-ghost" autofocus @click="closeMacros()">Close</button>
+        </div>
+    </div>
+</dialog>

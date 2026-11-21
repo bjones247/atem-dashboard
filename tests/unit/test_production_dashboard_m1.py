@@ -62,7 +62,7 @@ def test_dashboard_template_contains_read_only_three_switcher_layout(client):
     assert content.count('SENDING VIRTUAL SWITCH TO:') == 1
     assert content.count('class="source-grid"') == 4
     assert content.count(':style="virtualBusLayout.columns"') == 2
-    assert content.count('class="btn btn-xs font-bold direct-mode-button"') == 2
+    assert content.count('class="btn btn-xs font-bold direct-mode-button') == 3
     assert 'rounded-lg border border-base-300 p-3" role="group" aria-label="Primary transition controls"' in content
     assert content.index('@click="primaryCut()"') < content.index('@click="primaryAuto()"') < content.index('aria-label="AUTO transition type"') < content.index("'transition-style-'")
     assert 'AUTO TRANSITION TYPE:' not in content
@@ -78,7 +78,7 @@ def test_dashboard_template_contains_read_only_three_switcher_layout(client):
     assert 'Logical selection; does not change hardware routing.' not in content
     assert 'getSourceNameById(view.group.' not in content
     assert 'M/E transition status' not in content
-    assert content.index('virtual-switcher-area">') < content.index('x-for="view in virtualSwitcherViews"') < content.index('aria-label="TAKE ALL"') < content.index('</main>')
+    assert content.index('virtual-switcher-area">') < content.index('x-for="view in virtualSwitcherViews"') < content.index('aria-label="TAKE ALL"') < content.index('aria-label="Unswitched Outputs"')
     assert 'class="btn btn-error font-bold" :disabled="!!takeAllReason()"' in content
     assert '>Operation:</span>' not in content
     assert 'Blocked before dispatch.' in content
@@ -103,18 +103,47 @@ def test_dashboard_template_contains_read_only_three_switcher_layout(client):
 
 @pytest.mark.django_db
 def test_cross_view_navigation_retained(client):
-    """Stock control surface has a link to the Production Dashboard, and vice versa."""
-    # Control page -> Dashboard link
+    """Classic and the separate dashboard still have links to the other workspace."""
     control_resp = client.get('/atem/control/', {'ip': '192.168.1.114'})
     assert control_resp.status_code == 200
     control_html = control_resp.content.decode('utf-8')
-    assert '/atem/dashboard/' in control_html
+    assert '/atem/live/' in control_html
+    assert 'id="tbarTrack"' in control_html
+    assert 'data-webatem-workspace' not in control_html
+    assert 'dashboard-macros-title' not in control_html
 
     # Dashboard page -> Control page link
     dash_resp = client.get('/atem/dashboard/', {'ip': '192.168.1.114'})
     assert dash_resp.status_code == 200
     dash_html = dash_resp.content.decode('utf-8')
     assert '/atem/control/' in dash_html
+
+
+@pytest.mark.django_db
+def test_connect_opens_virtual_workspace_with_the_stock_toolbar_and_panels(client):
+    connect = client.get('/atem/').content.decode('utf-8')
+    assert 'data-control-url="/atem/live/"' in connect
+    assert client.get('/atem/live/').url == '/atem/'
+
+    response = client.get('/atem/live/', {'ip': '192.0.2.4', 'name': 'Production'})
+    assert response.status_code == 200
+    assert response.context['initial_ip'] == '192.0.2.4'
+    templates = [template.name for template in response.templates]
+    assert 'control.html' in templates
+    assert 'dashboard/_surface.html' in templates
+    assert 'dashboard/_macros.html' in templates
+    for partial in ('_header', '_media_pool', '_fairlight', '_hyperdeck_panel', '_profile_modal'):
+        assert f'control/{partial}.html' in templates
+    assert 'control/_settings_transition.html' in templates
+    assert 'csrftoken' in response.cookies
+    workspace = response.content.decode('utf-8')
+    assert 'x-data="productionDashboard" data-webatem-workspace' in workspace
+    assert 'aria-label="TAKE ALL"' in workspace
+    assert 'id="tbarTrack"' not in workspace
+    assert 'Open Virtual Switchers' not in workspace
+    assert 'aria-label="Open Macros"' in workspace
+    for script in ('atem_control.js', 'production_dashboard.js', 'alpine.min.js'):
+        assert workspace.count(f'/{script}') == 1
 
 
 def _discover_me_program_id(sources):
@@ -276,7 +305,7 @@ def test_aux_preview_and_master_cut_safety_in_js():
         if match:
             sent_commands.append(match.group(1))
 
-    sanctioned = {'connect', 'refresh', 'cut', 'set_aux_output', 'set_preview', 'set_program',
+    sanctioned = {'connect', 'refresh', 'cut', 'set_aux_output', 'set_preview', 'set_program', 'execute_macro',
                   'toggle_usk', 'dashboard_cut_me', 'dashboard_cut_aux',
                   'dashboard_review_me', 'dashboard_review_aux',
                   'dashboard_toggle_usk', 'dashboard_review_usk',

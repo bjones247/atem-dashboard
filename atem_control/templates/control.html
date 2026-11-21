@@ -84,6 +84,7 @@ style attribute and undo x-show. {% endcomment %}
         
 {% include 'control/_header.html' %}
 
+{% block switcher_surface %}
         <!-- M/E selector (Stage 4A) — only rendered on multi-M/E units, so
              single-M/E switchers look exactly as before. Buttons switch
              which M/E the per-M/E surfaces (buses, transition, USKs, FtB)
@@ -388,6 +389,7 @@ style attribute and undo x-show. {% endcomment %}
 {% include 'control/_fade_to_black.html' %}
             </div>
         </div>
+{% endblock %}
     </div>
     </div>
     <!-- End of main ATEM content -->
