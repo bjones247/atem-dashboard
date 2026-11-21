@@ -1,51 +1,21 @@
-<p align="center"><img src="docs/brand/banner.png" alt="webATEM. Browser control for ATEM switchers. Run the server, open a tab, cut the show." width="100%"></p>
+# webATEM.vs
 
-**Browser control for ATEM switchers.** Run the server on a Mac, a Windows
-PC or a Linux box, and control your ATEMs in a browser from any device on
-the network: desktop, laptop, tablet or phone. WebATEM finds the switchers
-for you and gives you the whole control surface: switching, keyers, audio,
-media pool, macros. Run the server, open a tab, cut the show.
+Cue different sources for multiple ATEM outputs and take them with one button. webATEM.vs adds two virtual switchers to the WebATEM browser interface and keeps the Classic switcher available.
 
-<p align="center">
-  <a href="https://github.com/lucas-romanenko/webatem/releases/latest"><img src="https://img.shields.io/github/v/release/lucas-romanenko/webatem?style=flat-square&color=2FD07A&label=release" alt="Latest release"></a>
-  <a href="https://pypi.org/project/webatem/"><img src="https://img.shields.io/pypi/v/webatem?style=flat-square&color=9A9E9F&label=pypi" alt="On PyPI"></a>
-  <a href="https://github.com/lucas-romanenko/webatem/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/lucas-romanenko/webatem/ci.yml?branch=main&style=flat-square&label=tests" alt="Tests"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-9A9E9F?style=flat-square" alt="MIT licensed"></a>
-</p>
+- **Cue and take together.** Set Preview on each switcher, then press **TAKE ALL** to run the ready cuts in one action.
+- **Decide which outputs follow each switcher.** Route the hardware M/E Program feed or either virtual switcher's Program to one or more available outputs. Each virtual switcher has its own Preview and Program.
+- **Change any remaining output from the dashboard.** Pick a source under **Unswitched Outputs** without opening the routing settings or setting up a macro.
 
-<p align="center">
-  <a href="https://github.com/lucas-romanenko/webatem/releases/latest/download/webatem-windows-x64-setup.exe"><img src="https://img.shields.io/badge/Download-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white" alt="Download for Windows"></a>
-  &nbsp;
-  <a href="https://github.com/lucas-romanenko/webatem/releases/latest/download/webatem-macos-arm64.dmg"><img src="https://img.shields.io/badge/Download-macOS%20(Apple%20silicon)-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS, Apple silicon"></a>
-  &nbsp;
-  <a href="https://github.com/lucas-romanenko/webatem/releases/latest/download/webatem-macos-intel.dmg"><img src="https://img.shields.io/badge/Download-macOS%20(Intel)-333333?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS, Intel"></a>
-  &nbsp;
-  <a href="https://github.com/lucas-romanenko/webatem/releases/latest/download/webatem-linux-x64"><img src="https://img.shields.io/badge/Download-Linux-E95420?style=for-the-badge&logo=linux&logoColor=white" alt="Download for Linux"></a>
-</p>
-<p align="center"><sub>Download it, open it, and your switchers appear. &nbsp;·&nbsp; Windows installs per-user, no admin needed. &nbsp;·&nbsp; The Linux build runs on desktop <b>and</b> headless servers.</sub></p>
+Get the Windows x64 installer from [webATEM.vs Releases](https://github.com/bjones247/webatem.vs/releases). The virtual switcher dashboard was beta tested on a Blackmagic ATEM 1 M/E Constellation 4K.
 
-Three ways to run it, all simple:
+Thanks to Lucas Romanenko for creating [WebATEM](https://github.com/lucas-romanenko/webatem). This fork builds on WebATEM 2.6.0.
 
-- **Just you, right now** → **download it** for your Mac or Windows machine
-  and open it. It lives in your menu bar / system tray (with a *Start at
-  login* switch), opens your browser, and your switchers appear. Like ATEM
-  Software Control, but in your browser, and on every device on the network.
-- **Your whole team, always on** → **host it** on a Linux box, VM or Raspberry
-  Pi with one Docker command; everyone on the network opens one address, from
-  any device. No accounts.
-- **Already have Python?** → `pipx install "webatem[desktop]"`, then `webatem`.
+---
 
-Every way of running it **auto-discovers the ATEMs on your network**
-(Bonjour/mDNS) and lists them by name, exactly like ATEM Software Control.
-Open the page and they are already there:
+<details>
+<summary>Original WebATEM reference</summary>
 
-<p align="center">
-  <img src="docs/screenshot-connect.png" alt="WebATEM connect page: recent connections and the switchers found on the network, each listed by name and address" width="900">
-</p>
-
-<p align="center">
-  <img src="docs/screenshot-control.png" alt="WebATEM control surface: program/preview buses, T-bar, keyers, transitions and macros" width="900">
-</p>
+The sections below describe the original WebATEM project. Their installation commands, download links, and hardware test history apply to that project.
 
 ## What you get
 
@@ -477,3 +447,4 @@ Templates are overridden the Django way (a `base.html`, a
 `control.html` carries a `control_extra` block for the host's panels and
 scripts. Discovery is off with `discovery_enabled` returning False.
 
+</details>
