@@ -508,7 +508,7 @@ def test_the_startup_note_names_who_has_the_port(monkeypatch):
     try:
         assert sup.ready.wait(30)
         assert sup.port == wanted + 1 and _answers(sup.port)
-        assert sup.startup_note == f'Port {wanted} is in use by Companion, so WebATEM is on port {wanted + 1} this time.'
+        assert sup.startup_note == f'Port {wanted} is in use by Companion, so the server is on port {wanted + 1} this time.'
     finally:
         sup.stop()
         sup.join(20)

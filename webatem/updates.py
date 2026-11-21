@@ -43,7 +43,8 @@ import time
 import urllib.request
 from pathlib import Path
 
-FEED = 'https://api.github.com/repos/lucas-romanenko/webatem/releases/latest'
+# Leave the built-in updater off until webATEM.vs has a release feed.
+FEED: str | None = None
 FIRST_CHECK_AFTER = 20            # seconds after start: let the launcher come up first
 CHECK_EVERY = 12 * 3600
 
@@ -52,7 +53,7 @@ class UpdateError(Exception):
     """Something the window shows as it is."""
 
 
-def feed_url() -> str:
+def feed_url() -> str | None:
     # The build workflow points this at a local copy of a release to prove
     # the whole path on each OS.
     return os.environ.get('WEBATEM_UPDATE_FEED') or FEED
@@ -138,7 +139,10 @@ def _request(url):
 
 def check(timeout: float = 10) -> dict:
     """Ask the feed. Raises on no answer (the caller says it quietly)."""
-    with _open(feed_url(), timeout) as r:
+    url = feed_url()
+    if not url:
+        raise UpdateError('Updates are disabled in this build.')
+    with _open(url, timeout) as r:
         release = json.load(r)
     latest = str(release.get('tag_name') or '').lstrip('vV')
     name = asset_name()
@@ -250,7 +254,7 @@ def apply(path: Path, relaunch: bool = True) -> None:
     if sys.platform == 'darwin':
         bundle = uninstall.mac_app_bundle()
         if bundle is None:
-            raise UpdateError('This copy of WebATEM is not an installed app, so it cannot replace itself.')
+            raise UpdateError('This copy is not an installed app, so it cannot replace itself.')
         script = Path(getattr(sys, '_MEIPASS', '')) / 'desktop' / 'install-mac.sh'
         if not script.is_file():
             raise UpdateError('The installer that came with this app is missing; install the update from the download page.')
@@ -258,7 +262,7 @@ def apply(path: Path, relaunch: bool = True) -> None:
         shutil.copyfile(script, local)          # the script replaces the bundle it lives in
         dest = bundle.parent
         if not os.access(dest, os.W_OK):
-            raise UpdateError(f'WebATEM cannot replace itself in {dest} (no permission); '
+            raise UpdateError(f'The app cannot replace itself in {dest} (no permission); '
                               'install the update from the download page.')
         # Start the new version the way Finder does, through LaunchServices
         # (`open`). 1.7.2 exec'd the binary from this detached script, and
@@ -278,7 +282,7 @@ def apply(path: Path, relaunch: bool = True) -> None:
         return
     binary = uninstall.linux_binary()
     if binary is None:
-        raise UpdateError('This copy of WebATEM is not the downloaded program, so it cannot replace itself.')
+        raise UpdateError('This copy is not the downloaded program, so it cannot replace itself.')
     new = binary.with_name(binary.name + '.new')
     try:
         shutil.copyfile(path, new)
@@ -286,7 +290,7 @@ def apply(path: Path, relaunch: bool = True) -> None:
         os.replace(new, binary)                 # the running one keeps its open file; the next start is the new one
     except OSError as e:
         new.unlink(missing_ok=True)
-        raise UpdateError(f'WebATEM cannot write to {binary.parent} ({e.strerror or e}).')
+        raise UpdateError(f'The app cannot write to {binary.parent} ({e.strerror or e}).')
     if relaunch:
         _detached(['/bin/sh', '-c', _WAIT + 'exec "$1" --resume', str(os.getpid()), str(binary)], log)
 

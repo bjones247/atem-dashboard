@@ -164,7 +164,8 @@ jobs:
             macOS)   APP="dist/WebATEM.app/Contents/MacOS/webatem" ;;
             *)       APP="dist/webatem" ;;
           esac
-          "$APP" --update < /dev/null > tls-check.txt 2>&1
+          WEBATEM_UPDATE_FEED="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest" \
+            "$APP" --update < /dev/null > tls-check.txt 2>&1
           code=$?
           cat tls-check.txt
           case $code in

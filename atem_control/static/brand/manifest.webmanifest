@@ -1,6 +1,6 @@
 {
-  "name": "webATEM",
-  "short_name": "webATEM",
+  "name": "webATEM.vs",
+  "short_name": "webATEM.vs",
   "description": "Browser control for ATEM switchers.",
   "id": "/atem/",
   "start_url": "/atem/",

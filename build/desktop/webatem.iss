@@ -29,9 +29,10 @@
 ; {#SourcePath}, whose trailing-backslash behaviour differs between versions.
 
 #define MyAppName "WebATEM"
-#define MyAppPublisher "Lucas Romanenko"
+#define MyAppDisplayName "webATEM.vs"
+#define MyAppPublisher "webATEM.vs contributors"
 #define MyAppExeName "webatem.exe"
-#define MyAppURL "https://github.com/lucas-romanenko/webatem"
+#define MyAppURL "https://github.com/bjones247/webatem.vs"
 ; version.iss is written by the build (a single #define); a bare checkout
 ; compiles without it.
 #ifexist "version.iss"
@@ -45,9 +46,9 @@
 ; A fixed AppId is what makes the next version replace this one instead of
 ; installing beside it. Never change it.
 AppId={{8F3C6B21-4F0E-4C5E-9A9C-6C1E0E6A51D7}
-AppName={#MyAppName}
+AppName={#MyAppDisplayName}
 AppVersion={#MyVersion}
-AppVerName={#MyAppName} {#MyVersion}
+AppVerName={#MyAppDisplayName} {#MyVersion}
 AppPublisher={#MyAppPublisher}
 AppCopyright=Lucas Romanenko. MIT, and bundles atemwire and pystray under LGPL-3.0.
 AppPublisherURL={#MyAppURL}
@@ -56,7 +57,7 @@ AppUpdatesURL={#MyAppURL}/releases
 VersionInfoVersion={#MyVersion}
 SourceDir=..\..
 DefaultDirName={autopf}\{#MyAppName}
-DefaultGroupName={#MyAppName}
+DefaultGroupName={#MyAppDisplayName}
 DisableProgramGroupPage=yes
 DisableDirPage=yes
 PrivilegesRequired=lowest
@@ -68,7 +69,7 @@ OutputDir=out
 OutputBaseFilename=webatem-windows-x64-setup
 SetupIconFile=build\desktop\icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
-UninstallDisplayName={#MyAppName}
+UninstallDisplayName={#MyAppDisplayName}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
@@ -87,11 +88,11 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 Source: "dist\WebATEM\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{group}\{#MyAppDisplayName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{autodesktop}\{#MyAppDisplayName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "Start {#MyAppName}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Description: "Start {#MyAppDisplayName}"; Flags: nowait postinstall skipifsilent
 ; A one-click update runs this installer silently (webatem/updates.py) with
 ; /relaunch=1: start WebATEM again, on the interface it was serving
 ; (--resume). The entry above is the checkbox on an interactive install,

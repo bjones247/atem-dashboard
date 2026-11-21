@@ -21,7 +21,7 @@ services:
       - WEBSOCKET_ALLOWED_ORIGINS=${WEBSOCKET_ALLOWED_ORIGINS:-}
       - TIME_ZONE=${TIME_ZONE:-UTC}
       - TIME_FORMAT_24HR=${TIME_FORMAT_24HR:-True}
-      - APP_TITLE=${APP_TITLE:-WebATEM}
+      - APP_TITLE
       - PORT=${PORT:-8880}
     volumes:
       - webatem-data:/app/data

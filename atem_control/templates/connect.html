@@ -2,7 +2,7 @@
 {% extends "base.html" %}
 {% load static static_v %}
 
-{% block title %}Connect to ATEM{% endblock %}
+{% block title %}Connect to ATEM - {{ app_title }}{% endblock %}
 
 {% block extra_css %}
 <link rel="stylesheet" href="{% static_v 'css/atem_connect.css' %}">
@@ -17,7 +17,7 @@
             <div class="text-center mb-6 relative">
                 <div class="flex items-center justify-center gap-[14px] mb-3">
                     <span class="brand-mark" style="width:44px;height:44px">{% include "brand/_mark.svg" %}</span>
-                    <span class="brand-wordmark" style="font-size:30px"><span>web</span>ATEM</span>
+                    <span class="brand-wordmark" style="font-size:30px">{% include "brand/_wordmark.html" %}</span>
                 </div>
                 <p style="color:var(--text-muted)">Browser control for ATEM switchers.</p>
             </div>

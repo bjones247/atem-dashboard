@@ -40,16 +40,36 @@ def test_fonts_and_licences_ship():
 
 @pytest.mark.django_db
 def test_pages_carry_the_brand(client):
+    description = 'an ATEM M/E and virtual switcher based on '
+    credit = 'webATEM</a> by Lucas Romanenko'
     launcher = client.get('/launcher/').content.decode()
-    assert 'brand-wordmark' in launcher and 'Made by Lucas Romanenko' in launcher
+    assert '<title>webATEM.vs</title>' in launcher
+    assert 'brand-wordmark' in launcher and '<span>web</span>ATEM.vs' in launcher
+    assert '<span class="ver">v1.1.0</span>' in launcher
+    assert description in launcher and credit in launcher
+    assert 'Uninstall webATEM.vs?' in launcher
     assert '<svg' in launcher                                    # the inline mark
     connect = client.get('/atem/').content.decode()
+    assert '<title>Connect to ATEM - webATEM.vs</title>' in connect
+    assert '<span>web</span>ATEM.vs' in connect
     assert 'brand/brand.css' in connect and 'brand/favicon.ico' in connect
     assert 'Browser control for ATEM switchers.' in connect
     # The independence line is the README's (Lucas, 2026-09-14): an operator
     # driving a switcher is not the audience for it, and it read as clutter
     # on both surfaces.
     assert 'Not affiliated' not in connect
+    for url, title in (
+        ('/atem/control/', 'ATEM Control Panel'),
+        ('/atem/live/?ip=192.0.2.4', 'Virtual Switchers'),
+        ('/atem/dashboard/', 'Production Dashboard'),
+    ):
+        html = client.get(url).content.decode()
+        assert f'<title>{title} - webATEM.vs</title>' in html
+        assert 'aria-label="webATEM.vs"' in html
+        if url != '/atem/dashboard/':
+            assert '<h3 class="font-bold mb-1">webATEM.vs <span class="font-mono font-normal text-base-content/60">v1.1.0</span></h3>' in html
+            assert description in html and credit in html
+            assert 'href="https://github.com/lucas-romanenko/webatem"' in html
 
 
 def test_tray_image_per_platform(monkeypatch):
@@ -67,7 +87,7 @@ def test_the_app_installs_to_a_home_screen_as_itself():
     including a maskable one for Android's launcher shapes."""
     import json
     manifest = json.loads((BRAND / 'manifest.webmanifest').read_text())
-    assert manifest['name'] == 'webATEM' and manifest['short_name'] == 'webATEM'
+    assert manifest['name'] == 'webATEM.vs' and manifest['short_name'] == 'webATEM.vs'
     assert manifest['start_url'] == '/atem/' and manifest['display'] == 'standalone'
     purposes = {i.get('purpose') for i in manifest['icons']}
     assert 'maskable' in purposes, 'Android crops a non-maskable icon to a circle'
@@ -82,7 +102,8 @@ def test_the_pages_point_at_the_manifest(client):
     html = client.get('/atem/').content.decode()
     assert 'rel="manifest"' in html and 'brand/manifest.webmanifest' in html
     assert 'apple-touch-icon' in html
-    assert 'webATEM' in html          # the tab, the home screen label
+    assert 'name="application-name" content="webATEM.vs"' in html
+    assert 'name="apple-mobile-web-app-title" content="webATEM.vs"' in html
 
 
 @pytest.mark.django_db

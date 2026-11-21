@@ -130,7 +130,7 @@ MEDIA_ROOT = DATA_DIR / 'uploads'
 mimetypes.add_type('application/manifest+json', '.webmanifest')
 WHITENOISE_MIMETYPES = {'.webmanifest': 'application/manifest+json'}
 
-APP_TITLE = os.getenv('APP_TITLE', 'webATEM')      # the wordmark's spelling: tab, home screen, installed app
+APP_TITLE = os.getenv('APP_TITLE', 'webATEM.vs')
 
 # The seam for a platform hosting the ATEM control app (atem_control/hooks.py):
 # a dotted path to a Hooks subclass. Unset = standalone WebATEM's defaults.
