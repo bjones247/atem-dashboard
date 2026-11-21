@@ -31,6 +31,12 @@ def configuration_update_block_reason(connection):
     with _lock:
         operations = _operations.get(connection, {})
         if any(key[0] == 'aux' for key in operations):
+            mx, _reason = _raw(connection)
+            if mx is not None:
+                for key in list(operations):
+                    if key[0] == 'aux':
+                        _pending(connection, key, _source(mx, 'aux-output-source', key[1]))
+        if any(key[0] == 'aux' for key in operations):
             return 'A physical output route is pending or unconfirmed; review hardware state before saving configuration.'
         return None
 
@@ -926,7 +932,8 @@ def take_all_readiness(connection, data, config_snapshot, require_current_revisi
             return 'M/E next-transition selection changed; review it before TAKE ALL.', None
         primary_data = {'me': 0, 'expected_program': me['program'], 'expected_preview': me['preview']}
         reason, _program, _preview = me_cut_readiness(connection)
-        if reason:
+        primary_skipped = reason == 'M/E Preview is already live; select a different Preview source.'
+        if reason and not primary_skipped:
             return reason, None
 
         projection = _route_projection(connection, mx, config_snapshot, revision)
@@ -967,11 +974,16 @@ def take_all_readiness(connection, data, config_snapshot, require_current_revisi
             else:
                 cut_data['expected_live'] = expected.get('live')
             reason, group_plan = _virtual_group_cut_plan(connection, cut_data, config_snapshot)
+            if reason == 'The selected source is already live.':
+                virtual[group_id] = {'status': 'skipped', 'channels': []}
+                continue
             if reason:
                 return f'{group_id}: {reason}', None
             virtual[group_id] = group_plan
+        if primary_skipped and all(group.get('status') == 'skipped' for group in virtual.values()):
+            return 'Preview is already live on every switcher; select a different Preview source.', None
         return None, {'device_id': device_id, 'revision': revision,
-                      'primary': primary_data, 'virtual': virtual}
+                      'primary': None if primary_skipped else primary_data, 'virtual': virtual}
 
 
 def dispatch_take_all(connection, data, config_snapshot, require_current_revision=False):
@@ -982,11 +994,14 @@ def dispatch_take_all(connection, data, config_snapshot, require_current_revisio
         if reason:
             return False, reason
 
-        primary_ok, primary_error = dispatch_me_cut(connection, plan['primary'])
-        primary = {'ok': primary_ok, 'action': 'cut', 'command': 'cut',
-                   'before': plan['primary']['expected_program'],
-                   'target': plan['primary']['expected_preview'],
-                   'error': primary_error if not primary_ok else ''}
+        if plan['primary'] is None:
+            primary = {'status': 'skipped', 'ok': True, 'action': 'cut'}
+        else:
+            primary_ok, primary_error = dispatch_me_cut(connection, plan['primary'])
+            primary = {'ok': primary_ok, 'action': 'cut', 'command': 'cut',
+                       'before': plan['primary']['expected_program'],
+                       'target': plan['primary']['expected_preview'],
+                       'error': primary_error if not primary_ok else ''}
 
         virtual = {}
         for group_id in ('virtual1', 'virtual2'):

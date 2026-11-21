@@ -326,9 +326,7 @@ document.addEventListener('alpine:init', () => {
                                 operation.error = 'Hardware routes changed, but the saved Program target was not updated.';
                             }
                         } else if (typeof this.configSavePurpose === 'string' && this.configSavePurpose.startsWith('take-all:') && this.takeAllOperation) {
-                            this.takeAllOperation.status = 'confirmed_config_failed';
-                            this.takeAllOperation.error = data.message || 'Hardware changes were confirmed, but switcher state was not saved.';
-                            this.assignmentBusy = false;
+                            this.failTakeAllConfig(data.message || 'Hardware changes were confirmed, but switcher state was not saved.');
                         }
                         this.configSavePurpose = null;
                         this.configSaveExpected = null;
@@ -1336,6 +1334,7 @@ document.addEventListener('alpine:init', () => {
             if (this.configSavePurpose) {
                 const matchesPendingSave = JSON.stringify(this.configSaveExpected) === JSON.stringify(data.config);
                 if (matchesPendingSave) {
+                    const completedSavePurpose = this.configSavePurpose;
                     if (this.routeBatch?.savingConfig) {
                         const batchError = this.routeBatch.error;
                         this.routeBatch = null;
@@ -1351,7 +1350,9 @@ document.addEventListener('alpine:init', () => {
                     else if (this.configSavePurpose.startsWith('group-align:')) this.finishGroupAlignConfig(data);
                     else if (this.configSavePurpose.startsWith('take-all:')) this.finishTakeAllConfig(data);
                     else this.configSavePurpose = null;
-                    this.configSaveExpected = null;
+                    if (!this.configSavePurpose || this.configSavePurpose === completedSavePurpose) {
+                        this.configSaveExpected = null;
+                    }
                 } else {
                     const message = 'Another dashboard session changed the configuration first. Review the refreshed settings; confirmed hardware routes are shown separately.';
                     if (this.routeBatch?.savingConfig) {
@@ -1374,9 +1375,7 @@ document.addEventListener('alpine:init', () => {
                             operation.error = message;
                         }
                     } else if (this.configSavePurpose.startsWith('take-all:') && this.takeAllOperation) {
-                        this.takeAllOperation.status = 'confirmed_config_failed';
-                        this.takeAllOperation.error = message;
-                        this.assignmentBusy = false;
+                        this.failTakeAllConfig(message);
                     }
                     this.dashboardConfigError = message;
                     this.configSavePurpose = null;
@@ -1444,9 +1443,13 @@ document.addEventListener('alpine:init', () => {
             const alignment = this.groupAlignOperations[groupId];
             const cut = this.groupCutOperations[groupId];
             const active = status => ['pending', 'partial', 'unconfirmed', 'saving'].includes(status);
+            const confirmedTakeAllAwaitingSave = cut?.status === 'confirmed' && !cut.configSaved &&
+                Number.isInteger(cut.takeAllId) &&
+                cut.takeAllId === this.takeAllOperation?.id &&
+                ['preflight', 'pending', 'unconfirmed', 'saving'].includes(this.takeAllOperation.status);
             const configFailedOnCurrentRoute = operation => operation?.status === 'confirmed_config_failed' &&
                 group.routeStatus === 'uniform' && group.liveSourceId === operation.target;
-            const operation = active(cut?.status) ? cut : active(alignment?.status) ? alignment
+            const operation = active(cut?.status) || confirmedTakeAllAwaitingSave ? cut : active(alignment?.status) ? alignment
                 : configFailedOnCurrentRoute(cut) ? cut
                     : configFailedOnCurrentRoute(alignment) ? alignment : null;
             if (!group.outputIds.length && !operation) return null;
@@ -1533,9 +1536,7 @@ document.addEventListener('alpine:init', () => {
                         operation.error = 'Output routes are confirmed, but the saved Program target result is unknown.';
                     }
                 } else if (typeof this.configSavePurpose === 'string' && this.configSavePurpose.startsWith('take-all:') && this.takeAllOperation) {
-                    this.takeAllOperation.status = 'confirmed_config_failed';
-                    this.takeAllOperation.error = this.dashboardConfigError;
-                    this.assignmentBusy = false;
+                    this.failTakeAllConfig(this.dashboardConfigError);
                 }
                 this.configSavePurpose = null;
                 this.configSaveExpected = null;
@@ -2054,6 +2055,14 @@ document.addEventListener('alpine:init', () => {
             if (!this.hardwareReady || !this.dashboardConfig) return 'Switcher or saved configuration is unavailable.';
             if (this.dashboardConfigDeviceId !== this.routingProjection?.deviceId) return 'Verified switcher settings are unavailable.';
             if (this.outputMappingError) return this.outputMappingError;
+            if (this.takeAllOperation && ['preflight', 'pending', 'unconfirmed', 'saving'].includes(this.takeAllOperation.status)) {
+                return this.takeAllOperation.status === 'saving'
+                    ? 'TAKE ALL is saving confirmed switcher state.'
+                    : 'TAKE ALL is awaiting hardware confirmation.';
+            }
+            if (this.takeAllOperation?.status === 'confirmed_config_failed') {
+                return 'TAKE ALL saved switcher state failed; reload and review before another CUT.';
+            }
             if (this.dashboardConfigSaving || this.assignmentBusy) return 'A settings update or output ownership change is pending.';
             if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return 'Dashboard connection is not ready.';
             const pending = this.groupCutOperations[groupId];
@@ -2102,7 +2111,13 @@ document.addEventListener('alpine:init', () => {
             if (this.outputMappingError) return this.outputMappingError;
             if (this.dashboardConfigDeviceId !== this.routingProjection?.deviceId) return 'Verified switcher identity/configuration is unavailable.';
             if (this.takeAllOperation && ['preflight', 'pending', 'unconfirmed', 'saving'].includes(this.takeAllOperation.status)) {
-                return 'A previous TAKE ALL is still pending or unconfirmed; review its results first.';
+                if (this.takeAllOperation.status === 'preflight') return 'A previous TAKE ALL is awaiting server preflight.';
+                if (this.takeAllOperation.status === 'saving') return 'A previous TAKE ALL is saving confirmed switcher state.';
+                if (this.takeAllOperation.status === 'unconfirmed') return 'A previous TAKE ALL has unconfirmed results; review each affected output.';
+                return 'A previous TAKE ALL is awaiting hardware confirmation.';
+            }
+            if (this.takeAllOperation?.status === 'confirmed_config_failed') {
+                return 'TAKE ALL changed hardware routes, but saved switcher state failed; reload and review before another TAKE.';
             }
             if (this.dashboardConfigSaving || this.assignmentBusy) return 'A configuration or output operation is already in progress.';
             const conflicts = this.routingProjection?.conflicts || [];
@@ -2116,7 +2131,10 @@ document.addEventListener('alpine:init', () => {
                 return 'A Primary Preview or transition-style change is pending or unconfirmed.';
             }
             const primaryReason = this.primaryCutReason();
-            if (primaryReason) return primaryReason;
+            const primarySkipped = primaryReason === 'M/E Preview is already live; select a different Preview source.' ||
+                primaryReason === 'M/E Preview is already live.';
+            if (primaryReason && !primarySkipped) return primaryReason;
+            let ready = !primarySkipped;
             for (const groupId of ['virtual1', 'virtual2']) {
                 const group = this.routingProjection?.groups?.[groupId];
                 if (!group || !Array.isArray(group.outputIds)) return `${this.switcherName(groupId, groupId)} routing state is unavailable.`;
@@ -2126,9 +2144,11 @@ document.addEventListener('alpine:init', () => {
                     return `${this.switcherName(groupId, groupId)} has a pending or unresolved route operation.`;
                 }
                 const reason = this.groupCutReason(groupId);
+                if (reason === 'The selected source is already live.') continue;
                 if (reason) return `${this.switcherName(groupId, groupId)}: ${reason}`;
+                ready = true;
             }
-            return '';
+            return ready ? '' : 'Preview is already live on every switcher; select a different Preview source.';
         },
 
         takeAll() {
@@ -2143,20 +2163,26 @@ document.addEventListener('alpine:init', () => {
                 const group = this.routingProjection.groups[groupId];
                 groups[groupId] = { routes: this.groupRouteSnapshot(group), preview: group.previewSourceId };
             }
-            const primary = { status: 'pending', before: this.hardwareProgramSourceId,
+            const primarySkipped = this.hardwareProgramSourceId === this.hardwarePreviewSourceId;
+            const primary = { status: primarySkipped ? 'skipped' : 'pending', before: this.hardwareProgramSourceId,
                 target: this.hardwarePreviewSourceId, error: '' };
             this.takeAllOperation = { id, status: 'preflight', primary,
                 virtual1: { status: groups.virtual1 ? 'pending' : 'failed', outputIds: this.routingProjection.groups.virtual1.outputIds.slice(), channels: [] },
                 virtual2: { status: groups.virtual2 ? 'pending' : 'failed', outputIds: this.routingProjection.groups.virtual2.outputIds.slice(), channels: [] },
                 started: false, configSaved: false, error: '' };
             this.assignmentBusy = true;
-            this.primaryActionPending = { kind: 'take_all', takeAllId: id,
-                target: primary.target, before: primary.before };
-            this.armPrimaryOperationTimeout();
+            if (!primarySkipped) {
+                this.primaryActionPending = { kind: 'take_all', takeAllId: id,
+                    target: primary.target, before: primary.before };
+                this.armPrimaryOperationTimeout();
+            }
             for (const groupId of ['virtual1', 'virtual2']) {
                 const participant = this.takeAllOperation[groupId];
-                if (!participant.outputIds.length) { participant.status = 'skipped'; continue; }
                 const group = this.routingProjection.groups[groupId];
+                if (!participant.outputIds.length || group.previewSourceId === group.liveSourceId) {
+                    participant.status = 'skipped';
+                    continue;
+                }
                 const operation = this.groupCutOperations[groupId] = {
                         status: 'pending', target: group.previewSourceId, previous: group.liveSourceId,
                         showMismatchWhilePending: groups[groupId].routes.some(route => route.source !== group.savedProgramTargetId),
@@ -2231,9 +2257,11 @@ document.addEventListener('alpine:init', () => {
             operation.timer = null;
             operation.started = true;
             const primary = data.primary || {};
-            operation.primary.before = primary.before;
-            operation.primary.target = primary.target;
-            operation.primary.status = primary.ok ? 'pending' : 'failed';
+            if (primary.status !== 'skipped') {
+                operation.primary.before = primary.before;
+                operation.primary.target = primary.target;
+            }
+            operation.primary.status = primary.status === 'skipped' ? 'skipped' : (primary.ok ? 'pending' : 'failed');
             operation.primary.error = primary.error || '';
             if (!primary.ok && this.primaryActionPending?.takeAllId === operation.id) {
                 this.primaryActionPending = null;
@@ -2263,30 +2291,25 @@ document.addEventListener('alpine:init', () => {
                 }
                 const groupOperation = this.groupCutOperations[groupId];
                 if (!groupOperation || groupOperation.takeAllId !== operation.id) continue;
-                groupOperation.target = result.target;
-                groupOperation.previous = result.previous;
                 groupOperation.status = result.status === 'partial' ? 'partial' : 'pending';
                 participant.status = result.status === 'partial' ? 'partial' : 'pending';
                 participant.target = result.target;
                 participant.previous = result.previous;
                 participant.channels = groupOperation.channels;
-                for (const outcome of result.outcomes || []) {
-                    const item = groupOperation.channels.find(channel => channel.channel === outcome.channel);
-                    if (!item) continue;
-                    if (Number.isInteger(outcome.before)) item.before = outcome.before;
-                    item.status = outcome.ok ? 'pending' : 'failed';
-                    item.error = outcome.error || '';
-                }
+                this.recordGroupCutAcceptance(groupOperation, result);
             }
             this.reconcileThreeC();
+            this.tryFinalizeTakeAll();
         },
 
         tryFinalizeTakeAll() {
             const operation = this.takeAllOperation;
-            if (!operation?.started || ['complete', 'failed', 'confirmed_config_failed'].includes(operation.status)) return;
+            if (!operation?.started || ['complete', 'failed', 'saving', 'confirmed_config_failed'].includes(operation.status)) return;
             for (const groupId of ['virtual1', 'virtual2']) {
                 const groupOperation = this.groupCutOperations[groupId];
-                if (groupOperation?.takeAllId === operation.id && groupOperation.channels?.some(item =>
+                if (groupOperation?.takeAllId === operation.id &&
+                    ['pending', 'partial', 'unconfirmed'].includes(groupOperation.status) &&
+                    groupOperation.channels?.some(item =>
                     ['pending', 'dispatching', 'unconfirmed'].includes(item.status))) {
                     operation[groupId].status = groupOperation.channels.some(item => item.status === 'unconfirmed') ? 'unconfirmed' : 'pending';
                 }
@@ -2299,19 +2322,16 @@ document.addEventListener('alpine:init', () => {
             const confirmedGroups = ['virtual1', 'virtual2'].filter(groupId =>
                 operation[groupId].status === 'confirmed' && !operation[groupId].configSaved);
             if (confirmedGroups.length) {
+                const groupId = confirmedGroups[0];
                 const config = JSON.parse(JSON.stringify(this.dashboardConfig.config));
-                for (const groupId of confirmedGroups) {
-                    const participant = operation[groupId];
-                    const group = config.virtualSwitchers[groupId];
-                    this.applyConfirmedGroupTake(group, participant.target, participant.previous);
-                }
+                const participant = operation[groupId];
+                this.applyConfirmedGroupTake(config.virtualSwitchers[groupId], participant.target, participant.previous);
                 operation.status = 'saving';
-                operation.configSaveGroups = confirmedGroups;
-                this.configSavePurpose = `take-all:${operation.id}`;
+                operation.configSaveGroup = groupId;
+                this.configSavePurpose = `take-all:${operation.id}:${groupId}`;
                 if (!this.sendDashboardConfig(config, this.configSavePurpose)) {
-                    operation.status = 'confirmed_config_failed';
-                    operation.error = 'Hardware changes were confirmed, but the saved virtual switcher state could not be updated.';
-                    this.assignmentBusy = false;
+                    this.failTakeAllConfig('Hardware changes were confirmed, but the saved virtual switcher state could not be updated.');
+                    this.configSavePurpose = null;
                     this.showError(operation.error);
                 }
                 return;
@@ -2322,12 +2342,34 @@ document.addEventListener('alpine:init', () => {
         finishTakeAllConfig() {
             this.configSavePurpose = null;
             if (this.takeAllOperation) {
-                this.takeAllOperation.configSaved = true;
-                for (const groupId of this.takeAllOperation.configSaveGroups || []) this.takeAllOperation[groupId].configSaved = true;
-                this.takeAllOperation.configSaveGroups = [];
+                const groupId = this.takeAllOperation.configSaveGroup;
+                if (groupId) {
+                    this.takeAllOperation[groupId].configSaved = true;
+                    const groupOperation = this.groupCutOperations[groupId];
+                    if (groupOperation?.takeAllId === this.takeAllOperation.id) groupOperation.configSaved = true;
+                }
+                this.takeAllOperation.configSaveGroup = null;
+                this.takeAllOperation.status = 'pending';
             }
             this.configSaveExpected = null;
-            this.finishTakeAll();
+            this.tryFinalizeTakeAll();
+        },
+
+        failTakeAllConfig(message) {
+            const operation = this.takeAllOperation;
+            if (!operation) return;
+            operation.status = 'confirmed_config_failed';
+            operation.error = message;
+            const groupId = operation.configSaveGroup;
+            if (groupId) {
+                operation[groupId].error = message;
+                const groupOperation = this.groupCutOperations[groupId];
+                if (groupOperation?.takeAllId === operation.id) {
+                    groupOperation.status = 'confirmed_config_failed';
+                    groupOperation.error = message;
+                }
+            }
+            this.assignmentBusy = false;
         },
 
         finishTakeAll() {
@@ -2388,6 +2430,11 @@ document.addEventListener('alpine:init', () => {
             const operation = this.groupCutOperations[data.group_id];
             if (!operation) return;
             if (operation.mode === 'direct' && (data.mode !== 'direct' || data.target !== operation.target)) return;
+            this.recordGroupCutAcceptance(operation, data);
+            this.reconcileThreeC();
+        },
+
+        recordGroupCutAcceptance(operation, data) {
             operation.accepted = true;
             operation.target = data.target; operation.previous = data.previous;
             for (const outcome of data.outcomes || []) {
@@ -2396,7 +2443,6 @@ document.addEventListener('alpine:init', () => {
                 if (Number.isInteger(outcome.before)) item.before = outcome.before;
                 item.status = outcome.ok ? 'pending' : 'failed'; item.error = outcome.error || '';
             }
-            this.reconcileThreeC();
         },
 
         finishGroupCutConfig() {
@@ -2561,6 +2607,7 @@ document.addEventListener('alpine:init', () => {
                     this.primaryActionPending = null;
                     if (this.primaryActionTimer !== null) clearTimeout(this.primaryActionTimer);
                     this.primaryActionTimer = null;
+                    if (op.takeAllId) this.tryFinalizeTakeAll();
                 } else if (this.hardwareProgramSourceId !== null && this.hardwareProgramSourceId !== op.before && this.hardwareProgramSourceId !== op.target) {
                     op.unconfirmed = true;
                     if (op.takeAllId && this.takeAllOperation?.id === op.takeAllId) {
@@ -2733,9 +2780,7 @@ document.addEventListener('alpine:init', () => {
                         operation.error = this.dashboardConfigError;
                     }
                 } else if (typeof this.configSavePurpose === 'string' && this.configSavePurpose.startsWith('take-all:') && this.takeAllOperation) {
-                    this.takeAllOperation.status = 'confirmed_config_failed';
-                    this.takeAllOperation.error = this.dashboardConfigError;
-                    this.assignmentBusy = false;
+                    this.failTakeAllConfig(this.dashboardConfigError);
                 }
                 this.configSavePurpose = null;
                 this.configSaveExpected = null;

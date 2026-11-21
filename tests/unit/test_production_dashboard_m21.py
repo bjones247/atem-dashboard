@@ -126,6 +126,22 @@ def _take_all_request(action='cut'):
                        'virtual2': {'live': 2, 'preview': 1}}}
 
 
+def test_assignment_dialog_layout_and_hidden_cut_feedback():
+    template = (Path(__file__).resolve().parents[2] / 'atem_control' / 'templates' / 'dashboard.html').read_text()
+    assert 'grid-template-columns: 4.5rem 5rem minmax(9rem, 1fr) 7rem' in template
+    assert '<span>SELECT</span><span>Output</span><span>Current Output Source</span><span>Switcher</span>' in template
+    assert "other: 'Unswitched'" in template
+    dialog = template[template.index('aria-label="Change output assignments"'):]
+    assert dialog.index('>Save</button>') < dialog.index('>Cancel</button>')
+    assert 'Review TAKE ALL results' not in template
+    assert '.production-dashboard .cut-feedback-hidden { display: none !important; }' in template
+    assert template.count('class="cut-reason cut-feedback-hidden') == 3
+    assert 'class="cut-feedback-hidden text-warning" role="status"' in template
+    assert template.count('class="cut-feedback-hidden basis-full text-[10px] text-warning"') == 2
+    assert ':title="assignmentChangeReason() ||' in template
+    assert ':title="takeAllReason() ||' in template
+
+
 def _key_only_auto_payload():
     return {'me': 0, 'expected_program': 1, 'expected_preview': 2,
             'expected_selection': {'background': False, 'key1': True, 'key2': False,
@@ -240,6 +256,56 @@ def test_take_all_dispatches_primary_and_both_virtual_groups_once(monkeypatch):
         ('cut', None), ('set_aux_output', 1), ('set_aux_output', 2)]
 
 
+def test_take_all_skips_already_live_participants_and_requires_one_change(monkeypatch):
+    c = _three_c_connection()
+    config = _three_c_config(
+        virtual1={'outputs': [1], 'previewSource': 1, 'programTarget': 1},
+        virtual2={'outputs': [2], 'previewSource': 1, 'programTarget': 2})
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda _c, command, data: sent.append((command, data)) or (True, None))
+
+    request = _take_all_request()
+    request['groups']['virtual1']['preview'] = 1
+    ok, result = switching.dispatch_take_all(c, request, config)
+    assert ok
+    assert result['virtual']['virtual1']['status'] == 'skipped'
+    assert [(command, data.get('aux_channel')) for command, data in sent] == [
+        ('cut', None), ('set_aux_output', 2)]
+
+    c = _three_c_connection()
+    c.mixerstate['preview-bus-input'][0].source = 1
+    request = {**request, 'expected_preview': 1}
+    sent.clear()
+    ok, result = switching.dispatch_take_all(c, request, config)
+    assert ok
+    assert result['primary']['status'] == 'skipped'
+    assert [(command, data.get('aux_channel')) for command, data in sent] == [('set_aux_output', 2)]
+
+    c = _three_c_connection()
+    c.mixerstate['preview-bus-input'][0].source = 1
+    config['config']['virtualSwitchers']['virtual2']['previewSource'] = 2
+    request['groups']['virtual2']['preview'] = 2
+    sent.clear()
+    ok, reason = switching.dispatch_take_all(c, request, config)
+    assert not ok and 'already live on every switcher' in reason
+    assert sent == []
+
+
+def test_config_save_reconciles_confirmed_take_all_routes_before_blocking():
+    c = _three_c_connection()
+    switching._record(c, ('aux', 1), 1, 2)
+    switching._record(c, ('aux', 2), 2, 1)
+    assert switching.configuration_update_block_reason(c)
+
+    c.mixerstate['aux-output-source'][1].source = 2
+    assert switching.configuration_update_block_reason(c)
+    assert ('aux', 1) not in switching._operations[c]
+
+    c.mixerstate['aux-output-source'][2].source = 1
+    assert switching.configuration_update_block_reason(c) is None
+    assert not any(key[0] == 'aux' for key in switching._operations[c])
+
+
 def test_take_all_consumer_uses_guarded_dispatch_and_returns_per_switcher_results(monkeypatch):
     c = _three_c_connection()
     config = _three_c_config()
@@ -266,6 +332,45 @@ def test_take_all_consumer_uses_guarded_dispatch_and_returns_per_switcher_result
 
     assert calls and calls[0][1] == {'require_current_revision': True}
     assert consumer.sent == [{'type': 'dashboard_take_all_started', **outcome}]
+
+
+def test_take_all_consumer_reports_virtual_cuts_when_primary_is_skipped(monkeypatch):
+    c = _three_c_connection()
+    c.mixerstate['preview-bus-input'][0].source = 1
+    config = _three_c_config(
+        virtual1={'outputs': [1], 'previewSource': 2, 'programTarget': 1},
+        virtual2={'outputs': [2], 'previewSource': 1, 'programTarget': 2})
+    request = {**_take_all_request(), 'expected_preview': 1}
+    dispatched = []
+    monkeypatch.setattr(dashboard_config, 'get_config_for_connection', lambda _connection: config)
+    monkeypatch.setattr(switching, 'dispatch',
+                        lambda _connection, command, payload: dispatched.append((command, payload)) or (True, None))
+    consumer = ATEMConsumer.__new__(ATEMConsumer)
+    consumer.connection = c
+    consumer.sent = []
+    logged = []
+    consumer._record_atem_command = lambda command, payload: logged.append((command, payload))
+
+    async def ensure_config(force_reload=False):
+        assert force_reload
+        return config
+
+    async def send_json(data):
+        consumer.sent.append(data)
+
+    consumer._ensure_dashboard_config = ensure_config
+    consumer.send_json = send_json
+    asyncio.run(consumer.execute_command('dashboard_take_all', request))
+
+    assert [command for command, _payload in dispatched] == ['set_aux_output', 'set_aux_output']
+    assert [command for command, _payload in logged] == ['set_aux_output', 'set_aux_output']
+    assert [payload['input_source'] for _command, payload in logged] == [2, 1]
+    assert len(consumer.sent) == 1
+    response = consumer.sent[0]
+    assert response['type'] == 'dashboard_take_all_started'
+    assert response['primary']['status'] == 'skipped'
+    assert response['virtual']['virtual1']['status'] == 'pending'
+    assert response['virtual']['virtual2']['status'] == 'pending'
 
 
 def test_take_all_uses_cut_with_a_non_cut_style_and_skips_empty_groups(monkeypatch):
@@ -1218,21 +1323,9 @@ window.addEventListener('load', async () => {
     await Alpine.nextTick();
     await new Promise(resolve => setTimeout(resolve, 50));
     const takeAllResultElement = takeAllCard.querySelector('[aria-live="polite"]');
-    for (let attempt = 0; attempt < 5; attempt++) {
-      if (getComputedStyle(takeAllResultElement).display !== 'none') break;
-      await new Promise(resolve => setTimeout(resolve, 50));
-      await Alpine.nextTick();
-    }
-    const takeAllResultVisible = getComputedStyle(takeAllResultElement).display !== 'none';
-    const takeAllResultText = takeAllCard.querySelector('[aria-live="polite"]').textContent;
-    const takeAllOuter = takeAllCard.querySelector('div[x-show="takeAllOperation"]');
-    const takeAllResultDebug = {display: getComputedStyle(takeAllResultElement).display,
-      outerDisplay: getComputedStyle(takeAllOuter).display,
-      outerExpression: Alpine.evaluate(takeAllOuter, takeAllOuter.getAttribute('x-show')),
-      resultExpression: Alpine.evaluate(takeAllResultElement, takeAllResultElement.getAttribute('x-show')),
-      cloaked: takeAllResultElement.hasAttribute('x-cloak'),
-      operationStatus: dashboard.takeAllOperation?.status, started: dashboard.takeAllOperation?.started,
-      reason: dashboard.takeAllReason(), style: takeAllResultElement.getAttribute('style')};
+    const takeAllPendingWithoutResultPanel = dashboard.takeAllOperation?.status === 'pending' &&
+      getComputedStyle(takeAllResultElement).display === 'none' &&
+      !takeAllCard.textContent.includes('Review TAKE ALL results');
     const otherRow = root.querySelector('.other-output-list-inner');
     const otherOverflow = getComputedStyle(otherRow.closest('.other-output-list')).overflowX;
     const otherDirectButtons = otherRow.querySelectorAll('.route-source-grid button').length > 0 &&
@@ -1248,7 +1341,7 @@ window.addEventListener('load', async () => {
       primaryCancelled, staleDisabled, staleReason, topologyDisabled, topologyReason,
       configErrorDisabled, configErrorReason, primaryOwnsConflictedOutput, conflictExcludedFromVirtual,
       primaryVisibilityDebug, takeAllReady, takeAllCommand, tiedTakeAllBlocked,
-      takeAllResultVisible, takeAllResultText, takeAllResultDebug, otherOverflow, otherDirectButtons,
+      takeAllPendingWithoutResultPanel, otherOverflow, otherDirectButtons,
       primaryLiveStyle, virtualLiveStyle, outputBadgeStyle,
     });
   } catch (error) {
@@ -1304,8 +1397,7 @@ window.addEventListener('load', async () => {
     assert observed['takeAllReady'] is True
     assert observed['takeAllCommand']['primary_action'] == 'cut'
     assert observed['tiedTakeAllBlocked'] is True
-    assert observed['takeAllResultVisible'] is True, observed['takeAllResultDebug']
-    assert 'pending' in observed['takeAllResultText']
+    assert observed['takeAllPendingWithoutResultPanel'] is True
     assert observed['otherOverflow'] == 'auto'
     assert observed['otherDirectButtons'] is True
     for style in (observed['primaryLiveStyle'], observed['virtualLiveStyle']):
@@ -1318,7 +1410,7 @@ window.addEventListener('load', async () => {
 
 
 @pytest.mark.django_db
-def test_rendered_dashboard_keeps_live_program_visible_and_cut_reasons(client):
+def test_rendered_dashboard_keeps_live_program_visible_and_cut_feedback_hidden(client):
     html = client.get('/atem/dashboard/').content.decode('utf-8')
     assert 'Observed M/E Program' not in html
     assert 'Observed M/E Preview' not in html
@@ -1326,6 +1418,7 @@ def test_rendered_dashboard_keeps_live_program_visible_and_cut_reasons(client):
     assert 'outputStatus(output)' in html
     assert 'x-show="view.routeWarning"' in html
     assert 'x-text="view.routeWarning?.title"' in html
+    assert '.production-dashboard .cut-feedback-hidden { display: none !important; }' in html
     assert 'Observed hardware routes' not in html
     assert 'All assigned outputs:' not in html
     assert 'CUT ALL OUTPUTS' not in html

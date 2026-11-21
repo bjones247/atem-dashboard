@@ -151,6 +151,8 @@ def summarize(command: str, data: dict, mixerstate=None) -> str:
     me_suffix = f" (ME{me + 1})" if isinstance(me, int) and me > 0 else ''
 
     def src(sid):
+        if sid is None:
+            return 'unknown source'
         if mixerstate is not None:
             lbl = input_label(mixerstate, _int(sid))
             name = lbl.get('long') or lbl.get('short')
@@ -183,9 +185,9 @@ def summarize(command: str, data: dict, mixerstate=None) -> str:
     if command == 'set_transition_style':
         return f"Transition style → {d.get('style')}{me_suffix}"
     if command == 'set_aux_output':
-        aux = d.get('aux')
+        aux = d.get('aux', d.get('aux_channel'))
         aux_lbl = f"Aux {aux + 1}" if isinstance(aux, int) else "Aux"
-        return f"{aux_lbl} → {src(d.get('source'))}"
+        return f"{aux_lbl} → {src(d.get('source', d.get('input_source')))}"
     if command == 'set_video_mode':
         return f"Video mode → {d.get('mode', d.get('video_mode'))}"
     if command == 'set_input_label':

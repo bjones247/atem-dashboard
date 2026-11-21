@@ -656,16 +656,228 @@ test('TAKE ALL sends Primary CUT once and reports each participant after confirm
   const confirmed = hardware({ program: 2, preview: 1, aux3: 3 });
   confirmed.dashboardRouting = threeCProjection({ routes: [90010, 3, 3, 1, 2, 1], virtual1: [1], virtual2: [2] });
   d.updateState(confirmed);
-  const save = sent.find(message => message.command === 'dashboard_config_update');
-  assert.ok(save, 'confirmed group CUTs are saved together once');
-  assert.equal(save.config.virtualSwitchers.virtual1.programTarget, 3);
-  assert.equal(save.config.virtualSwitchers.virtual2.programTarget, 3);
-  d.handleMessage({ type: 'dashboard_config', deviceId: 'a'.repeat(32), revision: 8, config: save.config });
+  const firstSave = sent.find(message => message.command === 'dashboard_config_update');
+  assert.ok(firstSave, 'the first confirmed virtual CUT is saved');
+  assert.equal(firstSave.config.virtualSwitchers.virtual1.programTarget, 3);
+  assert.equal(firstSave.config.virtualSwitchers.virtual2.programTarget, 1);
+  d.updateState(confirmed);
+  assert.equal(sent.filter(message => message.command === 'dashboard_config_update').length, 1);
+  d.handleMessage({ type: 'dashboard_config', deviceId: 'a'.repeat(32), revision: 8, config: firstSave.config });
+  const saves = sent.filter(message => message.command === 'dashboard_config_update');
+  assert.equal(saves.length, 2);
+  assert.equal(saves[1].expected_revision, 8);
+  assert.equal(saves[1].config.virtualSwitchers.virtual2.programTarget, 3);
+  d.handleMessage({ type: 'dashboard_config', deviceId: 'a'.repeat(32), revision: 9, config: saves[1].config });
   assert.equal(d.takeAllOperation.status, 'complete');
   assert.equal(d.takeAllOperation.primary.status, 'confirmed');
   assert.equal(d.takeAllOperation.virtual1.status, 'confirmed');
   assert.equal(d.takeAllOperation.virtual2.status, 'confirmed');
   assert.equal(sent.filter(message => message.command === 'dashboard_take_all').length, 1);
+});
+
+test('TAKE ALL allows a ready participant and skips each already live switcher', () => {
+  const first = controller();
+  configureThreeC(first.dashboard, { virtual1: [1] });
+  first.dashboard.state.dashboardRouting.groups.virtual1.previewSourceId = 1;
+  first.dashboard.dashboardConfig.config.virtualSwitchers.virtual1.previewSource = 1;
+  assert.equal(first.dashboard.groupCutReason('virtual1'), 'The selected source is already live.');
+  assert.equal(first.dashboard.takeAllReason(), '');
+  first.dashboard.takeAll();
+  assert.equal(first.dashboard.takeAllOperation.virtual1.status, 'skipped');
+  assert.equal(first.dashboard.groupCutOperations.virtual1, undefined);
+  assert.equal(first.sent.at(-1).command, 'dashboard_take_all');
+
+  const second = controller();
+  configureThreeC(second.dashboard, { virtual1: [1] });
+  const state = hardware({ program: 1, preview: 1,
+    meReason: 'M/E Preview is already live; select a different Preview source.' });
+  state.dashboardRouting = threeCProjection({ virtual1: [1] });
+  second.dashboard.updateState(state);
+  assert.equal(second.dashboard.primaryCutReason(), state.dashboardSafety.meCut.reason);
+  assert.equal(second.dashboard.takeAllReason(), '');
+  second.dashboard.takeAll();
+  assert.equal(second.dashboard.takeAllOperation.primary.status, 'skipped');
+  assert.equal(second.dashboard.primaryActionPending, null);
+  assert.equal(second.sent.at(-1).command, 'dashboard_take_all');
+  second.dashboard.handleMessage({ type: 'dashboard_take_all_started', device_id: 'a'.repeat(32),
+    primary: { status: 'skipped', ok: true },
+    virtual: {
+      virtual1: { status: 'pending', target: 3, previous: 1, outcomes: [{ channel: 1, ok: true }] },
+      virtual2: { status: 'skipped', outcomes: [] },
+    } });
+  assert.equal(second.dashboard.takeAllOperation.primary.status, 'skipped');
+  assert.equal(second.dashboard.takeAllOperation.virtual1.status, 'pending');
+  const virtualConfirmed = hardware({ program: 1, preview: 1,
+    meReason: 'M/E Preview is already live; select a different Preview source.' });
+  virtualConfirmed.dashboardRouting = threeCProjection({ routes: [90010, 3, 2, 1, 2, 1], virtual1: [1] });
+  second.dashboard.updateState(virtualConfirmed);
+  const virtualSave = second.sent.find(message => message.command === 'dashboard_config_update');
+  assert.ok(virtualSave);
+  second.dashboard.handleMessage({ type: 'dashboard_config', deviceId: 'a'.repeat(32), revision: 8,
+    config: virtualSave.config });
+  assert.equal(second.dashboard.takeAllOperation.status, 'complete');
+  assert.equal(second.dashboard.assignmentBusy, false);
+
+  const third = controller();
+  configureThreeC(third.dashboard, { virtual1: [1] });
+  const allLive = hardware({ program: 1, preview: 1,
+    meReason: 'M/E Preview is already live; select a different Preview source.' });
+  allLive.dashboardRouting = threeCProjection({ virtual1: [1] });
+  allLive.dashboardRouting.groups.virtual1.previewSourceId = 1;
+  third.dashboard.updateState(allLive);
+  assert.match(third.dashboard.takeAllReason(), /already live on every switcher/);
+  third.dashboard.takeAll();
+  assert.equal(third.sent.some(item => item.command === 'dashboard_take_all'), false);
+});
+
+test('TAKE ALL with Primary skipped finishes a rejected virtual dispatch without waiting for hardware', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d, { virtual1: [1] });
+  const state = hardware({ program: 1, preview: 1,
+    meReason: 'M/E Preview is already live; select a different Preview source.' });
+  state.dashboardRouting = threeCProjection({ virtual1: [1] });
+  d.updateState(state);
+  d.takeAll();
+  d.handleMessage({ type: 'dashboard_take_all_started', device_id: 'a'.repeat(32),
+    primary: { status: 'skipped', ok: true },
+    virtual: { virtual1: { status: 'failed', error: 'route changed', outcomes: [] },
+      virtual2: { status: 'skipped', outcomes: [] } } });
+  assert.equal(d.takeAllOperation.status, 'partial');
+  assert.equal(d.assignmentBusy, false);
+  assert.equal(sent.some(message => message.command === 'dashboard_config_update'), false);
+});
+
+test('TAKE ALL with Primary already live confirms both virtual groups and saves both swaps', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d, { virtual1: [1], virtual2: [2] });
+  const initial = hardware({ program: 1, preview: 1,
+    meReason: 'M/E Preview is already live; select a different Preview source.' });
+  initial.dashboardRouting = threeCProjection({ virtual1: [1], virtual2: [2] });
+  d.updateState(initial);
+  assert.equal(d.takeAllReason(), '');
+  d.takeAll();
+  d.handleMessage({ type: 'dashboard_take_all_started', device_id: 'a'.repeat(32),
+    primary: { status: 'skipped', ok: true },
+    virtual: {
+      virtual1: { status: 'pending', target: 3, previous: 1, outcomes: [{ channel: 1, ok: true }] },
+      virtual2: { status: 'pending', target: 3, previous: 2, outcomes: [{ channel: 2, ok: true }] },
+    } });
+  const firstRoute = hardware({ program: 1, preview: 1,
+    meReason: 'M/E Preview is already live; select a different Preview source.' });
+  firstRoute.dashboardRouting = threeCProjection({ routes: [90010, 3, 2, 1, 2, 1], virtual1: [1], virtual2: [2] });
+  d.updateState(firstRoute);
+  assert.equal(d.takeAllOperation.virtual1.status, 'confirmed');
+  assert.equal(d.takeAllOperation.virtual2.status, 'pending');
+  assert.equal(d.groupRouteWarning('virtual1'), null);
+  assert.match(d.groupCutReason('virtual2'), /TAKE ALL is awaiting hardware confirmation/);
+  assert.equal(sent.some(message => message.command === 'dashboard_config_update'), false);
+  const bothRoutes = hardware({ program: 1, preview: 1,
+    meReason: 'M/E Preview is already live; select a different Preview source.' });
+  bothRoutes.dashboardRouting = threeCProjection({ routes: [90010, 3, 3, 1, 2, 1], virtual1: [1], virtual2: [2] });
+  d.updateState(bothRoutes);
+  const firstSave = sent.find(message => message.command === 'dashboard_config_update');
+  assert.ok(firstSave);
+  assert.equal(firstSave.config.virtualSwitchers.virtual1.previewSource, 1);
+  assert.equal(d.takeAllOperation.status, 'saving');
+  d.handleMessage({ type: 'dashboard_config', deviceId: 'a'.repeat(32), revision: 8, config: firstSave.config });
+  const saves = sent.filter(message => message.command === 'dashboard_config_update');
+  assert.equal(saves.length, 2);
+  assert.equal(saves[1].expected_revision, 8);
+  assert.equal(saves[1].config.virtualSwitchers.virtual2.previewSource, 2);
+  assert.equal(d.takeAllOperation.status, 'saving');
+  d.handleMessage({ type: 'dashboard_config', deviceId: 'a'.repeat(32), revision: 9, config: saves[1].config });
+  assert.equal(d.takeAllOperation.status, 'complete');
+  assert.equal(d.groupRouteWarning('virtual1'), null);
+  assert.equal(d.groupRouteWarning('virtual2'), null);
+});
+
+test('TAKE ALL with Primary skipped swaps observed Black and Bars into virtual Previews', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d, { virtual1: [1], virtual2: [2] });
+  const initial = hardware({ program: 1, preview: 1,
+    meReason: 'M/E Preview is already live; select a different Preview source.' });
+  initial.sources.push({ source: 0, short: 'BLK', long: 'Black', port_type: 1, available_aux: true });
+  initial.dashboardRouting = threeCProjection({ routes: [90010, 0, 1000, 1, 2, 1], virtual1: [1], virtual2: [2] });
+  initial.dashboardRouting.groups.virtual1.savedProgramTargetId = 0;
+  initial.dashboardRouting.groups.virtual2.savedProgramTargetId = 1000;
+  d.updateState(initial);
+  d.dashboardConfig.config.virtualSwitchers.virtual1.programTarget = 0;
+  d.dashboardConfig.config.virtualSwitchers.virtual2.programTarget = 1000;
+  assert.equal(d.takeAllReason(), '');
+  d.takeAll();
+  d.handleMessage({ type: 'dashboard_take_all_started', device_id: 'a'.repeat(32),
+    primary: { status: 'skipped', ok: true },
+    virtual: {
+      virtual1: { status: 'pending', target: 3, previous: 0, outcomes: [{ channel: 1, ok: true }] },
+      virtual2: { status: 'pending', target: 3, previous: 1000, outcomes: [{ channel: 2, ok: true }] },
+    } });
+  const confirmed = hardware({ program: 1, preview: 1,
+    meReason: 'M/E Preview is already live; select a different Preview source.' });
+  confirmed.sources.push({ source: 0, short: 'BLK', long: 'Black', port_type: 1, available_aux: true });
+  confirmed.dashboardRouting = threeCProjection({ routes: [90010, 3, 3, 1, 2, 1], virtual1: [1], virtual2: [2] });
+  d.updateState(confirmed);
+  const firstSave = sent.find(message => message.command === 'dashboard_config_update');
+  assert.equal(firstSave.config.virtualSwitchers.virtual1.previewSource, 0);
+  d.handleMessage({ type: 'dashboard_config', deviceId: 'a'.repeat(32), revision: 8, config: firstSave.config });
+  const secondSave = sent.filter(message => message.command === 'dashboard_config_update')[1];
+  assert.equal(secondSave.config.virtualSwitchers.virtual2.previewSource, 1000);
+  d.handleMessage({ type: 'dashboard_config', deviceId: 'a'.repeat(32), revision: 9, config: secondSave.config });
+  assert.equal(d.takeAllOperation.status, 'complete');
+});
+
+test('TAKE ALL preserves the first saved switcher when the second save is rejected', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d, { virtual1: [1], virtual2: [2] });
+  const initial = hardware({ program: 1, preview: 1,
+    meReason: 'M/E Preview is already live; select a different Preview source.' });
+  initial.dashboardRouting = threeCProjection({ virtual1: [1], virtual2: [2] });
+  d.updateState(initial);
+  d.takeAll();
+  d.handleMessage({ type: 'dashboard_take_all_started', device_id: 'a'.repeat(32),
+    primary: { status: 'skipped', ok: true },
+    virtual: {
+      virtual1: { status: 'pending', target: 3, previous: 1, outcomes: [{ channel: 1, ok: true }] },
+      virtual2: { status: 'pending', target: 3, previous: 2, outcomes: [{ channel: 2, ok: true }] },
+    } });
+  const confirmed = hardware({ program: 1, preview: 1,
+    meReason: 'M/E Preview is already live; select a different Preview source.' });
+  confirmed.dashboardRouting = threeCProjection({ routes: [90010, 3, 3, 1, 2, 1], virtual1: [1], virtual2: [2] });
+  d.updateState(confirmed);
+  const firstSave = sent.find(message => message.command === 'dashboard_config_update');
+  d.handleMessage({ type: 'dashboard_config', deviceId: 'a'.repeat(32), revision: 8, config: firstSave.config });
+  assert.equal(d.takeAllOperation.virtual1.configSaved, true);
+  assert.equal(d.takeAllOperation.virtual2.configSaved, undefined);
+  d.handleMessage({ type: 'error', command: 'dashboard_config_update', message: 'stale revision' });
+  assert.equal(d.takeAllOperation.status, 'confirmed_config_failed');
+  assert.equal(d.takeAllOperation.virtual1.configSaved, true);
+  assert.equal(d.takeAllOperation.virtual2.configSaved, undefined);
+  assert.equal(sent.filter(message => message.command === 'dashboard_config_update').length, 2);
+  assert.equal(d.groupCutOperations.virtual2.status, 'confirmed_config_failed');
+  assert.match(d.takeAllReason(), /reload and review/);
+  assert.match(d.groupCutReason('virtual2'), /reload and review/);
+});
+
+test('TAKE ALL completes when only Primary CUT runs', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d, { virtual1: [1], virtual2: [2] });
+  d.state.dashboardRouting.groups.virtual1.previewSourceId = 1;
+  d.state.dashboardRouting.groups.virtual2.previewSourceId = 2;
+  d.dashboardConfig.config.virtualSwitchers.virtual1.previewSource = 1;
+  d.dashboardConfig.config.virtualSwitchers.virtual2.previewSource = 2;
+  assert.equal(d.takeAllReason(), '');
+  d.takeAll();
+  d.handleMessage({ type: 'dashboard_take_all_started', device_id: 'a'.repeat(32),
+    primary: { ok: true, action: 'cut', command: 'cut', before: 1, target: 2 },
+    virtual: { virtual1: { status: 'skipped', outcomes: [] },
+      virtual2: { status: 'skipped', outcomes: [] } } });
+  const changed = hardware({ program: 2, preview: 1 });
+  changed.dashboardRouting = threeCProjection({ virtual1: [1], virtual2: [2] });
+  changed.dashboardRouting.groups.virtual1.previewSourceId = 1;
+  changed.dashboardRouting.groups.virtual2.previewSourceId = 2;
+  d.updateState(changed);
+  assert.equal(d.takeAllOperation.status, 'complete');
+  assert.equal(d.assignmentBusy, false);
+  assert.equal(sent.some(message => message.command === 'dashboard_config_update'), false);
 });
 
 test('TAKE ALL blocks a tied key and sends nothing', () => {

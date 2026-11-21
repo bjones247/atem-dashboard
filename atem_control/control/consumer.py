@@ -447,7 +447,7 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
                 await self.send_json({'type': 'error', 'command': command, 'message': result})
                 return
             primary = result['primary']
-            if primary['ok']:
+            if primary.get('ok') and primary.get('command'):
                 self._record_atem_command(primary['command'], {'me': 0})
             for group in result['virtual'].values():
                 for outcome in group.get('outcomes', []):

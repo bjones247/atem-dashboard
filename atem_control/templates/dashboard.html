@@ -48,8 +48,13 @@
     .production-dashboard .dashboard-cut-button { min-width: 4.5rem; min-height: 2.5rem; height: 2.5rem; padding-inline: 1rem; }
     .production-dashboard .auto-style-buttons { margin-left: 3rem; }
     .production-dashboard .cut-reason { font-size: .7rem; line-height: 1.2; }
+    .production-dashboard .cut-feedback-hidden { display: none !important; }
     .production-dashboard .route-source-grid { display: grid; grid-template-columns: repeat(4, 3.125rem); gap: .25rem; justify-content: center; }
     .production-dashboard .route-source-grid .btn { width: 100%; min-width: 0; min-height: 0; height: 3.125rem; font: 600 .75rem var(--font-data, monospace); padding: .1rem .2rem; }
+    .production-dashboard .assignment-grid { display: grid; grid-template-columns: 4.5rem 5rem minmax(9rem, 1fr) 7rem; gap: .75rem; align-items: center; min-width: 28rem; }
+    .production-dashboard .assignment-grid-note { grid-column: 2 / -1; }
+    .production-dashboard .assignment-dialog-box { padding: 1rem; }
+    .production-dashboard .assignment-dialog-actions { display: flex; justify-content: flex-end; gap: .5rem; margin-top: 1rem; }
     [x-cloak] { display: none !important; }
 </style>
 {% endblock %}
@@ -126,7 +131,7 @@
                     </template>
                     <span x-show="primarySwitcherOutputs.length === 0" class="text-xs text-warning" x-text="routingProjection ? 'No confirmed Primary outputs' : 'Output state unavailable'"></span>
                     <button type="button" class="btn btn-ghost btn-xs btn-square" :disabled="!!assignmentChangeReason()" :title="assignmentChangeReason() || 'Change Primary output assignments'" aria-label="Change Primary output assignments" @click="openAssignmentDialog('primary')"><i class="bi bi-pencil" aria-hidden="true"></i></button>
-                    <span x-show="assignmentChangeReason()" class="basis-full text-[10px] text-warning" x-text="assignmentChangeReason()"></span>
+                    <span x-show="assignmentChangeReason()" class="cut-feedback-hidden basis-full text-[10px] text-warning" x-text="assignmentChangeReason()"></span>
                 </div>
             </header>
             <div class="card-body p-4 space-y-3">
@@ -172,8 +177,8 @@
                 </div>
                 <div class="rounded-lg border border-base-300 p-3" role="group" aria-label="Primary transition controls">
                     <div class="flex flex-wrap items-center gap-2">
-                        <button type="button" class="btn btn-error btn-sm font-bold dashboard-cut-button" :disabled="!!primaryCutReason()" @click="primaryCut()">CUT</button>
-                        <button type="button" class="btn btn-warning btn-sm font-bold" :disabled="!!primaryAutoReason()" @click="primaryAuto()">AUTO</button>
+                        <button type="button" class="btn btn-error btn-sm font-bold dashboard-cut-button" :disabled="!!primaryCutReason()" :title="primaryCutReason() || 'Cut Primary to Preview'" @click="primaryCut()">CUT</button>
+                        <button type="button" class="btn btn-warning btn-sm font-bold" :disabled="!!primaryAutoReason()" :title="primaryAutoReason() || 'Transition Primary to Preview'" @click="primaryAuto()">AUTO</button>
                         <div class="auto-style-buttons flex flex-wrap gap-1" role="group" aria-label="AUTO transition type">
                             <template x-for="style in transitionStyles" :key="'transition-style-' + style.value">
                                 <button type="button" class="btn btn-xs" :class="hardwareMe?.transition?.style === style.value ? 'btn-warning' : 'btn-outline'" :disabled="!hardwareReady || stylePending || !transitionStyleSupported(style.value)" @click="selectTransitionStyle(style.value)" :title="transitionStyleSupported(style.value) ? 'Select transition type; this does not execute it' : style.label + ' capability unavailable or unknown'" x-text="style.label"></button>
@@ -181,7 +186,7 @@
                         </div>
                     </div>
                     <div x-show="styleUnconfirmed" class="text-xs text-warning mt-2">Style command unconfirmed. <button type="button" class="btn btn-link btn-xs" @click="reviewTransitionStyle()">Review hardware state</button></div>
-                    <div class="cut-reason text-warning mt-2" x-show="primaryCutReason() || primaryAutoReason()" x-text="primaryCutReason() || primaryAutoReason()"></div>
+                    <div class="cut-reason cut-feedback-hidden text-warning mt-2" x-show="primaryCutReason() || primaryAutoReason()" x-text="primaryCutReason() || primaryAutoReason()"></div>
                     <div x-show="primaryActionPending?.unconfirmed" class="flex flex-wrap items-center gap-2 text-xs text-warning mt-2">
                         <span>Primary result unconfirmed; no command will be retried.</span>
                         <button type="button" class="btn btn-xs btn-outline" @click="reviewPrimaryOperation()">Review state</button>
@@ -227,7 +232,7 @@
                             </template>
                             <span x-show="view.outputs.length === 0" class="text-xs text-base-content/55" x-text="view.group.outputIds?.length ? 'Saved assignment unresolved' : 'No assigned outputs'"></span>
                             <button type="button" class="btn btn-ghost btn-xs btn-square" :disabled="!!assignmentChangeReason()" :title="assignmentChangeReason() || 'Change ' + view.title + ' output assignments'" :aria-label="'Change ' + view.title + ' output assignments'" @click="openAssignmentDialog(view.key)"><i class="bi bi-pencil" aria-hidden="true"></i></button>
-                            <span x-show="assignmentChangeReason()" class="basis-full text-[10px] text-warning" x-text="assignmentChangeReason()"></span>
+                            <span x-show="assignmentChangeReason()" class="cut-feedback-hidden basis-full text-[10px] text-warning" x-text="assignmentChangeReason()"></span>
                         </div>
                     </header>
                     <div class="card-body p-4 space-y-3">
@@ -275,10 +280,10 @@
                         </div>
                         <div class="rounded-lg border border-base-300 p-3">
                             <div class="flex flex-wrap items-start gap-2">
-                                <button type="button" class="btn btn-error btn-sm font-bold dashboard-cut-button" :disabled="!!groupCutReason(view.key)" @click="cutVirtualGroup(view.key)">CUT</button>
+                                <button type="button" class="btn btn-error btn-sm font-bold dashboard-cut-button" :disabled="!!groupCutReason(view.key)" :title="groupCutReason(view.key) || 'Cut ' + view.title + ' to staged source'" @click="cutVirtualGroup(view.key)">CUT</button>
                                 <span class="badge badge-xs" x-show="groupCutOperations[view.key]?.status === 'pending'">ROUTING…</span>
                                 <div class="min-w-0 flex-1 text-xs">
-                                    <div x-show="view.routeWarning" x-cloak class="text-warning" role="status">
+                                    <div x-show="view.routeWarning" x-cloak class="cut-feedback-hidden text-warning" role="status">
                                         <div class="font-bold" x-text="view.routeWarning?.title"></div>
                                         <div x-text="'Expected ' + view.routeWarning?.expected"></div>
                                         <template x-for="route in (view.routeWarning?.outputs || [])" :key="view.key + '-warning-' + route.outputId">
@@ -286,14 +291,18 @@
                                                 <span class="font-bold" :class="route.matchesExpected === true ? 'text-success' : (route.matchesExpected === false ? 'text-error' : 'text-warning')" x-text="route.marker"></span>
                                                 <span x-text="'OUT ' + route.outputId + (route.observed ? ' set to ' : ': ') + route.label"></span>
                                                 <span x-show="route.error" class="text-warning" x-text="route.error"></span>
-                                                <button type="button" x-show="route.reviewable" class="btn btn-ghost btn-xs" @click="reviewOutputOperation(route.outputId)">Review route</button>
                                             </div>
                                         </template>
                                         <div x-show="view.routeWarning?.missingOutputs">Some assigned outputs could not be resolved.</div>
                                         <div x-show="view.routeWarning?.error" x-text="view.routeWarning?.error"></div>
-                                        <button type="button" x-show="view.group.routeStatus === 'mixed'" class="btn btn-warning btn-xs mt-1" :disabled="!!groupAlignReason(view.key)" @click="beginVirtualGroupAlign(view.key)" :title="groupAlignReason(view.key) || 'Review and explicitly align every assigned output'">Review alignment</button>
                                     </div>
-                                    <div class="cut-reason text-warning" x-show="groupCutReason(view.key) || ['partial','unconfirmed','confirmed_config_failed'].includes(groupCutOperations[view.key]?.status)" x-text="groupCutReason(view.key) || groupCutOperations[view.key]?.error || 'Partial or unconfirmed result; inspect each output.'"></div>
+                                    <div class="cut-reason cut-feedback-hidden text-warning" x-show="groupCutReason(view.key) || ['partial','unconfirmed','confirmed_config_failed'].includes(groupCutOperations[view.key]?.status)" x-text="groupCutReason(view.key) || groupCutOperations[view.key]?.error || 'Partial or unconfirmed result; inspect each output.'"></div>
+                                    <div x-show="view.routeWarning" class="flex flex-wrap gap-1">
+                                        <template x-for="route in (view.routeWarning?.outputs || []).filter(item => item.reviewable)" :key="view.key + '-review-' + route.outputId">
+                                            <button type="button" class="btn btn-ghost btn-xs" @click="reviewOutputOperation(route.outputId)" x-text="'Review OUT ' + route.outputId"></button>
+                                        </template>
+                                        <button type="button" x-show="view.group.routeStatus === 'mixed'" class="btn btn-warning btn-xs" :disabled="!!groupAlignReason(view.key)" @click="beginVirtualGroupAlign(view.key)" :title="groupAlignReason(view.key) || 'Review and explicitly align every assigned output'">Review alignment</button>
+                                    </div>
                                 </div>
                             </div>
                             <div x-show="groupAlignOperations[view.key]?.status === 'pending' || groupAlignOperations[view.key]?.status === 'unconfirmed' || groupAlignOperations[view.key]?.status === 'partial' || groupAlignOperations[view.key]?.status === 'confirmed_config_failed'" class="text-xs text-warning mt-2" x-text="groupAlignOperations[view.key]?.error || 'Alignment is pending; inspect each output route.'"></div>
@@ -317,36 +326,15 @@
                             <button type="button" class="btn btn-error font-bold" :disabled="!!takeAllReason()" :title="takeAllReason() || 'Cut Primary and each assigned virtual switcher'" @click="takeAll()">TAKE ALL</button>
                         </div>
                     </div>
-                    <p x-show="takeAllReason() && takeAllReason() !== takeAllOperation?.error" class="cut-reason text-warning" x-text="takeAllReason()"></p>
+                    <p x-show="takeAllReason() && takeAllReason() !== takeAllOperation?.error" class="cut-reason cut-feedback-hidden text-warning" x-text="takeAllReason()"></p>
                     <div x-show="hardwareReady && takeAllBlockers.some(blocker => blocker.reviewable)" class="flex flex-wrap gap-2">
                         <template x-for="blocker in takeAllBlockers.filter(item => item.reviewable)" :key="blocker.kind + '-' + blocker.index">
                             <button type="button" class="btn btn-xs btn-outline" @click="reviewTakeAllBlocker(blocker)" x-text="'Review ' + blocker.label"></button>
                         </template>
                     </div>
-                    <div x-show="takeAllOperation" :style="takeAllOperation ? 'display: block' : 'display: none'" class="mt-2 border-t border-base-300 pt-3 space-y-2" aria-live="polite">
+                    <div x-show="takeAllOperation?.error" class="mt-2 border-t border-base-300 pt-3" aria-live="polite">
                         <p class="text-xs text-warning" x-show="takeAllOperation?.error"
                            x-text="(takeAllOperation?.status === 'blocked' ? 'Blocked before dispatch. ' : '') + (takeAllOperation?.error || '')"></p>
-                        <div x-show="takeAllOperation?.status !== 'blocked'" class="grid grid-cols-1 md:grid-cols-3 gap-2">
-                            <template x-for="participantId in ['primary','virtual1','virtual2']" :key="'take-all-' + participantId">
-                                <div class="rounded border border-base-300 bg-base-100 p-2 text-sm">
-                                    <div class="flex items-center justify-between gap-2">
-                                        <span class="font-semibold" x-text="participantId === 'primary' ? primarySwitcherName : switcherName(participantId, participantId === 'virtual1' ? 'Virtual Switcher 1' : 'Virtual Switcher 2')"></span>
-                                        <span class="badge badge-xs" x-text="takeAllOperation?.[participantId]?.status"></span>
-                                    </div>
-                                    <div class="text-xs text-warning mt-1" x-show="takeAllOperation?.[participantId]?.error" x-text="takeAllOperation?.[participantId]?.error"></div>
-                                    <div x-show="participantId !== 'primary'" class="mt-1 space-y-1">
-                                        <template x-for="channel in takeAllOperation?.[participantId]?.channels || []" :key="participantId + '-take-all-out-' + channel.channel">
-                                            <div class="flex items-center justify-between gap-2 text-xs">
-                                                <span class="font-mono" x-text="'OUT ' + (channel.channel + 1)"></span>
-                                                <span class="badge badge-xs" :class="channel.status === 'confirmed' ? 'badge-success' : (['failed','unconfirmed'].includes(channel.status) ? 'badge-warning' : 'badge-info')" x-text="channel.status"></span>
-                                                <button type="button" class="btn btn-ghost btn-xs" x-show="channel.status === 'unconfirmed' || (takeAllOperation?.status === 'partial' && channel.status === 'failed')" @click="reviewOutputOperation(channel.channel + 1)">Review</button>
-                                            </div>
-                                        </template>
-                                    </div>
-                                    <button type="button" class="btn btn-ghost btn-xs mt-1" x-show="participantId === 'primary' && takeAllOperation?.primary?.status === 'unconfirmed'" @click="reviewPrimaryOperation()">Review Primary state</button>
-                                </div>
-                            </template>
-                        </div>
                     </div>
                 </div>
             </section>
@@ -388,20 +376,23 @@
     </section>
 
 <div x-show="assignmentDialogOpen" :style="assignmentDialogOpen ? 'display: grid' : 'display: none'" x-cloak class="modal modal-open" role="dialog" aria-modal="true" aria-label="Change output assignments">
-    <div class="modal-box max-w-3xl">
+    <div class="modal-box max-w-3xl assignment-dialog-box">
         <h2 class="font-bold text-xl" x-text="'Change outputs for ' + switcherName(assignmentOwner, assignmentOwner)"></h2>
-        <p class="text-sm text-base-content/70 mt-2">Stage the ownership changes, review the current routes, then apply. Route commands run separately and can partially succeed. Transfers require confirmation here and are saved only after observed route confirmation.</p>
+        <p class="text-sm text-base-content/70 mt-2">Stage the ownership changes, review the current routes, then save. Route commands run separately and can partially succeed. Transfers require confirmation here and are saved only after observed route confirmation.</p>
         <div x-show="assignmentOwner === 'primary'" class="alert alert-warning py-2 mt-3 text-xs">Releasing a Primary output switches it to Color Bars. The final Primary destination is protected when the minimum-destination policy is on.</div>
-        <div class="mt-4 max-h-[55vh] overflow-y-auto divide-y divide-base-300">
+        <div class="mt-4 max-h-[55vh] overflow-auto rounded border border-base-300 p-4">
+            <div class="assignment-grid border-b border-base-300 pb-2 text-xs font-semibold uppercase text-base-content/60">
+                <span>SELECT</span><span>Output</span><span>Current Output Source</span><span>Switcher</span>
+            </div>
             <template x-for="output in physicalOutputs" :key="'assignment-output-' + output.outputId">
-                <label class="flex items-center gap-3 py-3">
+                <label class="assignment-grid border-b border-base-300 py-3 last:border-0">
                     <input type="checkbox" class="checkbox checkbox-primary" x-model="assignmentSelection[String(output.outputId)]" :disabled="!output.available || output.routeStatus !== 'observed' || routingProjection?.supersededVirtualOutputIds?.includes(output.outputId) || (['unresolved','unknown'].includes(output.owner) && !assignmentSelection[String(output.outputId)]) || assignmentBusy">
-                    <span class="font-mono font-bold w-16" x-text="output.displayName"></span>
-                    <span class="text-sm flex-1" x-text="output.routeStatus === 'observed' ? sourceStateLabel(output.liveSourceId) : outputStatus(output)"></span>
-                    <span class="badge badge-sm" :class="output.owner === 'other' ? 'badge-ghost' : (output.owner === 'unresolved' || output.owner === 'unknown' ? 'badge-warning' : 'badge-outline')" x-text="output.owner"></span>
-                    <span class="text-xs text-warning" x-show="routingProjection?.supersededVirtualOutputIds?.includes(output.outputId)">Removing old virtual assignment…</span>
-                    <span class="basis-full pl-7 text-xs text-info" x-show="stagedAssignmentDescription(output)" x-text="stagedAssignmentDescription(output)"></span>
-                    <span class="text-xs text-warning" x-show="assignmentSelection[String(output.outputId)] && (output.owner === 'primary' || output.owner === 'virtual1' || output.owner === 'virtual2') && assignmentOwner !== output.owner" x-text="'Transfer from ' + output.owner"></span>
+                    <span class="font-mono font-bold" x-text="output.displayName"></span>
+                    <span class="text-sm min-w-0 break-words" x-text="output.routeStatus === 'observed' ? sourceStateLabel(output.liveSourceId) : outputStatus(output)"></span>
+                    <span class="badge badge-sm" :class="output.owner === 'other' ? 'badge-ghost' : (output.owner === 'unresolved' || output.owner === 'unknown' ? 'badge-warning' : 'badge-outline')" x-text="({primary: 'Primary', virtual1: 'Virtual 1', virtual2: 'Virtual 2', other: 'Unswitched'})[output.owner] || output.owner"></span>
+                    <span class="assignment-grid-note text-xs text-warning" x-show="routingProjection?.supersededVirtualOutputIds?.includes(output.outputId)">Removing old virtual assignment…</span>
+                    <span class="assignment-grid-note text-xs text-info" x-show="stagedAssignmentDescription(output)" x-text="stagedAssignmentDescription(output)"></span>
+                    <span class="assignment-grid-note text-xs text-warning" x-show="assignmentSelection[String(output.outputId)] && (output.owner === 'primary' || output.owner === 'virtual1' || output.owner === 'virtual2') && assignmentOwner !== output.owner" x-text="'Transfer from ' + (({primary: 'Primary', virtual1: 'Virtual 1', virtual2: 'Virtual 2'})[output.owner] || output.owner)"></span>
                 </label>
             </template>
         </div>
@@ -420,9 +411,9 @@
             <span>Some output routes are unconfirmed. Review the current hardware route before continuing.</span>
             <button type="button" class="btn btn-xs" @click="reviewUnconfirmedAssignmentRoutes()">Review uncertain routes</button>
         </div>
-        <div class="modal-action">
+        <div class="modal-action assignment-dialog-actions">
+            <button type="button" class="btn btn-primary" :disabled="assignmentBusy || !hardwareReady || !!outputMappingError" @click="applyAssignmentChanges()">Save</button>
             <button type="button" class="btn btn-ghost" :disabled="assignmentBusy" @click="closeAssignmentDialog()">Cancel</button>
-            <button type="button" class="btn btn-primary" :disabled="assignmentBusy || !hardwareReady || !!outputMappingError" @click="applyAssignmentChanges()">Apply reviewed changes</button>
         </div>
     </div>
     <button class="modal-backdrop" aria-label="Close assignment dialog" :disabled="assignmentBusy" @click="closeAssignmentDialog()"></button>
