@@ -44,7 +44,10 @@
     .production-dashboard .direct-mode-button { border-radius: .5rem; }
     .production-dashboard .btn.btn-live-source { background: #dc2626 !important; border-color: #ef4444 !important; color: white !important; box-shadow: 0 0 8px #dc262655; opacity: 1 !important; }
     .production-dashboard .btn-preview-source { background: #059669 !important; border-color: #10b981 !important; color: white !important; }
-    .production-dashboard .keyer-button { min-height: 2.3rem; height: 2.3rem; }
+    .production-dashboard .keyer-grid { grid-auto-columns: minmax(2rem, 4rem); }
+    .production-dashboard .primary-rate-input { width: 4.25rem; }
+    .production-dashboard .primary-transition-row { margin-left: -10px; }
+    .production-dashboard .primary-rate-control { margin-left: 5px; }
     .production-dashboard .dashboard-cut-button { min-width: 4.5rem; min-height: 2.5rem; height: 2.5rem; padding-inline: 1rem; }
     .production-dashboard .auto-style-buttons { margin-left: 3rem; }
     .production-dashboard .cut-reason { font-size: .7rem; line-height: 1.2; }
@@ -176,16 +179,33 @@
                     <div x-show="meObservationStale || hardwareProgramSourceId === null || !primaryBusLayout.buttons.some(button => button.source.source === hardwareProgramSourceId)" class="text-xs text-warning mt-1" x-text="meObservationStale ? 'Program stale; last observed: ' + sourceStateLabel(hardwareProgramSourceId) : (hardwareProgramSourceId === null ? 'M/E Program unavailable' : 'Live source: ' + sourceStateLabel(hardwareProgramSourceId))"></div>
                 </div>
                 <div class="rounded-lg border border-base-300 p-3" role="group" aria-label="Primary transition controls">
-                    <div class="flex flex-wrap items-center gap-2">
-                        <button type="button" class="btn btn-error btn-sm font-bold dashboard-cut-button" :disabled="!!primaryCutReason()" :title="primaryCutReason() || 'Cut Primary to Preview'" @click="primaryCut()">CUT</button>
-                        <button type="button" class="btn btn-warning btn-sm font-bold" :disabled="!!primaryAutoReason()" :title="primaryAutoReason() || 'Transition Primary to Preview'" @click="primaryAuto()">AUTO</button>
+                    <div class="primary-transition-row flex flex-wrap items-center gap-2">
+                        <button type="button" class="btn btn-error btn-sm font-bold dashboard-cut-button" :disabled="!!primaryCutReason()" :title="primaryCutReason() || 'Cut the selected BKGD and KEY layers'" @click="primaryCut()">CUT</button>
+                        <button type="button" class="btn btn-warning btn-sm font-bold dashboard-cut-button" :disabled="!!primaryAutoReason()" :title="primaryAutoReason() || 'Transition the selected BKGD and KEY layers'" @click="primaryAuto()">AUTO</button>
                         <div class="auto-style-buttons flex flex-wrap gap-1" role="group" aria-label="AUTO transition type">
                             <template x-for="style in transitionStyles" :key="'transition-style-' + style.value">
-                                <button type="button" class="btn btn-xs" :class="hardwareMe?.transition?.style === style.value ? 'btn-warning' : 'btn-outline'" :disabled="!hardwareReady || stylePending || !transitionStyleSupported(style.value)" @click="selectTransitionStyle(style.value)" :title="transitionStyleSupported(style.value) ? 'Select transition type; this does not execute it' : style.label + ' capability unavailable or unknown'" x-text="style.label"></button>
+                                <button type="button" class="btn btn-xs" :class="hardwareMe?.transition?.style === style.value ? 'btn-warning' : 'btn-outline'" :disabled="!hardwareReady || stylePending || !!primarySetupPendingReason || !transitionStyleSupported(style.value)" @click="selectTransitionStyle(style.value)" :title="transitionStyleSupported(style.value) ? 'Select transition type; this does not execute it' : style.label + ' capability unavailable or unknown'" x-text="style.label"></button>
                             </template>
+                            <div class="primary-rate-control flex items-center gap-1 text-xs">
+                                <span x-show="!primaryRateEdit">Rate</span>
+                                <span x-show="!primaryRateEdit" class="font-mono" x-text="primaryRateDisplay ?? '—'"></span>
+                                <button type="button" x-show="!primaryRateEdit" class="btn btn-ghost btn-xs btn-square"
+                                        :disabled="!!primaryRateReason()" :title="primaryRateReason() || 'Edit AUTO rate'"
+                                        aria-label="Edit AUTO rate" @click="beginPrimaryRateEdit(); $nextTick(() => { if (primaryRateEdit) { $refs.primaryRateInput.focus(); $refs.primaryRateInput.select(); } })">
+                                    <i class="bi bi-pencil" aria-hidden="true"></i>
+                                </button>
+                                <input type="text" x-show="primaryRateEdit" x-cloak x-ref="primaryRateInput"
+                                       class="input input-bordered input-xs primary-rate-input font-mono"
+                                       aria-label="AUTO rate in seconds and frames" spellcheck="false" autocomplete="off"
+                                       :value="primaryRateEdit?.initialText ?? ''"
+                                       @blur="finishPrimaryRateEdit($el.value)"
+                                       @keydown.escape.prevent.stop="primaryRateEdit = null; $el.blur()"
+                                       @keydown.enter.prevent="$el.blur()">
+                            </div>
                         </div>
                     </div>
                     <div x-show="styleUnconfirmed" class="text-xs text-warning mt-2">Style command unconfirmed. <button type="button" class="btn btn-link btn-xs" @click="reviewTransitionStyle()">Review hardware state</button></div>
+                    <button type="button" x-cloak x-show="hardwareReady && (primaryTransitionSetup?.reviewable || primarySetupOperation?.unconfirmed)" class="btn btn-link btn-xs mt-2" @click="reviewPrimarySetup()">Review transition settings</button>
                     <div class="cut-reason cut-feedback-hidden text-warning mt-2" x-show="primaryCutReason() || primaryAutoReason()" x-text="primaryCutReason() || primaryAutoReason()"></div>
                     <div x-show="primaryActionPending?.unconfirmed" class="flex flex-wrap items-center gap-2 text-xs text-warning mt-2">
                         <span>Primary result unconfirmed; no command will be retried.</span>
@@ -194,13 +214,37 @@
                 </div>
                 <div class="rounded-lg border border-base-300 p-3" role="group" aria-labelledby="primary-keyers-heading">
                     <div id="primary-keyers-heading" class="text-xs font-bold uppercase mb-1">Keyers</div>
-                    <div class="flex flex-wrap gap-1.5">
-                        <template x-for="keyer in upstreamKeyers" :key="'primary-usk-' + keyer.keyIndex">
-                            <button type="button" class="btn btn-xs keyer-button" :class="keyer.pending ? 'btn-warning' : (keyer.onAir === true ? 'btn-live-source' : 'btn-outline')" :aria-disabled="!hardwareReady || !!keyer.disabledReason" :title="keyer.disabledReason || (keyer.label + ' fill: ' + keyer.fillLabel)" @click="toggleUSK(keyer.keyIndex)"><span x-text="keyer.label"></span><span class="text-[9px] opacity-70" x-text="keyer.fillLabel"></span></button>
-                        </template>
-                        <template x-for="keyer in downstreamKeyers" :key="'primary-dsk-' + keyer.keyIndex">
-                            <button type="button" class="btn btn-xs keyer-button" :class="keyer.pending ? 'btn-warning' : (keyer.onAir === true ? 'btn-live-source' : 'btn-outline')" :aria-disabled="!hardwareReady || !!keyer.disabledReason" :title="keyer.disabledReason || keyer.label" @click="toggleDSK(keyer.keyIndex)"><span x-text="keyer.label"></span></button>
-                        </template>
+                    <div class="switcher-source-bus">
+                        <div class="source-grid keyer-grid" :style="primaryBusLayout.columns">
+                            <button type="button" class="btn btn-xs" style="grid-row: 2; grid-column: 1"
+                                    :class="primaryTransitionSetup?.selection?.background ? 'btn-preview-source' : 'btn-outline'"
+                                    :aria-pressed="primaryTransitionSetup?.selection?.background"
+                                    :disabled="!!primaryLayerReason('background')" :title="primaryLayerReason('background') || 'Include background in next transition'"
+                                    @click="togglePrimaryLayer('background')"><span>BKGD</span></button>
+                            <template x-for="keyer in upstreamKeyers" :key="'primary-usk-' + keyer.keyIndex">
+                                <button type="button" class="btn btn-xs" :style="{ gridRow: 1, gridColumn: primaryKeyerColumn(keyer.keyIndex + 1) }"
+                                        :class="keyer.pending ? 'btn-warning' : (keyer.onAir === true ? 'btn-live-source' : 'btn-outline')"
+                                        :aria-disabled="!!primaryUskToggleReason(keyer)" :aria-pressed="keyer.onAir"
+                                        :aria-label="keyer.label + ' ON AIR'"
+                                        :title="primaryUskToggleReason(keyer) || (keyer.label + ' fill: ' + keyer.fillLabel)"
+                                        @click="toggleUSK(keyer.keyIndex)"><span>ON AIR</span></button>
+                            </template>
+                            <template x-for="keyer in upstreamKeyers" :key="'primary-layer-' + keyer.keyIndex">
+                                <button type="button" class="btn btn-xs" :style="{ gridRow: 2, gridColumn: primaryKeyerColumn(keyer.keyIndex + 1) }"
+                                        :class="primaryTransitionSetup?.selection?.['key' + (keyer.keyIndex + 1)] ? 'btn-preview-source' : 'btn-outline'"
+                                        :aria-pressed="primaryTransitionSetup?.selection?.['key' + (keyer.keyIndex + 1)]"
+                                        :disabled="!!primaryLayerReason('key' + (keyer.keyIndex + 1))"
+                                        :title="primaryLayerReason('key' + (keyer.keyIndex + 1)) || 'Include ' + keyer.label + ' in next transition'"
+                                        @click="togglePrimaryLayer('key' + (keyer.keyIndex + 1))"><span x-text="'KEY ' + (keyer.keyIndex + 1)"></span></button>
+                            </template>
+                            <template x-for="keyer in downstreamKeyers" :key="'primary-dsk-' + keyer.keyIndex">
+                                <button type="button" class="btn btn-xs" :style="{ gridRow: 2, gridColumn: primaryKeyerColumn(upstreamKeyers.length + 1 + keyer.keyIndex) }"
+                                        :class="keyer.pending ? 'btn-warning' : (keyer.onAir === true ? 'btn-live-source' : 'btn-outline')"
+                                        :aria-disabled="!hardwareReady || !!keyer.disabledReason" :aria-pressed="keyer.onAir"
+                                        :title="keyer.disabledReason || keyer.label + ' ON AIR'"
+                                        @click="toggleDSK(keyer.keyIndex)"><span x-text="keyer.label"></span></button>
+                            </template>
+                        </div>
                     </div>
                 </div>
                 <div x-show="!connected" class="text-xs text-warning">M/E state is not currently connected.</div>
@@ -320,9 +364,9 @@
                     <div class="flex flex-wrap items-center justify-between gap-3">
                         <div>
                             <h2 class="font-bold text-lg">TAKE ALL</h2>
-                            <p class="text-xs text-base-content/60">Cuts Primary and both virtual switchers to their staged sources. Each output confirms separately.</p>
+                            <p class="text-xs text-base-content/60">Cuts the selected Primary layers and each ready virtual switcher. Each output confirms separately.</p>
                         </div>
-                        <div class="flex flex-wrap items-center gap-2">
+                        <div class="flex flex-wrap items-center gap-2" :title="takeAllReason()">
                             <button type="button" class="btn btn-error font-bold" :disabled="!!takeAllReason()" :title="takeAllReason() || 'Cut Primary and each assigned virtual switcher'" @click="takeAll()">TAKE ALL</button>
                         </div>
                     </div>
@@ -417,18 +461,6 @@
         </div>
     </div>
     <button class="modal-backdrop" aria-label="Close assignment dialog" :disabled="assignmentBusy" @click="closeAssignmentDialog()"></button>
-</div>
-
-<div x-show="keyedAutoConfirmOpen" :style="keyedAutoConfirmOpen ? 'display: grid' : 'display: none'" x-cloak class="modal modal-open" role="dialog" aria-modal="true" aria-label="Confirm keyed AUTO">
-    <div class="modal-box">
-        <h2 class="font-bold text-lg">Confirm keyed AUTO</h2>
-        <p class="py-3">The next transition includes <strong x-text="meTiedKeyList.join(', ')"></strong>. AUTO may take these keyers live. This does not change their next-transition ties.</p>
-        <div class="modal-action">
-            <button class="btn btn-ghost" @click="keyedAutoConfirmOpen = false">Cancel</button>
-            <button class="btn btn-warning" @click="dispatchPrimaryAuto(true)">Confirm AUTO</button>
-        </div>
-    </div>
-    <button class="modal-backdrop" aria-label="Cancel keyed AUTO" @click="keyedAutoConfirmOpen = false"></button>
 </div>
 
 <div x-show="groupAlignDraft" :style="groupAlignDraft ? 'display: grid' : 'display: none'" x-cloak class="modal modal-open" role="dialog" aria-modal="true" aria-label="Confirm virtual switcher route alignment">

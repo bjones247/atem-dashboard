@@ -14,6 +14,8 @@ The shared ATEM monitor now gives confirmed M/E Program routes exclusive Primary
 
 ## Immediate assignment and stop line
 
+**Primary keyed transitions.** The operator approved one press for Primary CUT, AUTO, and TAKE ALL using the displayed BKGD and KEY selection. The server checks the selection and selected key states, then waits for the resulting Program and key states. TAKE ALL runs a selected key even when the Primary background stays on the same source. See Blueprint §9 for the physical acceptance checks.
+
 **Milestones 3A–3D are implemented and offline-tested. Stop for review; do not begin another milestone.** The dashboard includes guarded assignment/release, direct output routing, Primary M/E controls, individual virtual group CUT, mixed-route alignment, and TAKE ALL. TAKE ALL preflights every participant before dispatch, then invokes the guarded Primary CUT and Virtual Switcher 1/2 CUT paths in order. Each output and switcher result remains separately confirmed; empty virtual groups are reported as skipped. It does not touch Other Outputs, retry uncertain commands, roll back successful actions, or claim frame-synchronous switching. Confirmed virtual results are saved through revision-checked configuration. No physical ATEM commands were sent. Physical validation requires separate explicit operator approval and isolated destinations.
 
 ## Approved product model

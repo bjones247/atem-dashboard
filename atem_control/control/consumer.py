@@ -412,7 +412,7 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
         # thread-sensitive lane so one slow call elsewhere can't queue
         # every operator's commands behind it. The audio verbs go to the
         # mixer the last pushed state named (Fairlight or classic).
-        if command in ('dashboard_review_me', 'dashboard_review_me_preview', 'dashboard_review_style',
+        if command in ('dashboard_review_me', 'dashboard_review_me_preview', 'dashboard_review_me_setup', 'dashboard_review_style',
                        'dashboard_review_aux', 'dashboard_review_usk', 'dashboard_review_dsk'):
             kind = {'dashboard_review_me_preview': 'me_preview',
                     'dashboard_review_style': 'style'}.get(command, command.removeprefix('dashboard_review_'))
@@ -523,6 +523,11 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
             ok, err = await sync_to_async(dashboard_switching.dispatch_me_transition_style, thread_sensitive=False)(
                 self.connection, data)
             logged_command = 'set_transition_style'
+        elif command in ('dashboard_set_transition_rate', 'dashboard_set_transition_layer'):
+            change_rate = command == 'dashboard_set_transition_rate'
+            ok, err = await sync_to_async(dashboard_switching.dispatch_me_transition_setup, thread_sensitive=False)(
+                self.connection, data, change_rate=change_rate)
+            logged_command = 'set_transition_rate' if change_rate else 'set_next_transition_layers'
         elif command == 'dashboard_cut_me':
             ok, err = await sync_to_async(dashboard_switching.dispatch_me_cut, thread_sensitive=False)(
                 self.connection, data)

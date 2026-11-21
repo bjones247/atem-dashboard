@@ -70,6 +70,49 @@ test('linked M/E panels have one live source and send one guarded CUT', () => {
   assert.equal(d.panels[0].pending, false);
 });
 
+test('Primary rate edits in seconds and frames and layer changes wait for observed state', () => {
+  const { dashboard: d, sent } = controller();
+  const state = hardware();
+  state.mes[0].transition.position = 0;
+  state.dashboardSafety.meSetup = { style: 0, rate: 30, fps: 30, selection: {
+    ...state.mes[0].transition.selection,
+  }};
+  d.updateState(state);
+  assert.equal(d.primaryRateDisplay, '1:00');
+  d.beginPrimaryRateEdit();
+  assert.equal(d.primaryRateEdit.initialText, '1:00');
+  assert.equal(sent.length, 0);
+  d.finishPrimaryRateEdit('0:30');
+  assert.equal(sent.length, 0);
+  d.beginPrimaryRateEdit();
+  d.finishPrimaryRateEdit('2:01');
+  assert.equal(sent.length, 0);
+  d.beginPrimaryRateEdit();
+  d.finishPrimaryRateEdit('1:15');
+  assert.equal(d.primaryRateDisplay, '1:00');
+  assert.deepEqual(sent[0], { command: 'dashboard_set_transition_rate', me: 0,
+    expected_style: 0, expected_rate: 30, rate: 45 });
+  assert.match(d.primaryAutoReason(), /awaiting hardware confirmation/i);
+  d.togglePrimaryLayer('key1');
+  assert.equal(sent.length, 1);
+  state.dashboardSafety.meSetup.rate = 45;
+  d.updateState(state);
+  assert.equal(d.primaryRateDisplay, '1:15');
+  d.togglePrimaryLayer('background');
+  assert.equal(sent.length, 1);
+  d.togglePrimaryLayer('key1');
+  assert.equal(sent[1].command, 'dashboard_set_transition_layer');
+  assert.equal(sent[1].expected_selection.key1, false);
+  assert.equal(d.primaryTransitionSetup.selection.key1, false);
+  state.dashboardSafety.meSetup.selection.key1 = true;
+  state.mes[0].transition.selection.key1 = true;
+  d.updateState(state);
+  assert.equal(d.primarySetupOperation, null);
+  d.primaryAuto();
+  assert.equal(sent[2].command, 'dashboard_auto_me');
+  assert.equal(sent[2].expected_selection.key1, true);
+});
+
 test('missing safety, tied key, or disconnect blocks M/E CUT', () => {
   const { dashboard: d, sent } = controller();
   d.updateState(hardware({ meReason: 'M/E transition selection has not been observed.' }));
@@ -524,7 +567,7 @@ function configureThreeC(d, options = {}) {
   d.dashboardConfig = { deviceId: 'a'.repeat(32), revision: 7, config };
 }
 
-test('3C Primary Preview and AUTO use guarded server commands; keyed AUTO needs explicit operator confirmation', () => {
+test('3C Primary Preview and keyed AUTO dispatch in one click with their observed state', () => {
   const { dashboard: d, sent } = controller();
   configureThreeC(d);
   sent.length = 0;
@@ -538,10 +581,8 @@ test('3C Primary Preview and AUTO use guarded server commands; keyed AUTO needs 
   safeState.dashboardRouting = threeCProjection();
   d.updateState(safeState);
   d.primaryAuto();
-  assert.equal(d.keyedAutoConfirmOpen, true);
-  d.dispatchPrimaryAuto(true);
   assert.equal(sent[1].command, 'dashboard_auto_me');
-  assert.equal(sent[1].allow_keyed, true);
+  assert.deepEqual(sent[1].expected_key_states, { '0': false });
   assert.deepEqual(sent[1].expected_selection, { background: true, key1: true, key2: false, key3: false, key4: false });
 });
 
@@ -563,8 +604,6 @@ test('3C key-only Primary AUTO confirms from the observed keyer after M/E return
   sent.length = 0;
 
   d.primaryAuto();
-  assert.equal(d.keyedAutoConfirmOpen, true);
-  d.dispatchPrimaryAuto(true);
   assert.deepEqual(sent[0].expected_key_states, { '0': false });
   assert.equal(JSON.stringify(d.primaryActionPending.keyTargets), JSON.stringify({ '0': true }));
 
@@ -578,7 +617,25 @@ test('3C key-only Primary AUTO confirms from the observed keyer after M/E return
   d.updateState(confirmed);
   assert.equal(d.hardwareProgramSourceId, 1, 'key-only AUTO leaves the background unchanged');
   assert.equal(d.primaryActionPending, null);
-  assert.equal(d.actionNotice, 'Primary key-only AUTO confirmed by observed keyer state.');
+  assert.match(d.actionNotice, /confirmed by observed Program and keyer state/);
+});
+
+test('Primary CUT can take a key off air with Preview already live', () => {
+  const { dashboard: d, sent } = controller();
+  const state = keyOnlyAutoState({ keyOnAir: true });
+  state.mes[0].preview = 1;
+  state.dashboardSafety.meCut.reason = 'Background is not selected for the next M/E transition.';
+  d.updateState(state);
+  assert.equal(d.primaryCutReason(), '');
+  d.primaryCut();
+  assert.equal(sent[0].command, 'dashboard_cut_me');
+  assert.deepEqual(sent[0].expected_key_states, { '0': true });
+  assert.equal(d.primaryActionPending.target, 1);
+  d.toggleUSK(0);
+  assert.equal(sent.length, 1, 'the selected key cannot be toggled while CUT is pending');
+  state.dashboardSafety.usk['0'].onAir = false;
+  d.updateState(state);
+  assert.equal(d.primaryActionPending, null);
 });
 
 test('3C key-only AUTO with unknown key state is blocked before dispatch', () => {
@@ -602,7 +659,7 @@ test('3C reviewed key-only AUTO with unchanged key state is not reported success
   initial.dashboardRouting = threeCProjection();
   d.updateState(initial);
   sent.length = 0;
-  d.dispatchPrimaryAuto(true);
+  d.primaryAuto();
   timers.get(d.primaryActionTimer)();
   assert.equal(d.primaryActionPending.unconfirmed, true);
   d.reviewPrimaryOperation();
@@ -614,7 +671,7 @@ test('3C reviewed key-only AUTO with unchanged key state is not reported success
 
   assert.equal(d.primaryActionPending, null);
   assert.match(d.actionError, /no transition was confirmed/i);
-  assert.notEqual(d.actionNotice, 'Primary key-only AUTO confirmed by observed keyer state.');
+  assert.doesNotMatch(d.actionNotice || '', /confirmed by observed Program and keyer state/);
   assert.equal(sent.filter(message => message.command === 'dashboard_auto_me').length, 1);
 });
 
@@ -673,6 +730,54 @@ test('TAKE ALL sends Primary CUT once and reports each participant after confirm
   assert.equal(d.takeAllOperation.virtual1.status, 'confirmed');
   assert.equal(d.takeAllOperation.virtual2.status, 'confirmed');
   assert.equal(sent.filter(message => message.command === 'dashboard_take_all').length, 1);
+});
+
+test('TAKE ALL includes a key-only Primary CUT when Preview is already live', () => {
+  const { dashboard: d, sent } = controller();
+  configureThreeC(d, { virtual1: [1] });
+  const initial = keyOnlyAutoState();
+  initial.mes[0].preview = initial.mes[0].program;
+  initial.dashboardSafety.meCut.reason = 'Background is not selected for the next M/E transition.';
+  initial.dashboardSafety.meSetup = {
+    selection: { ...initial.mes[0].transition.selection },
+    cutReason: null,
+    pendingReason: 'A switching command is awaiting hardware confirmation.',
+  };
+  initial.dashboardRouting = threeCProjection({ virtual1: [1] });
+  delete initial.mes[0].transition.position;
+  d.updateState(initial);
+  sent.length = 0;
+  assert.match(d.takeAllReason(), /awaiting hardware confirmation/);
+
+  // The ATEM confirms the layer selection. The raw CUT check is ready
+  // even if the general M/E view lacks a position in this snapshot.
+  initial.dashboardSafety.meSetup.pendingReason = null;
+  d.updateState(initial);
+  assert.equal(d.primaryCutReason(), '');
+  assert.equal(d.takeAllReason(), '');
+  d.takeAll();
+  assert.equal(sent[0].command, 'dashboard_take_all');
+  assert.equal(sent[0].expected_selection.key1, true);
+  assert.deepEqual(sent[0].expected_key_states, { '0': false });
+  assert.equal(d.takeAllOperation.primary.status, 'pending');
+  d.handleMessage({ type: 'dashboard_take_all_started', device_id: 'a'.repeat(32),
+    primary: { ok: true, action: 'cut', command: 'cut', before: 1, target: 1 },
+    virtual: {
+      virtual1: { status: 'pending', target: 3, previous: 1, outcomes: [{ channel: 1, ok: true }] },
+      virtual2: { status: 'skipped', outcomes: [] },
+    } });
+  initial.dashboardRouting = threeCProjection({ routes: [90010, 3, 2, 1, 2, 1], virtual1: [1] });
+  d.updateState(initial);
+  assert.equal(d.takeAllOperation.primary.status, 'pending', 'unchanged Program is insufficient');
+  assert.equal(sent.some(message => message.command === 'dashboard_config_update'), false);
+  initial.mes[0].transition.position = 0;
+  initial.dashboardSafety.usk['0'].onAir = true;
+  d.updateState(initial);
+  assert.equal(d.takeAllOperation.primary.status, 'confirmed');
+  const save = sent.find(message => message.command === 'dashboard_config_update');
+  assert.ok(save, 'the confirmed virtual CUT is saved after the selected key confirms');
+  d.handleMessage({ type: 'dashboard_config', deviceId: 'a'.repeat(32), revision: 8, config: save.config });
+  assert.equal(d.takeAllOperation.status, 'complete');
 });
 
 test('TAKE ALL allows a ready participant and skips each already live switcher', () => {
@@ -880,16 +985,18 @@ test('TAKE ALL completes when only Primary CUT runs', () => {
   assert.equal(sent.some(message => message.command === 'dashboard_config_update'), false);
 });
 
-test('TAKE ALL blocks a tied key and sends nothing', () => {
+test('TAKE ALL blocks when a selected key has no observed on-air state', () => {
   const { dashboard: d, sent } = controller();
   configureThreeC(d, { virtual1: [1] });
-  const state = hardware({ meReason: 'M/E CUT blocked: KEY 1 tied to next transition.' });
+  const state = hardware();
+  state.mes[0].transition.position = 0;
   state.mes[0].transition.selection.key1 = true;
+  state.dashboardSafety.usk['0'].onAir = null;
   state.dashboardRouting = threeCProjection({ virtual1: [1] });
   d.updateState(state);
   sent.length = 0;
   d.takeAll();
-  assert.match(d.takeAllReason(), /KEY 1/);
+  assert.match(d.takeAllReason(), /keyer on-air state has not been observed/);
   assert.deepEqual(sent, []);
 });
 

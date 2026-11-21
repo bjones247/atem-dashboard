@@ -10,11 +10,17 @@ import time
 import weakref
 from contextlib import contextmanager
 
+from atemwire.state import display_fps
+
 from atem_control.control.commands import dispatch
 
 
 MAX_RX_AGE = 4.0  # atemwire re-handshakes after roughly five quiet seconds
 PENDING_SECONDS = 3.0
+ME_PREVIEW_ALREADY_LIVE = 'M/E Preview is already live; select a different Preview source.'
+TRANSITION_LAYERS = ('background', 'key1', 'key2', 'key3', 'key4')
+TRANSITION_RATE_PACKETS = ('transition-mix', 'transition-dip', 'transition-wipe',
+                           'transition-dve', 'transition-stinger')
 _lock = threading.RLock()
 _operations = weakref.WeakKeyDictionary()
 
@@ -76,9 +82,9 @@ def _pending(connection, key, live):
         return None
     key_targets = operation.get('key_targets')
     if key_targets is not None:
-        if live != operation['before']:
+        if live is not None and live not in (operation['before'], operation['target']):
             operation['uncertain'] = True
-            return 'M/E background changed during key-only AUTO; review current hardware state before another action.'
+            return 'M/E background changed to an unexpected source during a keyed transition.'
         mx = getattr(connection, 'mixerstate', None)
         keys_confirmed = isinstance(mx, dict) and all(
             _usk_on_air(mx, int(index)) is target
@@ -89,13 +95,13 @@ def _pending(connection, key, live):
                               position.in_transition is False and
                               _integer(getattr(position, 'position', None)) and
                               position.position == 0)
-        if keys_confirmed and transition_at_rest:
+        if live == operation['target'] and keys_confirmed and transition_at_rest:
             operations.pop(key, None)
             return None
         if time.monotonic() - operation['since'] >= PENDING_SECONDS:
             operation['uncertain'] = True
-            return 'Key-only AUTO is unconfirmed. Review current keyer and M/E state before another action.'
-        return 'Key-only AUTO is awaiting observed keyer and transition confirmation.'
+            return 'Keyed transition is unconfirmed. Review current keyer and M/E state before another action.'
+        return 'Keyed transition is awaiting observed keyer and M/E state.'
     if live == operation['target']:
         operations.pop(key, None)
         return None
@@ -138,6 +144,9 @@ def me_cut_readiness(connection):
         ] + [getattr(position, 'in_transition', None)]
         if any(type(value) is not bool for value in fields):
             return 'M/E transition state is incomplete or malformed.', program, preview
+        reason, _reviewable = _transition_setup_status(connection, mx)
+        if reason:
+            return reason, program, preview
         if fields[0] is not True:
             return 'Background is not selected for the next M/E transition.', program, preview
         tied = [f'KEY {i}' for i in range(1, 5) if fields[i]]
@@ -152,7 +161,7 @@ def me_cut_readiness(connection):
         # in_transition=False and position=0. Those two observed fields are
         # the rest-state guard; the residual countdown is informational.
         if program == preview:
-            return 'M/E Preview is already live; select a different Preview source.', program, preview
+            return ME_PREVIEW_ALREADY_LIVE, program, preview
         return None, program, preview
 
 
@@ -204,6 +213,11 @@ def usk_toggle_readiness(connection, key_index, expected_on_air=None):
         live = _usk_on_air(mx, key_index)
         if live is None:
             return 'Upstream keyer on-air state has not been observed.', None
+        me_operation = _operations.get(connection, {}).get(('me', 0), {})
+        if str(key_index) in (me_operation.get('key_targets') or {}):
+            reason = _pending(connection, ('me', 0), _source(mx, 'program-bus-input', 0))
+            if reason:
+                return reason, live
         reason = _pending(connection, ('usk', key_index), live)
         if reason:
             return reason, live
@@ -298,8 +312,17 @@ def safety_snapshot(connection):
             for dsk_index in range(min(dsk_count, 64)):
                 dsk_reason, on_air = dsk_toggle_readiness(connection, dsk_index)
                 dsk[str(dsk_index)] = {'reason': dsk_reason, 'onAir': on_air}
+        settings = _entry(mx, 'transition-settings', 0) if mx is not None else None
+        style = getattr(settings, 'style', None)
+        setup_reason, reviewable = _transition_setup_status(connection, mx) if mx is not None else (None, False)
+        selected_cut_reason, _ = _selected_transition_readiness(connection)
         return {'fresh': freshness_reason is None,
                 'meCut': {'reason': reason, 'program': program, 'preview': preview},
+                'meSetup': {'selection': _observed_transition_layers(settings),
+                            'style': style, 'rate': _observed_transition_rate(mx, style),
+                            'fps': display_fps(mx) if mx is not None else None,
+                            'cutReason': selected_cut_reason,
+                            'pendingReason': setup_reason, 'reviewable': reviewable},
                 'takeAllBlockers': _take_all_pending_controls(connection, mx) if mx else [],
                 'aux': aux, 'usk': usk, 'dsk': dsk}
 
@@ -322,6 +345,8 @@ def dispatch_me_cut(connection, data):
     with _lock:
         if data.get('me', 0) != 0:
             return False, 'Dashboard supports M/E 1 only.'
+        if 'expected_selection' in data:
+            return _dispatch_selected_me_transition(connection, 'cut', data)
         reason, program, preview = me_cut_readiness(connection)
         if reason:
             return False, reason
@@ -415,6 +440,93 @@ def _me_state(mx):
             'in_transition': in_transition, 'position_value': position_value}, None
 
 
+def _observed_transition_layers(settings):
+    values = [getattr(settings, f'next_transition_{name}', None)
+              for name in ('bkgd', *TRANSITION_LAYERS[1:])]
+    if all(type(value) is bool for value in values):
+        return dict(zip(TRANSITION_LAYERS, values))
+    return None
+
+
+def _observed_transition_rate(mx, style):
+    if mx is not None and type(style) is int and 0 <= style < len(TRANSITION_RATE_PACKETS):
+        rate = getattr(_entry(mx, TRANSITION_RATE_PACKETS[style], 0), 'rate', None)
+        if _integer(rate):
+            return rate
+    return None
+
+
+def _transition_setup_observation(mx, target):
+    if target[0] == 'layers':
+        layers = _observed_transition_layers(_entry(mx, 'transition-settings', 0))
+        return ('layers', *layers.values()) if layers is not None else None
+    style = target[1]
+    rate = _observed_transition_rate(mx, style)
+    return ('rate', style, rate) if rate is not None else None
+
+
+def _transition_setup_status(connection, mx):
+    key = ('me_setup', 0)
+    operation = _operations.get(connection, {}).get(key)
+    if not operation:
+        return None, False
+    observed = _transition_setup_observation(mx, operation['target'])
+    reason = _pending(connection, key, observed)
+    reviewable = bool(reason and observed is not None and
+                      time.monotonic() - operation['since'] >= PENDING_SECONDS)
+    return reason, reviewable
+
+
+def dispatch_me_transition_setup(connection, data, *, change_rate):
+    """Update the selected style's rate or next-transition mask without taking it live."""
+    with _lock:
+        mx, reason = _raw(connection)
+        if reason:
+            return False, reason
+        state, reason = _me_state(mx)
+        if reason:
+            return False, reason
+        if data.get('me', 0) != 0 or state['in_transition'] or state['position_value'] != 0:
+            return False, 'M/E 1 must be at rest before changing transition settings.'
+        style = getattr(state['settings'], 'style', None)
+        setup_reason, _ = _transition_setup_status(connection, mx)
+        reason = (setup_reason or _pending(connection, ('me', 0), state['program']) or
+                  _pending(connection, ('transition_style', 0), style))
+        if reason:
+            return False, reason
+
+        if change_rate:
+            expected_style, expected_rate, rate = (data.get(field) for field in
+                                                   ('expected_style', 'expected_rate', 'rate'))
+            observed_rate = _observed_transition_rate(mx, style)
+            if type(expected_style) is not int or type(expected_rate) is not int or \
+                    observed_rate is None or (expected_style, expected_rate) != (style, observed_rate):
+                return False, 'Transition style or rate changed. Review the current rate.'
+            if type(rate) is not int or not 1 <= rate <= 60 or rate == observed_rate:
+                return False, 'Choose a different transition rate from 1 to 60 frames.'
+            command, payload = 'set_transition_rate', {'me': 0, 'rate': str(rate)}
+            before, target = ('rate', style, observed_rate), ('rate', style, rate)
+        else:
+            expected = data.get('expected_selection')
+            layer = data.get('layer')
+            observed = dict(zip(TRANSITION_LAYERS, state['selection']))
+            if (not isinstance(expected, dict) or expected != observed or
+                    any(type(value) is not bool for value in expected.values())):
+                return False, 'Next-transition selection changed. Review the current selection.'
+            if layer not in TRANSITION_LAYERS or (
+                    layer != 'background' and _usk_on_air(mx, int(layer[-1]) - 1) is None):
+                return False, 'Next-transition layer is unavailable.'
+            selection = {**observed, layer: not observed[layer]}
+            if not any(selection.values()):
+                return False, 'Keep at least one layer selected for the next transition.'
+            command, payload = 'set_next_transition_layers', {'me': 0, 'selection': selection}
+            before, target = ('layers', *observed.values()), ('layers', *selection.values())
+        ok, error = dispatch(connection, command, payload)
+        if ok:
+            _record(connection, ('me_setup', 0), before, target)
+        return ok, error
+
+
 def dispatch_me_preview(connection, data):
     """Guard and dispatch a Primary hardware Preview selection."""
     with _lock:
@@ -476,20 +588,25 @@ def dispatch_me_program(connection, data):
 
 
 def dispatch_me_auto(connection, data):
-    """Guard Primary AUTO; keyed transitions require explicit confirmation."""
+    """Apply the selected layers on Primary AUTO."""
+    return _dispatch_selected_me_transition(connection, 'auto', data)
+
+
+def _dispatch_selected_me_transition(connection, command, data):
     with _lock:
-        reason, state = me_auto_readiness(connection, data)
+        reason, state = (me_auto_readiness(connection, data) if command == 'auto' else
+                         _selected_transition_readiness(connection, data))
         if reason:
             return False, reason
-        ok, error = dispatch(connection, 'auto', {'me': 0})
+        ok, error = dispatch(connection, command, {'me': 0})
         if ok:
-            _record(connection, ('me', 0), state['program'], state['preview'],
+            _record(connection, ('me', 0), state['program'], state['target'],
                     key_targets=state.get('key_targets'))
         return ok, error
 
 
-def me_auto_readiness(connection, data):
-    """Validate the selected hardware AUTO without issuing a command."""
+def _selected_transition_readiness(connection, data=None):
+    """Check current readiness, and compare the displayed state before a write."""
     with _lock:
         mx, reason = _raw(connection)
         if reason:
@@ -497,43 +614,57 @@ def me_auto_readiness(connection, data):
         state, reason = _me_state(mx)
         if reason:
             return reason, None
-        if data.get('me', 0) != 0 or data.get('expected_program') != state['program'] or \
-                data.get('expected_preview') != state['preview']:
+        if data is not None and (data.get('me', 0) != 0 or not _integer(data.get('expected_program')) or
+                not _integer(data.get('expected_preview')) or data['expected_program'] != state['program'] or
+                data['expected_preview'] != state['preview']):
             return 'M/E Program or Preview changed; review the current hardware state.', None
         if state['in_transition'] or state['position_value'] != 0:
             return 'M/E transition is active or not at rest.', None
-        if state['program'] == state['preview']:
-            return 'M/E Preview is already live; select a different Preview source.', None
         pending = _pending(connection, ('me', 0), state['program'])
         if pending:
             return pending, None
+        setup_reason, _ = _transition_setup_status(connection, mx)
+        if setup_reason:
+            return setup_reason, None
         background, *keys = state['selection']
-        expected_selection = data.get('expected_selection')
-        observed_selection = {'background': background,
-                              **{f'key{i + 1}': keys[i] for i in range(4)}}
-        if not isinstance(expected_selection, dict) or expected_selection != observed_selection:
-            return 'M/E next-transition selection changed; review the tied keyers before AUTO.', None
+        if data is not None:
+            expected_selection = data.get('expected_selection')
+            observed_selection = dict(zip(TRANSITION_LAYERS, state['selection']))
+            if (not isinstance(expected_selection, dict) or expected_selection != observed_selection or
+                    any(type(value) is not bool for value in expected_selection.values())):
+                return 'M/E next-transition selection changed; review the current layers.', None
         if not (background or any(keys)):
             return 'No M/E background or keyer is selected for the next transition.', None
-        tied = [index + 1 for index, selected in enumerate(keys) if selected]
-        if tied and data.get('allow_keyed') is not True:
-            return 'Keyed AUTO requires explicit confirmation for: ' + ', '.join(f'KEY {i}' for i in tied), None
-        if not background:
+        if state['program'] == state['preview'] and not any(keys):
+            return ME_PREVIEW_ALREADY_LIVE, None
+        state['target'] = state['preview'] if background else state['program']
+        if any(keys):
             key_before = {}
-            key_targets = {}
             for key_index, selected in enumerate(keys):
                 if not selected:
                     continue
                 on_air = _usk_on_air(mx, key_index)
                 if on_air is None:
-                    return f'Key-only AUTO cannot be confirmed because KEY {key_index + 1} on-air state is unknown.', None
+                    return f'KEY {key_index + 1} on-air state is unknown.', None
+                pending = _pending(connection, ('usk', key_index), on_air)
+                if pending:
+                    return pending, None
                 key_before[str(key_index)] = on_air
-                key_targets[str(key_index)] = not on_air
-            expected_key_states = data.get('expected_key_states')
-            if not isinstance(expected_key_states, dict) or expected_key_states != key_before:
-                return 'Key-only AUTO keyer state changed or is unavailable; review keyer state before AUTO.', None
-            state['key_before'] = key_before
-            state['key_targets'] = key_targets
+            if data is not None:
+                expected_key_states = data.get('expected_key_states')
+                if (not isinstance(expected_key_states, dict) or expected_key_states != key_before or
+                        any(type(value) is not bool for value in expected_key_states.values())):
+                    return 'Selected keyer state changed or is unavailable; review current on-air state.', None
+            state['key_targets'] = {index: not on_air for index, on_air in key_before.items()}
+        return None, state
+
+
+def me_auto_readiness(connection, data):
+    """Validate the selected layers and AUTO style without issuing a command."""
+    with _lock:
+        reason, state = _selected_transition_readiness(connection, data)
+        if reason:
+            return reason, None
         style = getattr(state['settings'], 'style', None)
         if type(style) is not int or style not in (0, 1, 2, 3, 4):
             return 'Selected M/E transition style is unknown or unsupported.', None
@@ -544,7 +675,7 @@ def me_auto_readiness(connection, data):
             return pending_style, None
         if style in (3, 4):
             capability = 'dves' if style == 3 else 'stingers'
-            count = getattr(mx.get('topology'), capability, None)
+            count = getattr(connection.mixerstate.get('topology'), capability, None)
             if not _integer(count) or count == 0:
                 return f'{"DVE" if style == 3 else "Stinger"} transition capability is unavailable or unknown.', None
         return None, state
@@ -568,6 +699,9 @@ def dispatch_me_transition_style(connection, data):
             return False, 'M/E transition progress state is incomplete.'
         if position.in_transition or position.position != 0:
             return False, 'Transition style cannot change while M/E is transitioning.'
+        setup_reason, _ = _transition_setup_status(connection, mx)
+        if setup_reason:
+            return False, setup_reason
         if style in (3, 4):
             topology = mx.get('topology')
             capability = 'dves' if style == 3 else 'stingers'
@@ -919,20 +1053,12 @@ def take_all_readiness(connection, data, config_snapshot, require_current_revisi
         if blockers:
             return blockers[0]['message'], None
 
-        me, reason = _me_state(mx)
-        if reason:
-            return reason, None
-        if not _integer(data.get('expected_program')) or not _integer(data.get('expected_preview')) or \
-                data['expected_program'] != me['program'] or data['expected_preview'] != me['preview']:
-            return 'M/E Program or Preview changed; review current hardware state before TAKE ALL.', None
-        expected_selection = data.get('expected_selection')
-        observed_selection = {'background': me['selection'][0],
-                              **{f'key{i + 1}': value for i, value in enumerate(me['selection'][1:])}}
-        if not isinstance(expected_selection, dict) or expected_selection != observed_selection:
-            return 'M/E next-transition selection changed; review it before TAKE ALL.', None
-        primary_data = {'me': 0, 'expected_program': me['program'], 'expected_preview': me['preview']}
-        reason, _program, _preview = me_cut_readiness(connection)
-        primary_skipped = reason == 'M/E Preview is already live; select a different Preview source.'
+        primary_data = {'me': 0, 'expected_program': data.get('expected_program'),
+                        'expected_preview': data.get('expected_preview'),
+                        'expected_selection': data.get('expected_selection'),
+                        'expected_key_states': data.get('expected_key_states')}
+        reason, me = _selected_transition_readiness(connection, primary_data)
+        primary_skipped = reason == ME_PREVIEW_ALREADY_LIVE
         if reason and not primary_skipped:
             return reason, None
 
@@ -983,7 +1109,8 @@ def take_all_readiness(connection, data, config_snapshot, require_current_revisi
         if primary_skipped and all(group.get('status') == 'skipped' for group in virtual.values()):
             return 'Preview is already live on every switcher; select a different Preview source.', None
         return None, {'device_id': device_id, 'revision': revision,
-                      'primary': None if primary_skipped else primary_data, 'virtual': virtual}
+                      'primary': None if primary_skipped else primary_data,
+                      'primary_target': None if primary_skipped else me['target'], 'virtual': virtual}
 
 
 def dispatch_take_all(connection, data, config_snapshot, require_current_revision=False):
@@ -1000,7 +1127,7 @@ def dispatch_take_all(connection, data, config_snapshot, require_current_revisio
             primary_ok, primary_error = dispatch_me_cut(connection, plan['primary'])
             primary = {'ok': primary_ok, 'action': 'cut', 'command': 'cut',
                        'before': plan['primary']['expected_program'],
-                       'target': plan['primary']['expected_preview'],
+                       'target': plan['primary_target'],
                        'error': primary_error if not primary_ok else ''}
 
         virtual = {}
@@ -1107,12 +1234,18 @@ def dispatch_virtual_group_align(connection, data, config_snapshot, require_curr
 def review_unconfirmed(connection, kind, channel=0):
     """Explicit read-only reconciliation after timeout; never retries a write."""
     with _lock:
-        if kind not in ('me', 'me_preview', 'style', 'aux', 'usk', 'dsk') or \
+        if kind not in ('me', 'me_preview', 'me_setup', 'style', 'aux', 'usk', 'dsk') or \
                 (kind in ('aux', 'usk', 'dsk') and not _integer(channel)):
             return False, 'Unknown dashboard switching operation.'
         mx, reason = _raw(connection)
         if reason:
             return False, reason
+        if kind == 'me_setup':
+            reason, reviewable = _transition_setup_status(connection, mx)
+            if reason and not reviewable:
+                return False, 'Wait for the transition settings to settle before reviewing.'
+            _operations.get(connection, {}).pop(('me_setup', 0), None)
+            return True, None
         key = ('me', 0) if kind == 'me' else (kind, 0) if kind in ('me_preview', 'style') else (kind, channel)
         if kind == 'usk':
             live = _usk_on_air(mx, channel)

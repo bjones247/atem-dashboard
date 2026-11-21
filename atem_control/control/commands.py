@@ -87,6 +87,8 @@ ATEM_COMMAND_MAP = {
     # Transition control
     'set_transition_style': lambda c, d: ops.set_transition_style(c, style=d['style'], me=d.get('me', 0)),
     'set_transition_rate': lambda c, d: ops.set_transition_rate(c, rate_str=d['rate'], me=d.get('me', 0)),
+    'set_next_transition_layers': lambda c, d: ops.set_next_transition_layers(
+        c, me=d.get('me', 0), **d['selection']),
     'set_mix_rate': lambda c, d: ops.set_mix_rate(c, rate_str=d['rate'], me=d.get('me', 0)),
     'set_dip_rate': lambda c, d: ops.set_dip_rate(c, rate_str=d['rate'], me=d.get('me', 0)),
     'set_wipe_rate': lambda c, d: ops.set_wipe_rate(c, rate_str=d['rate'], me=d.get('me', 0)),

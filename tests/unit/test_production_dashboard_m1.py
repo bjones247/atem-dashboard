@@ -284,6 +284,8 @@ def test_aux_preview_and_master_cut_safety_in_js():
                   'dashboard_config_get', 'dashboard_config_update',
                   'dashboard_set_preview_me', 'dashboard_set_program_me',
                   'dashboard_auto_me', 'dashboard_set_transition_style',
+                  'dashboard_set_transition_rate', 'dashboard_set_transition_layer',
+                  'dashboard_review_me_setup',
                   'dashboard_output_route', 'dashboard_cut_virtual_group',
                   'dashboard_align_virtual_group', 'dashboard_review_me_preview',
                   'dashboard_review_style', 'dashboard_take_all'}

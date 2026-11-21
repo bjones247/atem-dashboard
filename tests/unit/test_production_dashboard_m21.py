@@ -116,6 +116,46 @@ def _three_c_config(**groups):
     return {'deviceId': 'a' * 32, 'revision': 7, 'config': config}
 
 
+def test_primary_rate_is_in_frames_and_waits_for_the_selected_style_to_confirm():
+    c = _three_c_connection()
+    packets = []
+    c.send = packets.append
+    c.mixerstate['transition-settings'][0].style = 2
+    c.mixerstate['transition-wipe'] = {0: NS(rate=20)}
+    c.mixerstate['video-mode'] = NS(rate=59.94)
+    request = {'expected_style': 2, 'expected_rate': 20, 'rate': 60}
+    assert switching.dispatch_me_transition_setup(c, {**request, 'expected_style': 0}, change_rate=True)[0] is False
+    assert switching.dispatch_me_transition_setup(c, {**request, 'rate': 61}, change_rate=True)[0] is False
+    assert packets == []
+    assert switching.dispatch_me_transition_setup(c, request, change_rate=True) == (True, None)
+    assert [(p.__class__.__name__, p.rate) for p in packets] == [('WipeSettingsCommand', 60)]
+    assert switching.safety_snapshot(c)['meSetup']['rate'] == 20
+    assert switching.dispatch_me_transition_setup(c, request, change_rate=True)[0] is False
+    c.mixerstate['transition-wipe'][0].rate = 60
+    setup = switching.safety_snapshot(c)['meSetup']
+    assert setup['rate'] == 60 and setup['fps'] == 30 and not setup['pendingReason']
+
+
+def test_primary_next_transition_updates_layers_without_taking_key_live():
+    c = _three_c_connection()
+    packets = []
+    c.send = packets.append
+    setup = switching.safety_snapshot(c)['meSetup']
+    selection = setup['selection']
+    request = {'expected_selection': selection, 'layer': 'key1'}
+    assert switching.dispatch_me_transition_setup(
+        c, {**request, 'layer': 'background'}, change_rate=False)[0] is False
+    assert switching.dispatch_me_transition_setup(c, request, change_rate=False) == (True, None)
+    assert [(p.__class__.__name__, p.next_transition) for p in packets] == [('TransitionSettingsCommand', 3)]
+    assert switching.me_cut_readiness(c)[0]
+    assert switching.dispatch_me_transition_setup(c, request, change_rate=False)[0] is False
+    assert c.mixerstate['key-on-air'][0][0].enabled is False
+    c.mixerstate['transition-settings'][0].next_transition_key1 = True
+    setup = switching.safety_snapshot(c)['meSetup']
+    assert setup['selection']['key1'] is True and not setup['pendingReason']
+    assert 'KEY 1 tied' in switching.me_cut_readiness(c)[0]
+
+
 def _take_all_request(action='cut'):
     return {'device_id': 'a' * 32, 'config_revision': 7, 'primary_action': action,
             'expected_program': 1, 'expected_preview': 2,
@@ -146,7 +186,7 @@ def _key_only_auto_payload():
     return {'me': 0, 'expected_program': 1, 'expected_preview': 2,
             'expected_selection': {'background': False, 'key1': True, 'key2': False,
                                    'key3': False, 'key4': False},
-            'expected_key_states': {'0': False}, 'allow_keyed': True,
+            'expected_key_states': {'0': False},
             'expected_style': 0}
 
 
@@ -192,7 +232,7 @@ def test_key_only_auto_requires_observed_key_state_and_times_out_unconfirmed(mon
     assert switching.dispatch_me_auto(c, _key_only_auto_payload()) == (True, None)
     switching._operations[c][('me', 0)]['since'] -= switching.PENDING_SECONDS + 1
     reason, _state = switching.me_auto_readiness(c, _key_only_auto_payload())
-    assert 'Key-only AUTO is unconfirmed' in reason
+    assert 'Keyed transition is unconfirmed' in reason
     assert ('me', 0) in switching._operations.get(c, {})
     assert len(sent) == 1
 
@@ -465,8 +505,8 @@ def test_take_all_empty_group_is_skipped_even_when_its_saved_queue_is_unavailabl
     (lambda c, config, request: (config['config']['virtualSwitchers']['virtual1'].update({'outputs': [1]}), config['config']['virtualSwitchers']['virtual2'].update({'outputs': [1]})), 'conflicted'),
     (lambda c, config, request: request.update({'config_revision': 6}), 'revision'),
     (lambda c, config, request: setattr(c.protocol.transport, 'last_rx_monotonic', time.monotonic() - switching.MAX_RX_AGE - 1), 'stale'),
-    (lambda c, config, request: (setattr(c.mixerstate['transition-settings'][0], 'next_transition_key1', True), request['expected_selection'].update({'key1': True})), 'KEY 1'),
-    (lambda c, config, request: setattr(c.mixerstate['transition-position'][0], 'in_transition', True), 'in progress'),
+    (lambda c, config, request: (setattr(c.mixerstate['transition-settings'][0], 'next_transition_key1', True), request['expected_selection'].update({'key1': True})), 'keyer state'),
+    (lambda c, config, request: setattr(c.mixerstate['transition-position'][0], 'in_transition', True), 'active or not at rest'),
     (lambda c, config, request: switching._operations.setdefault(c, {}).update({('aux', 1): {'before': 1, 'target': 2, 'since': time.monotonic(), 'uncertain': False}}), 'pending or unconfirmed'),
 ])
 def test_take_all_preflight_failure_dispatches_nothing(monkeypatch, mutate, message):
@@ -483,6 +523,30 @@ def test_take_all_preflight_failure_dispatches_nothing(monkeypatch, mutate, mess
 
     assert not ok and message.lower() in reason.lower()
     assert sent == []
+
+
+@pytest.mark.parametrize('background, preview, target', [(True, 2, 2), (False, 1, 1)])
+def test_take_all_cuts_selected_keys_and_ready_virtual_group(monkeypatch, background, preview, target):
+    c = _three_c_connection()
+    c.mixerstate['preview-bus-input'][0].source = preview
+    settings = c.mixerstate['transition-settings'][0]
+    settings.next_transition_bkgd = background
+    settings.next_transition_key1 = True
+    config = _three_c_config(virtual1={'outputs': [1], 'previewSource': 2, 'programTarget': 1})
+    request = {**_take_all_request(), 'expected_preview': preview, 'expected_key_states': {'0': False}}
+    request['expected_selection'].update(background=background, key1=True)
+    snapshot = switching.safety_snapshot(c)
+    assert snapshot['meCut']['reason']  # The legacy background-only CUT is unavailable.
+    assert snapshot['meSetup']['cutReason'] is None
+    sent = []
+    monkeypatch.setattr(switching, 'dispatch', lambda _c, command, data: sent.append(command) or (True, None))
+
+    ok, result = switching.dispatch_take_all(c, request, config)
+
+    assert ok and result['primary']['ok']
+    assert result['primary']['target'] == target
+    assert sent == ['cut', 'set_aux_output']
+    assert switching._operations[c][('me', 0)]['key_targets'] == {'0': True}
 
 
 def test_take_all_reports_independent_partial_virtual_failures_without_retry(monkeypatch):
@@ -526,7 +590,8 @@ def test_guarded_me_preview_direct_program_and_transition_style(monkeypatch):
     assert 'awaiting' in switching.dispatch_me_transition_style(c, {'me': 0, 'style': 2})[1]
 
 
-def test_keyed_auto_requires_explicit_intent_and_does_not_change_ties(monkeypatch):
+@pytest.mark.parametrize('command, send', [('cut', switching.dispatch_me_cut), ('auto', switching.dispatch_me_auto)])
+def test_primary_keyed_transition_checks_and_confirms_program_and_keys(monkeypatch, command, send):
     c = _three_c_connection()
     c.mixerstate['transition-settings'][0].next_transition_key2 = True
     sent = []
@@ -534,10 +599,20 @@ def test_keyed_auto_requires_explicit_intent_and_does_not_change_ties(monkeypatc
     payload = {'me': 0, 'expected_program': 1, 'expected_preview': 2,
                'expected_selection': {'background': True, 'key1': False, 'key2': True,
                                       'key3': False, 'key4': False}}
-    assert 'explicit confirmation' in switching.dispatch_me_auto(c, payload)[1]
-    assert switching.dispatch_me_auto(c, {**payload, 'allow_keyed': True}) == (True, None)
-    assert sent == [('auto', {'me': 0})]
+    assert 'keyer state' in send(c, payload)[1]
+    payload['expected_key_states'] = {'1': False}
+    assert 'selection changed' in send(c, {**payload, 'expected_selection': {
+        **payload['expected_selection'], 'key2': False}})[1]
+    assert sent == []
+    assert send(c, payload) == (True, None)
+    assert sent == [(command, {'me': 0})]
     assert c.mixerstate['transition-settings'][0].next_transition_key2 is True
+    c.mixerstate['program-bus-input'][0].source = 2
+    assert 'awaiting observed' in switching.me_cut_readiness(c)[0]
+    assert switching.usk_toggle_readiness(c, 1)[0]
+    c.mixerstate['key-on-air'][0][1].enabled = True
+    assert 'KEY 2 tied' in switching.me_cut_readiness(c)[0]
+    assert ('me', 0) not in switching._operations.get(c, {})
 
 
 def test_physical_output_route_checks_installation_topology_ownership_and_expected_route(monkeypatch):
@@ -1270,11 +1345,6 @@ window.addEventListener('load', async () => {
     const conflictExcludedFromVirtual = !!conflictCheckbox && !conflictCheckbox.checked && conflictCheckbox.disabled;
     assignmentDialog.querySelector('.modal-action .btn-ghost').click(); await Alpine.nextTick();
 
-    dashboard.keyedAutoConfirmOpen = true; await Alpine.nextTick();
-    const keyedDialog = document.querySelector('[aria-label="Confirm keyed AUTO"]');
-    const keyedDialogScoped = visible(keyedDialog) && keyedDialog.textContent.includes('Confirm keyed AUTO');
-    keyedDialog.querySelector('.modal-action .btn-ghost').click(); await Alpine.nextTick();
-
     dashboard.groupAlignDraft = {groupId: 'virtual1', target: 1,
       expectedRoutes: [{channel: 1, source: 1}, {channel: 2, source: 2}]};
     await Alpine.nextTick();
@@ -1305,13 +1375,11 @@ window.addEventListener('load', async () => {
     const takeAllReady = !takeAllButton.disabled && dashboard.takeAllReason() === '';
     const keyedState = makeState(takeRoutes);
     keyedState.mes[0].transition.selection.key1 = true;
-    keyedState.dashboardSafety.meCut.reason = 'M/E CUT blocked: KEY 1 tied to next transition.';
+    keyedState.mes[0].transition.position = 0;
+    keyedState.dashboardSafety.usk['0'] = {onAir: false};
     keyedState.dashboardRouting = takeState.dashboardRouting;
     dashboard.updateState(keyedState); await Alpine.nextTick();
-    const commandsBeforeTiedCut = window.sentCommands.length;
-    dashboard.takeAll(); await Alpine.nextTick();
-    const tiedTakeAllBlocked = takeAllButton.disabled && window.sentCommands.length === commandsBeforeTiedCut;
-    dashboard.updateState(takeState); await Alpine.nextTick();
+    const keyedTakeAllReady = !takeAllButton.disabled && dashboard.takeAllReason() === '';
     takeAllButton.click(); await Alpine.nextTick();
     const takeAllCommand = window.sentCommands.find(command => command.command === 'dashboard_take_all');
     dashboard.handleMessage({type: 'dashboard_take_all_started', device_id: deviceId,
@@ -1336,11 +1404,11 @@ window.addEventListener('load', async () => {
     document.getElementById('result').textContent = JSON.stringify({
       primaryOpened, primaryReleaseReview, primaryReleaseCommand, primaryReleaseConfirmed,
       virtualOneOpened, virtualTwoOpened, reviewedDiff, applyConnected,
-      assignmentFinished, keyedDialogScoped, alignmentDialogScoped, hardwareCommands,
+      assignmentFinished, alignmentDialogScoped, hardwareCommands,
       configUnavailableDisabled, configUnavailableReason,
       primaryCancelled, staleDisabled, staleReason, topologyDisabled, topologyReason,
       configErrorDisabled, configErrorReason, primaryOwnsConflictedOutput, conflictExcludedFromVirtual,
-      primaryVisibilityDebug, takeAllReady, takeAllCommand, tiedTakeAllBlocked,
+      primaryVisibilityDebug, takeAllReady, takeAllCommand, keyedTakeAllReady,
       takeAllPendingWithoutResultPanel, otherOverflow, otherDirectButtons,
       primaryLiveStyle, virtualLiveStyle, outputBadgeStyle,
     });
@@ -1383,7 +1451,6 @@ window.addEventListener('load', async () => {
     assert 'Route IN2' in observed['reviewedDiff']
     assert observed['applyConnected'] is True
     assert observed['assignmentFinished'] is True
-    assert observed['keyedDialogScoped'] is True
     assert observed['alignmentDialogScoped'] is True
     assert observed['hardwareCommands'] == []
     assert observed['configUnavailableDisabled'] is True
@@ -1396,7 +1463,8 @@ window.addEventListener('load', async () => {
     assert 'revision conflict' in observed['configErrorReason'].lower()
     assert observed['takeAllReady'] is True
     assert observed['takeAllCommand']['primary_action'] == 'cut'
-    assert observed['tiedTakeAllBlocked'] is True
+    assert observed['keyedTakeAllReady'] is True
+    assert observed['takeAllCommand']['expected_key_states'] == {'0': False}
     assert observed['takeAllPendingWithoutResultPanel'] is True
     assert observed['otherOverflow'] == 'auto'
     assert observed['otherDirectButtons'] is True
