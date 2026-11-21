@@ -1,0 +1,81 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Offline dashboard keyer DOM regression</title>
+<link rel="stylesheet" href="../../atem_control/static/vendor/webatem.css">
+<style>
+.production-dashboard .btn.btn-key-active,
+.production-dashboard .btn.btn-key-active:hover {
+  background-color: var(--pgm, #dc2626) !important;
+  color: #fff !important;
+  border-color: var(--pgm, #dc2626) !important;
+  transition: none !important;
+}
+.production-dashboard .btn.btn-key-pending,
+.production-dashboard .btn.btn-key-pending:hover {
+  background-color: #92400e !important;
+}
+</style>
+<link rel="stylesheet" href="../../atem_control/static/brand/brand.css">
+<script>
+window.sentCommands = [];
+window.WebSocket = class {
+  static OPEN = 1;
+  static CONNECTING = 0;
+  constructor() { this.readyState = 1; }
+  send(value) { window.sentCommands.push(JSON.parse(value)); }
+  close() { this.readyState = 3; }
+};
+</script>
+<div id="dashboard" class="production-dashboard" x-data="productionDashboard">
+  <template x-for="k in upstreamKeyers" :key="k.keyIndex">
+    <button :id="'key-' + k.keyIndex" class="btn btn-sm h-auto py-2 flex flex-col justify-between border text-left"
+            :class="{'btn-key-active': k.onAir === true && !k.pending && !k.unconfirmed,
+                     'btn-key-pending': k.pending,
+                     'btn-key-unconfirmed': k.unconfirmed,
+                     'cursor-not-allowed': !hardwareReady || !!k.disabledReason,
+                     'opacity-50': !hardwareReady || (!!k.disabledReason && !k.pending && !k.unconfirmed)}"
+            :aria-disabled="!hardwareReady || !!k.disabledReason"
+            @click="toggleUSK(k.keyIndex)" x-text="k.statusText"></button>
+  </template>
+</div>
+<output id="result">waiting</output>
+<script src="../../atem_control/static/js/production_dashboard.js"></script>
+<script>
+function state(onAir) {
+  return {
+    is_connected: true,
+    sources: [{source: 1, short: 'IN1', long: 'Input 1', available_me1: true}],
+    auxOutputs: {},
+    mes: [{program: 1, preview: 1, usk: {states: [onAir], data: [{fill_source: 1}]}}],
+    dashboardSafety: {fresh: true, meCut: {reason: 'Preview is already live.', program: 1, preview: 1},
+      aux: {}, usk: {'0': {reason: null, onAir}}}
+  };
+}
+document.addEventListener('alpine:initialized', () => {
+  const dashboard = Alpine.$data(document.getElementById('dashboard'));
+  dashboard.updateState(state(false));
+  setTimeout(() => {
+    const initialButton = document.getElementById('key-0');
+    initialButton.click();
+    initialButton.click(); // pending clicks must not enqueue another write
+    const blockedClickSentNoCommand = window.sentCommands.length === 1;
+    dashboard.updateState(state(true));
+    setTimeout(() => {
+      const button = document.getElementById('key-0');
+      const enabledAfterOn = !button.disabled && button.classList.contains('btn-key-active');
+      const keyer = dashboard.upstreamKeyers[0];
+      const observedAtClick = {disabled: button.disabled, active: button.classList.contains('btn-key-active'),
+        pending: keyer.pending, unconfirmed: keyer.unconfirmed,
+        disabledReason: keyer.disabledReason, hardwareReady: dashboard.hardwareReady,
+        ariaDisabled: button.getAttribute('aria-disabled'),
+        background: getComputedStyle(button).backgroundColor};
+      button.click();
+      const commands = window.sentCommands.filter(command => command.command === 'dashboard_toggle_usk');
+      document.getElementById('result').textContent = JSON.stringify({
+        enabledAfterOn, blockedClickSentNoCommand, observedAtClick, commands,
+      });
+    }, 500);
+  }, 100);
+});
+</script>
+<script defer src="../../atem_control/static/vendor/alpine.min.js"></script>

@@ -87,6 +87,8 @@ ATEM_COMMAND_MAP = {
     # Transition control
     'set_transition_style': lambda c, d: ops.set_transition_style(c, style=d['style'], me=d.get('me', 0)),
     'set_transition_rate': lambda c, d: ops.set_transition_rate(c, rate_str=d['rate'], me=d.get('me', 0)),
+    'set_next_transition_layers': lambda c, d: ops.set_next_transition_layers(
+        c, me=d.get('me', 0), **d['selection']),
     'set_mix_rate': lambda c, d: ops.set_mix_rate(c, rate_str=d['rate'], me=d.get('me', 0)),
     'set_dip_rate': lambda c, d: ops.set_dip_rate(c, rate_str=d['rate'], me=d.get('me', 0)),
     'set_wipe_rate': lambda c, d: ops.set_wipe_rate(c, rate_str=d['rate'], me=d.get('me', 0)),
@@ -94,7 +96,11 @@ ATEM_COMMAND_MAP = {
 
     # USK/DSK quick-toggle
     'toggle_usk': lambda c, d: ops.toggle_usk(c, keyer=d['key_index'], me=d.get('me', 0)),
+    'set_usk_on_air': lambda c, d: ops.set_usk_on_air(
+        c, keyer=d['key_index'], enabled=d['enabled'], me=d.get('me', 0)),
     'toggle_dsk': lambda c, d: ops.toggle_dsk(c, dsk_idx=d.get('dsk', 0)),
+    'set_dsk_on_air': lambda c, d: ops.set_dsk_on_air(
+        c, enabled=d['enabled'], dsk_idx=d['dsk']),
     'dsk_auto': lambda c, d: ops.dsk_auto(c, dsk_idx=d.get('dsk', 0)),
     'set_dsk_rate': lambda c, d: ops.set_dsk_rate(c, rate_str=d['rate'], dsk_idx=d.get('dsk', 0)),
 

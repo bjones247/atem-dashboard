@@ -11,6 +11,8 @@ urlpatterns = [
 
     path('',                            control_views.atem_connect, name='connect'),
     path('control/',                    control_views.atem_control, name='control'),
+    path('live/',                       control_views.atem_workspace, name='workspace'),
+    path('dashboard/',                  control_views.atem_dashboard, name='dashboard'),
     path('api/status/',                 control_views.atem_status, name='atem_status'),
     path('api/lookup-name/',            control_views.atem_lookup_name, name='atem_lookup_name'),
     path('api/discovered/',             control_views.atem_discovered, name='atem_discovered'),

@@ -1,0 +1,1 @@
+{% if app_title|slice:":3" == "web" %}<span>web</span>{{ app_title|slice:"3:" }}{% else %}{{ app_title }}{% endif %}

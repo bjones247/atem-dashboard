@@ -14,6 +14,7 @@ import io
 import json
 import zipfile
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 from PIL import Image
 
@@ -134,7 +135,7 @@ def test_a_restore_gives_every_slot_its_picture_and_its_name(client, monkeypatch
     def fake_execute_upload(items, **kw):
         for _ip, slot, path in items:
             with open(path, 'rb') as f:
-                uploads[slot] = (path.rsplit('/', 1)[-1], f.read())
+                uploads[slot] = (Path(path).name, f.read())
         return [_Done(slot) for _ip, slot, _ in items]
 
     monkeypatch.setattr(views, 'ATEM', lambda ip: _Atem())
@@ -158,5 +159,5 @@ def test_a_restore_gives_every_slot_its_picture_and_its_name(client, monkeypatch
 
 def test_a_slot_name_cannot_leave_the_restore_s_folder(tmp_path):
     path = views._slot_image_path(str(tmp_path), {'slot': 3, 'name': '../../etc/x'}, 'x.png')
-    assert path.startswith(str(tmp_path / '3') + '/') and '/' not in path.rsplit('/3/', 1)[1]
-    assert views._slot_image_path(str(tmp_path), {'slot': 4, 'name': ''}, 'Slot4.png').endswith('/4/Slot4.png')
+    assert Path(path).parent == tmp_path / '3'
+    assert Path(views._slot_image_path(str(tmp_path), {'slot': 4, 'name': ''}, 'Slot4.png')) == tmp_path / '4' / 'Slot4.png'

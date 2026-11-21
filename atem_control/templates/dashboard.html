@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% load static static_v %}
+
+{% block title %}Production Dashboard - {{ app_title }}{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{% static_v 'css/atem_control.css' %}">
+{% include 'dashboard/_styles.html' %}
+{% endblock %}
+
+{% block content %}
+{% include 'dashboard/_surface.html' %}
+{% endblock %}
+
+{% block extra_js %}
+{{ atem_equipment|json_script:"atem-equipment-data" }}
+<script src="{% static_v 'js/production_dashboard.js' %}"></script>
+<script defer src="{% static 'vendor/alpine.min.js' %}"></script>
+{% endblock %}

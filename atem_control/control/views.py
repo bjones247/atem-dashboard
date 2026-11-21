@@ -11,7 +11,7 @@ Endpoints:
 import logging
 
 from django.http import JsonResponse, HttpResponseBadRequest
-from django.shortcuts import render
+from django.shortcuts import redirect, render
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_POST
 
@@ -71,6 +71,30 @@ def atem_control(request):
     """ATEM control interface."""
     return render(request, 'control.html', {
         'initial_ip': request.GET.get('ip', '192.168.1.100'),
+        **_page_context(request),
+    })
+
+
+@ensure_csrf_cookie
+@access_required
+def atem_workspace(request):
+    """Virtual switching inside the stock WebATEM control page."""
+    ip = request.GET.get('ip', '').strip()
+    if not ip:
+        return redirect('atem_control:connect')
+    return render(request, 'control_virtual.html', {
+        **_page_context(request),
+        'initial_ip': ip,
+        'virtual_workspace': True,
+    })
+
+
+@ensure_csrf_cookie
+@access_required
+def atem_dashboard(request):
+    """Production Dashboard (3 physical outputs)."""
+    return render(request, 'dashboard.html', {
+        'initial_ip': request.GET.get('ip', ''),
         **_page_context(request),
     })
 

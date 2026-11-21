@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% load static %}
-{% block title %}WebATEM{% endblock %}
+{% block title %}{{ app_title }}{% endblock %}
 {% block extra_css %}
 <style>
   /* The launcher window: a fixed-size panel in the brand — header lockup,
@@ -27,7 +27,7 @@
   .lw-update .faint { color: var(--text-faint); font-size: 13px; }
   .lw-update code { font-family: var(--font-mono); font-size: 13px; color: var(--text); }
   .lw-update-actions { display: flex; align-items: center; gap: 6px; flex: none; }
-  .lw-foot-actions { display: flex; gap: 2px; }
+  .lw-foot-actions { display: flex; flex-shrink: 0; gap: 2px; }
   .lw-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
   /* Uninstall: a panel over the form, saying exactly what goes (the real
      paths, machine data in mono) before anything does. */
@@ -46,7 +46,7 @@
      data-settings="{% url 'server_settings' %}">
   <div class="lw-head">
     <span class="brand-mark">{% include "brand/_mark.svg" %}</span>
-    <span class="brand-wordmark"><span>web</span>ATEM</span>
+    <span class="brand-wordmark">{% include "brand/_wordmark.html" %}</span>
     <span class="ver">v{{ version }}</span>
   </div>
   <div class="lw-status">
@@ -87,14 +87,14 @@
       <button id="lwQuit" class="btn btn-ghost" hidden>Quit</button>
     </div>
     <div class="lw-foot">
-      <p class="lw-legal">Made by Lucas Romanenko</p>
+      <p class="lw-legal">{% include "brand/_upstream_credit.html" %}</p>
       <span class="lw-foot-actions">
         <button id="lwShowLog" class="btn btn-ghost btn-xs" hidden>Show log</button>
         <button id="lwUninstall" class="btn btn-ghost btn-xs" hidden>Uninstall…</button>
       </span>
     </div>
     <div class="lw-un" id="lwUninstallPanel" hidden>
-      <h2>Uninstall WebATEM?</h2>
+      <h2>Uninstall {{ app_title }}?</h2>
       <p id="lwUninstallIntro"></p>
       <ul id="lwUninstallList"></ul>
       <p id="lwUninstallThen" hidden></p>
@@ -111,6 +111,7 @@
 (function () {
   'use strict';
   var root = document.getElementById('launcherWindow');
+  var appTitle = '{{ app_title|escapejs }}';
   var ENDPOINT = root.dataset.settings;
   var QUIT = ENDPOINT.replace('settings/', 'quit/');
   var el = function (id) { return document.getElementById(id); };
@@ -188,10 +189,10 @@
     chk.hidden = !native || !!busy[u.state];
     if (u.state === 'checking') add('Checking for updates\u2026');
     else if (u.state === 'downloading') add('Downloading ' + u.latest + '\u2026' + (u.progress != null ? ' ' + u.progress + '%' : ''));
-    else if (u.state === 'installing') add('Installing ' + u.latest + '. WebATEM starts again by itself.');
+    else if (u.state === 'installing') add('Installing ' + u.latest + '. The app will restart automatically.');
     else if (u.state === 'available') {
       t.className = 'new';
-      add('WebATEM ' + u.latest + ' is available.');
+      add(appTitle + ' ' + u.latest + ' is available.');
       if (u.by === 'app') { if (native) go.hidden = false; else add(' Update from the tray menu.'); }
       else if (u.by === 'package') { add(' Run '); code(u.command); add('.'); }
       else add(' There is no download for this machine yet.');
@@ -277,9 +278,9 @@
     unList.innerHTML = '';
     unThen.hidden = true;
     if (p.kind === 'windows-installer') {
-      unIntro.textContent = 'WebATEM closes and Windows’ uninstaller removes it: the program, your settings and connection history, and start at login.';
+      unIntro.textContent = appTitle + ' closes and Windows’ uninstaller removes it: the program, your settings and connection history, and start at login.';
     } else {
-      unIntro.textContent = 'WebATEM closes, then removes all of this:';
+      unIntro.textContent = appTitle + ' closes, then removes all of this:';
       (p.items || []).forEach(function (item) {
         var li = document.createElement('li');
         var what = document.createElement('div'); what.className = 'what'; what.textContent = item[0];

@@ -83,6 +83,14 @@ def test_a_package_install_is_told_its_own_command(home):
     assert way['by'] == 'package' and way['command'] in ('pipx upgrade webatem', 'pip install --upgrade webatem')
 
 
+def test_updates_are_disabled_without_a_feed(monkeypatch, capsys):
+    monkeypatch.delenv('WEBATEM_UPDATE_FEED', raising=False)
+    monkeypatch.setattr(updates, '_open', lambda *args: pytest.fail('Attempted to contact an update server'))
+    assert updates.feed_url() is None
+    assert updates.cli(['--update']) == 1
+    assert 'Updates are disabled in this build.' in capsys.readouterr().out
+
+
 def test_check_reads_the_feed(home, release):
     base = release(tag='v1.7.0')
     found = updates.check()
@@ -359,6 +367,7 @@ def test_https_trusts_the_systems_store_then_mozillas_never_nothing(monkeypatch)
 
 def test_the_check_and_the_download_both_use_it(monkeypatch):
     seen = []
+    monkeypatch.setenv('WEBATEM_UPDATE_FEED', 'https://example.test/releases/latest')
 
     class Answer:
         headers = {}

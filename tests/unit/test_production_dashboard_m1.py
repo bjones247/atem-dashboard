@@ -1,0 +1,321 @@
+"""
+Unit and regression tests for Milestone 1 of the Production Dashboard.
+Verifies:
+1. Endpoint /atem/dashboard/ renders HTTP 200 and loads dashboard.html.
+2. Template contains the three managed physical panels, safe disabled CUT buttons, and status indicators.
+3. Cross-view navigation between stock control.html and dashboard.html.
+4. Dynamic discovery logic for:
+   - Single M/E output
+   - Multiple M/E outputs (mirrored/linked destinations sharing Program/Preview)
+   - Zero M/E outputs (all independent AUX)
+5. Synchronization of state across linked M/E destinations without misleading virtual Preview.
+6. Ability to designate primary M/E panel among linked outputs without hardware changes.
+7. Verification that Milestone 1 Preview interactions generate ZERO hardware switching commands.
+8. Regression verification that existing stock views (/atem/ and /atem/control/) remain functional.
+"""
+
+import json
+from pathlib import Path
+import pytest
+
+HERE = Path(__file__).parent
+
+
+@pytest.mark.django_db
+def test_dashboard_endpoint_renders_ok(client):
+    """GET /atem/dashboard/ renders HTTP 200 with required context."""
+    response = client.get('/atem/dashboard/')
+    assert response.status_code == 200
+    assert 'dashboard.html' in [t.name for t in response.templates]
+    assert response.context['initial_ip'] == ''
+
+    # With initial IP query parameter
+    response_with_ip = client.get('/atem/dashboard/', {'ip': '192.168.1.114'})
+    assert response_with_ip.status_code == 200
+    assert response_with_ip.context['initial_ip'] == '192.168.1.114'
+
+
+@pytest.mark.django_db
+def test_dashboard_template_contains_read_only_three_switcher_layout(client):
+    """Milestone 3B renders three logical switcher cards and Other Outputs."""
+    response = client.get('/atem/dashboard/', {'ip': '192.168.1.114'})
+    content = response.content.decode('utf-8')
+
+    # Status header
+    assert 'Production Dashboard' in content
+    assert 'Full Switcher' in content
+
+    # Hardware M/E and two virtual switchers are separate from output cards.
+    assert 'HARDWARE M/E' in content
+    assert 'Observed M/E Program' not in content
+    assert 'Observed M/E Preview' not in content
+    assert 'Program stale; last observed:' in content
+    assert 'Preview stale; last observed:' in content
+    assert 'badge badge-sm badge-primary primary-switcher-badge shrink-0">HARDWARE M/E</span>' in content
+    assert 'badge badge-sm badge-primary virtual-switcher-badge shrink-0">VIRTUAL</span>' in content
+    assert 'background: #bbf7d0' in content
+    assert 'background: #dc2626' in content
+    assert 'aria-label="Rename Primary Switcher"' in content
+    assert 'aria-label="Change Primary output assignments"' in content
+    assert 'x-for="view in virtualSwitcherViews"' in content
+    assert content.count('SENDING PROGRAM TO:') == 1
+    assert content.count('SENDING VIRTUAL SWITCH TO:') == 1
+    assert content.count('class="source-grid"') == 4
+    assert content.count(':style="virtualBusLayout.columns"') == 2
+    assert content.count('class="btn btn-xs font-bold direct-mode-button') == 3
+    assert 'rounded-lg border border-base-300 p-3" role="group" aria-label="Primary transition controls"' in content
+    assert content.index('@click="primaryCut()"') < content.index('@click="primaryAuto()"') < content.index('aria-label="AUTO transition type"') < content.index("'transition-style-'")
+    assert 'AUTO TRANSITION TYPE:' not in content
+    assert content.count('class="btn btn-error btn-sm font-bold dashboard-cut-button"') == 2
+    assert '.auto-style-buttons { margin-left: 3rem; }' in content
+    assert 'M/E PROGRAM</div>' not in content
+    assert 'LOGICAL PREVIEW / PROGRAM' not in content
+    assert 'border-success/40' not in content
+    assert 'text-xs font-bold uppercase text-success mb-1">STAGED FOR TARGET' in content
+    assert 'text-xs font-bold uppercase text-success">LIVE ON TARGET' in content
+    assert 'Saved Preview' not in content
+    assert 'Saved Program target' not in content
+    assert 'Logical selection; does not change hardware routing.' not in content
+    assert 'getSourceNameById(view.group.' not in content
+    assert 'M/E transition status' not in content
+    assert content.index('virtual-switcher-area">') < content.index('x-for="view in virtualSwitcherViews"') < content.index('aria-label="TAKE ALL"') < content.index('aria-label="Unswitched Outputs"')
+    assert 'class="btn btn-error font-bold" :disabled="!!takeAllReason()"' in content
+    assert '>Operation:</span>' not in content
+    assert 'Blocked before dispatch.' in content
+    assert 'Unswitched Outputs' in content
+    assert '.route-source-grid { display: grid; grid-template-columns: repeat(4, 3.125rem);' in content
+    assert 'badge badge-sm badge-primary unswitched-output-badge shrink-0">OUTPUT</span>' in content
+    assert 'aria-labelledby="primary-keyers-heading"' in content
+    assert '@click="selectVirtualProgram(view.key, button.source.source)"' in content
+    assert 'take-all-primary-action' not in content
+    assert 'getSourceNameById(outputSourceId(output))' in content
+    assert 'Observed live source' not in content
+    assert 'Hardware route confirmed' not in content
+    assert 'output.displayName' in content
+    assert 'output.owner' in content
+
+    # No switching, assignment, keyer, or TAKE ALL affordance is present in 3B.
+    assert '@click="cut(panel)"' not in content
+    assert 'CUT ALL OUTPUTS' not in content
+    assert 'Upstream Keyers' not in content
+    assert 'Change Outputs' not in content
+
+
+@pytest.mark.django_db
+def test_cross_view_navigation_retained(client):
+    """Classic and the separate dashboard still have links to the other workspace."""
+    control_resp = client.get('/atem/control/', {'ip': '192.168.1.114'})
+    assert control_resp.status_code == 200
+    control_html = control_resp.content.decode('utf-8')
+    assert '/atem/live/' in control_html
+    assert 'id="tbarTrack"' in control_html
+    assert 'data-webatem-workspace' not in control_html
+    assert 'dashboard-macros-title' not in control_html
+
+    # Dashboard page -> Control page link
+    dash_resp = client.get('/atem/dashboard/', {'ip': '192.168.1.114'})
+    assert dash_resp.status_code == 200
+    dash_html = dash_resp.content.decode('utf-8')
+    assert '/atem/control/' in dash_html
+
+
+@pytest.mark.django_db
+def test_connect_opens_virtual_workspace_with_the_stock_toolbar_and_panels(client):
+    connect = client.get('/atem/').content.decode('utf-8')
+    assert 'data-control-url="/atem/live/"' in connect
+    assert client.get('/atem/live/').url == '/atem/'
+
+    response = client.get('/atem/live/', {'ip': '192.0.2.4', 'name': 'Production'})
+    assert response.status_code == 200
+    assert response.context['initial_ip'] == '192.0.2.4'
+    templates = [template.name for template in response.templates]
+    assert 'control.html' in templates
+    assert 'dashboard/_surface.html' in templates
+    assert 'dashboard/_macros.html' in templates
+    for partial in ('_header', '_media_pool', '_fairlight', '_hyperdeck_panel', '_profile_modal'):
+        assert f'control/{partial}.html' in templates
+    assert 'control/_settings_transition.html' in templates
+    assert 'csrftoken' in response.cookies
+    workspace = response.content.decode('utf-8')
+    assert 'x-data="productionDashboard" data-webatem-workspace' in workspace
+    assert 'aria-label="TAKE ALL"' in workspace
+    assert 'id="tbarTrack"' not in workspace
+    assert 'Open Virtual Switchers' not in workspace
+    assert 'aria-label="Open Macros"' in workspace
+    for script in ('atem_control.js', 'production_dashboard.js', 'alpine.min.js'):
+        assert workspace.count(f'/{script}') == 1
+
+
+def _discover_me_program_id(sources):
+    for s in sources:
+        if s.get('port_type') == 128:
+            long_name = (s.get('long') or '').lower()
+            short_name = (s.get('short') or '').upper()
+            if 'program' in long_name or 'pgm' in long_name or short_name == 'PGM':
+                return s['source']
+    for s in sources:
+        if s.get('source') == 10010:
+            return 10010
+    return None
+
+
+def _map_panels(sources, aux_outputs, primary_preference=None):
+    me_program_src = _discover_me_program_id(sources)
+    panels = [
+        {'out': 1, 'aux': 'aux1', 'source': aux_outputs.get('aux1')},
+        {'out': 2, 'aux': 'aux2', 'source': aux_outputs.get('aux2')},
+        {'out': 3, 'aux': 'aux3', 'source': aux_outputs.get('aux3')},
+    ]
+
+    me_matches = [p['out'] for p in panels if me_program_src is not None and p['source'] == me_program_src]
+    
+    primary_out = None
+    if me_matches:
+        if primary_preference in me_matches:
+            primary_out = primary_preference
+        else:
+            primary_out = me_matches[0]
+
+    result = []
+    for p in panels:
+        is_me = p['out'] in me_matches
+        result.append({
+            'out': p['out'],
+            'is_me': is_me,
+            'role': 'HardwareME' if is_me else 'VirtualAux',
+            'is_primary': is_me and (p['out'] == primary_out),
+            'is_mirrored': is_me and (p['out'] != primary_out),
+            'source': p['source']
+        })
+    return result, me_matches, primary_out
+
+
+def test_single_me_output_discovery():
+    """Verify single M/E output mapping (golden snapshot: OUT 2 carries M/E Program)."""
+    snapshot_path = HERE / 'build_full_state_snapshot.json'
+    state = json.loads(snapshot_path.read_text())
+
+    panels, me_matches, primary_out = _map_panels(state.get('sources', []), state.get('auxOutputs', {}))
+    assert me_matches == [2]
+    assert primary_out == 2
+
+    assert panels[0]['role'] == 'VirtualAux' and not panels[0]['is_me']
+    assert panels[1]['role'] == 'HardwareME' and panels[1]['is_primary'] and not panels[1]['is_mirrored']
+    assert panels[2]['role'] == 'VirtualAux' and not panels[2]['is_me']
+
+
+def test_multiple_me_outputs_mirrored_and_linked():
+    """Verify multiple physical outputs carrying M/E Program are recognized as linked/mirrored.
+    
+    Matches actual user hardware: OUT 1 and OUT 2 carry M/E Program, OUT 3 carries independent AUX.
+    """
+    snapshot_path = HERE / 'build_full_state_snapshot.json'
+    state = json.loads(snapshot_path.read_text())
+    sources = state.get('sources', [])
+
+    # Hardware scenario: OUT 1 and OUT 2 both route M/E 1 Program (10010); OUT 3 routes Camera 3 (3)
+    aux_outputs = {'aux1': 10010, 'aux2': 10010, 'aux3': 3}
+
+    panels, me_matches, primary_out = _map_panels(sources, aux_outputs)
+    assert me_matches == [1, 2]
+    assert primary_out == 1  # Lowest numbered default
+
+    # OUT 1 is Primary M/E
+    assert panels[0]['is_me'] is True
+    assert panels[0]['role'] == 'HardwareME'
+    assert panels[0]['is_primary'] is True
+    assert panels[0]['is_mirrored'] is False
+
+    # OUT 2 is Linked/Mirrored M/E
+    assert panels[1]['is_me'] is True
+    assert panels[1]['role'] == 'HardwareME'
+    assert panels[1]['is_primary'] is False
+    assert panels[1]['is_mirrored'] is True
+
+    # OUT 3 is independent Virtual AUX
+    assert panels[2]['is_me'] is False
+    assert panels[2]['role'] == 'VirtualAux'
+    assert panels[2]['is_primary'] is False
+    assert panels[2]['is_mirrored'] is False
+
+
+def test_designate_primary_me_panel_without_hardware_changes():
+    """Verify operator can designate OUT 2 as primary M/E panel among linked outputs."""
+    snapshot_path = HERE / 'build_full_state_snapshot.json'
+    state = json.loads(snapshot_path.read_text())
+    sources = state.get('sources', [])
+    aux_outputs = {'aux1': 10010, 'aux2': 10010, 'aux3': 3}
+
+    # Operator explicitly sets primary preference to OUT 2
+    panels, me_matches, primary_out = _map_panels(sources, aux_outputs, primary_preference=2)
+    assert primary_out == 2
+
+    # Now OUT 2 is primary, OUT 1 is mirrored
+    assert panels[0]['is_primary'] is False and panels[0]['is_mirrored'] is True
+    assert panels[1]['is_primary'] is True and panels[1]['is_mirrored'] is False
+
+
+def test_zero_me_outputs_all_virtual_aux():
+    """Verify that when zero outputs carry M/E Program, all operate as independent AUX destinations."""
+    snapshot_path = HERE / 'build_full_state_snapshot.json'
+    state = json.loads(snapshot_path.read_text())
+    sources = state.get('sources', [])
+
+    # None route M/E Program (e.g. cameras 1, 2, 3)
+    aux_outputs = {'aux1': 1, 'aux2': 2, 'aux3': 3}
+
+    panels, me_matches, primary_out = _map_panels(sources, aux_outputs)
+    assert me_matches == []
+    assert primary_out is None
+
+    for p in panels:
+        assert p['role'] == 'VirtualAux'
+        assert p['is_me'] is False
+        assert p['is_primary'] is False
+        assert p['is_mirrored'] is False
+
+
+def test_aux_preview_and_master_cut_safety_in_js():
+    """Verify that AUX preview selection and Master CUT emit zero hardware commands."""
+    js_path = HERE.parent.parent / 'atem_control' / 'static' / 'js' / 'production_dashboard.js'
+    js_content = js_path.read_text(encoding='utf-8')
+
+    # Ensure selectPreview for AUX does not send any hardware command (it must only store in sessionStorage)
+    # Check function selectPreview definition
+    import re
+    select_preview_body = re.search(r'selectPreview\(panel,\s*sourceId\)\s*\{(.*?)\n\s*\},', js_content, re.DOTALL)
+    assert select_preview_body is not None
+    body_text = select_preview_body.group(1)
+    # For !panel.isME, it must touch sessionStorage and queuedPreviewSourceId without sending aux command
+    assert 'sessionStorage.setItem' in body_text
+    assert 'panel.queuedPreviewSourceId = sourceId' in body_text
+    assert 'set_aux_output' not in body_text
+
+    # Ensure cutAll (Master CUT) does not send any hardware command in Milestone 2
+    cut_all_body = re.search(r'cutAll\(\)\s*\{(.*?)\n\s*\},', js_content, re.DOTALL)
+    assert cut_all_body is not None
+    assert 'dispatchCommand' not in cut_all_body.group(1)
+    assert 'this.ws.send' not in cut_all_body.group(1)
+
+    # All dispatched commands must belong strictly to WebATEM's sanctioned protocol
+    send_calls = re.findall(r'this\.ws\.send\((.*?)\)', js_content, re.DOTALL)
+    sent_commands = []
+    for call in send_calls:
+        match = re.search(r"command:\s*['\"]([^'\"]+)['\"]", call)
+        if match:
+            sent_commands.append(match.group(1))
+
+    sanctioned = {'connect', 'refresh', 'cut', 'set_aux_output', 'set_preview', 'set_program', 'execute_macro',
+                  'toggle_usk', 'dashboard_cut_me', 'dashboard_cut_aux',
+                  'dashboard_review_me', 'dashboard_review_aux',
+                  'dashboard_toggle_usk', 'dashboard_review_usk',
+                  'dashboard_toggle_dsk', 'dashboard_review_dsk',
+                  'dashboard_config_get', 'dashboard_config_update',
+                  'dashboard_set_preview_me', 'dashboard_set_program_me',
+                  'dashboard_auto_me', 'dashboard_set_transition_style',
+                  'dashboard_set_transition_rate', 'dashboard_set_transition_layer',
+                  'dashboard_review_me_setup',
+                  'dashboard_output_route', 'dashboard_cut_virtual_group',
+                  'dashboard_align_virtual_group', 'dashboard_review_me_preview',
+                  'dashboard_review_style', 'dashboard_take_all'}
+    assert set(sent_commands).issubset(sanctioned)

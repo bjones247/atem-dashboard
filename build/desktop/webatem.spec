@@ -45,8 +45,8 @@ def _win_version_file():
                     OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
   kids=[
     StringFileInfo([StringTable('040904B0', [
-        StringStruct('CompanyName', 'Lucas Romanenko'),
-        StringStruct('FileDescription', 'WebATEM - browser control for ATEM switchers'),
+        StringStruct('CompanyName', 'webATEM.vs contributors'),
+        StringStruct('FileDescription', 'webATEM.vs - ATEM M/E and virtual switcher'),
         StringStruct('FileVersion', '{_version()}'),
         StringStruct('InternalName', 'webatem'),
         # WebATEM's own code is MIT, but this bundle is a Combined Work: it
@@ -56,7 +56,7 @@ def _win_version_file():
         # so a user can rebuild against their own atemwire.
         StringStruct('LegalCopyright', 'MIT, and bundles atemwire and pystray under LGPL-3.0. Not affiliated with the switcher manufacturer.'),
         StringStruct('OriginalFilename', 'webatem.exe'),
-        StringStruct('ProductName', 'WebATEM'),
+        StringStruct('ProductName', 'webATEM.vs'),
         StringStruct('ProductVersion', '{_version()}')])]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])
   ]
@@ -193,7 +193,7 @@ if IS_MAC:
         bundle_identifier='com.webatem.app',
         info_plist={
             'CFBundleName': 'WebATEM',
-            'CFBundleDisplayName': 'WebATEM',
+            'CFBundleDisplayName': 'webATEM.vs',
             'CFBundleShortVersionString': _version(),
             'CFBundleVersion': _version(),
             'NSHighResolutionCapable': True,

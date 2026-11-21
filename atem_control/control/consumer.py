@@ -18,10 +18,14 @@ from atem_control.media_pool import watcher as media_pool_service
 from atemwire.state import ATEMStateMixin
 from atemwire.messages.audio_legacy import enable_audio_levels
 from atemwire.messages.fairlight import enable_fairlight_levels
+from atemwire.messages.macros import MacroPlayStatusField, macro_entry
 from atemwire.messages.system_info import device_name
 from atemwire.pool import ATEMInstanceManager
 from atemwire.transport import NoFreeConnection
 from atem_control.control.commands import dispatch as dispatch_command
+from atem_control.control import dashboard_switching
+from atem_control.control import dashboard_config
+from atem_control.control import dashboard_ownership
 from atem_control.control.logging import ATEMConnectionLoggingMixin
 from atem_control import hooks
 from atem_control.activity import ActivityLog
@@ -63,6 +67,13 @@ CONNECT_ATTEMPTS = 1
 CONNECT_PROGRESS_EVERY = 0.5     # s between "Connecting…" updates to the page
 NO_FREE_CONNECTION_MESSAGE = ('No free connection on this switcher (ATEM Software Control, '
                               'panels or other clients are using all its slots)')
+MACRO_PLAYBACK_EVENT = 'change:macro-play-status'
+
+
+def _active_macro_number(status):
+    if status is not None and (status.running or status.waiting) and status.index != MacroPlayStatusField.IDLE:
+        return status.index + 1  # Browser slots are one-based.
+    return None
 
 
 class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketConsumer):
@@ -87,6 +98,7 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
     RECENT_COMMAND_WINDOW = 2.0     # Seconds after a command to use fast polling
     RECENT_CHANGE_WINDOW = 6.0     # Seconds after a state change to use fast polling
     IDLE_POLL_THRESHOLD = 10       # Consecutive unchanged polls before switching to slow
+    _macro_playback_listener = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -131,6 +143,9 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
         # Media pool subscription — tracks which IP we've joined, so disconnect
         # can both leave the group and release the watcher refcount exactly once.
         self._mediapool_ip: str | None = None
+        self._dashboard_config = None
+        self._dashboard_device_id: str | None = None
+        self._dashboard_config_group: str | None = None
 
         # Audio meter subscription — Fairlight meter levels (FMLv per strip,
         # FDLv master) arrive ~25 Hz per channel from the ATEM. We coalesce
@@ -304,6 +319,15 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
             logger.error(f"Error stopping monitoring: {e}", exc_info=True)
 
         try:
+            if self._dashboard_config_group:
+                await self.channel_layer.group_discard(self._dashboard_config_group, self.channel_name)
+            self._dashboard_config_group = None
+            self._dashboard_device_id = None
+            self._dashboard_config = None
+        except Exception as e:
+            logger.error(f"Error leaving dashboard config group: {e}", exc_info=True)
+
+        try:
             await sync_to_async(self._release_pool_ref, thread_sensitive=False)()
         except Exception as e:
             logger.error(f"Error releasing pool ref: {e}", exc_info=True)
@@ -369,6 +393,27 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
             await self.send_json({'type': 'error', 'message': 'ATEM not connected'})
             return
 
+        if command in ('dashboard_config_get', 'dashboard_config_update'):
+            try:
+                if command == 'dashboard_config_get':
+                    result = await self._ensure_dashboard_config(force_reload=True)
+                else:
+                    await self._ensure_dashboard_config()
+                    result = await sync_to_async(dashboard_config.update_config_for_connection, thread_sensitive=True)(
+                        self.connection, data.get('expected_revision'), data.get('config'), self.current_ip)
+                    self._dashboard_config = result
+                    await self._broadcast_dashboard_config_revision(result)
+                await self.send_json({'type': 'dashboard_config', **result})
+            except dashboard_config.DashboardConfigError as error:
+                if 'Stale configuration revision' in str(error):
+                    try:
+                        current = await self._ensure_dashboard_config(force_reload=True)
+                        await self.send_json({'type': 'dashboard_config', **current})
+                    except dashboard_config.DashboardConfigError:
+                        pass
+                await self.send_json({'type': 'error', 'command': command, 'message': str(error)})
+            return
+
         # Handler runs synchronously (it only enqueues — no network I/O on
         # this thread), but wrap in sync_to_async to stay consistent with
         # the async consumer model and in case handlers grow to read state.
@@ -376,17 +421,157 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
         # thread-sensitive lane so one slow call elsewhere can't queue
         # every operator's commands behind it. The audio verbs go to the
         # mixer the last pushed state named (Fairlight or classic).
-        ok, err = await sync_to_async(dispatch_command, thread_sensitive=False)(
-            self.connection, command, data, self._audio_mixer())
+        if command in ('dashboard_review_me', 'dashboard_review_me_preview', 'dashboard_review_me_setup', 'dashboard_review_style',
+                       'dashboard_review_aux', 'dashboard_review_usk', 'dashboard_review_dsk'):
+            kind = {'dashboard_review_me_preview': 'me_preview',
+                    'dashboard_review_style': 'style'}.get(command, command.removeprefix('dashboard_review_'))
+            index = data.get('key_index') if kind == 'usk' else (
+                data.get('dsk') if kind == 'dsk' else data.get('aux_channel', 0))
+            ok, err = await sync_to_async(dashboard_switching.review_unconfirmed, thread_sensitive=False)(
+                self.connection, kind, index)
+            if ok:
+                await self.send_json({'type': 'dashboard_reviewed', 'kind': kind,
+                                      'aux_channel': data.get('aux_channel', 0),
+                                      'key_index': data.get('key_index'),
+                                      'dsk': data.get('dsk')})
+                await self.send_current_state()
+            else:
+                await self.send_json({'type': 'error', 'command': command, 'message': err})
+            return
+        if command == 'dashboard_take_all':
+            try:
+                saved_config = await self._ensure_dashboard_config(force_reload=True)
+            except dashboard_config.DashboardConfigError as error:
+                await self.send_json({'type': 'error', 'command': command, 'message': str(error)})
+                return
+            if not saved_config:
+                await self.send_json({'type': 'error', 'command': command,
+                                      'message': 'Verified switcher settings are unavailable.'})
+                return
+            ok, result = await sync_to_async(
+                dashboard_switching.dispatch_take_all, thread_sensitive=True)(
+                    self.connection, data, saved_config, require_current_revision=True)
+            if not ok:
+                logger.info('TAKE ALL blocked before dispatch: %s', result)
+                await self.send_json({'type': 'error', 'command': command, 'message': result})
+                return
+            primary = result['primary']
+            if primary.get('ok') and primary.get('command'):
+                self._record_atem_command(primary['command'], {'me': 0})
+            for group in result['virtual'].values():
+                for outcome in group.get('outcomes', []):
+                    if outcome['ok'] and not outcome.get('no_op'):
+                        self._record_atem_command('set_aux_output', {
+                            'aux_channel': outcome['channel'],
+                            'input_source': group['target']})
+            await self.send_json({'type': 'dashboard_take_all_started', **result})
+            return
+        if command in ('dashboard_output_route', 'dashboard_cut_virtual_group', 'dashboard_align_virtual_group'):
+            try:
+                saved_config = await self._ensure_dashboard_config(force_reload=True)
+            except dashboard_config.DashboardConfigError as error:
+                await self.send_json({'type': 'error', 'command': command, 'message': str(error),
+                                      'output_id': data.get('output_id'),
+                                      'group_id': data.get('group_id')})
+                return
+            if not saved_config:
+                await self.send_json({'type': 'error', 'command': command,
+                                      'message': 'Verified switcher settings are unavailable.'})
+                return
+            if command == 'dashboard_output_route':
+                ok, result = await sync_to_async(
+                    dashboard_switching.dispatch_output_route, thread_sensitive=True)(
+                        self.connection, data, saved_config, require_current_revision=True)
+                if not ok:
+                    await self.send_json({'type': 'error', 'command': command,
+                                          'output_id': data.get('output_id'),
+                                          'message': result or 'Output route was not dispatched.'})
+                    return
+                no_op = bool(isinstance(result, dict) and result.get('no_op'))
+                if not no_op:
+                    self._record_atem_command('set_aux_output', {
+                        'aux_channel': data.get('output_id', 1) - 1,
+                        'input_source': data.get('input_source')})
+                await self.send_json({'type': 'dashboard_output_route_accepted',
+                                      'output_id': data.get('output_id'),
+                                      'mode': data.get('mode'),
+                                      'input_source': data.get('input_source'),
+                                      'no_op': no_op})
+                return
+            group_dispatch = (dashboard_switching.dispatch_virtual_group_align
+                              if command == 'dashboard_align_virtual_group'
+                              else dashboard_switching.dispatch_virtual_group_cut)
+            ok, result = await sync_to_async(group_dispatch, thread_sensitive=True)(
+                self.connection, data, saved_config, require_current_revision=True)
+            if not ok:
+                await self.send_json({'type': 'error', 'command': command,
+                                      'group_id': data.get('group_id'),
+                                      'message': result or 'Virtual switcher CUT was not dispatched.'})
+                return
+            for outcome in result['outcomes']:
+                if outcome['ok'] and not outcome.get('no_op'):
+                    self._record_atem_command('set_aux_output', {
+                        'aux_channel': outcome['channel'], 'input_source': result['target']})
+            result_type = ('dashboard_group_align_started' if command == 'dashboard_align_virtual_group'
+                           else 'dashboard_group_cut_started')
+            await self.send_json({'type': result_type, **result})
+            return
+        if command == 'dashboard_set_preview_me':
+            ok, err = await sync_to_async(dashboard_switching.dispatch_me_preview, thread_sensitive=False)(
+                self.connection, data)
+            logged_command = 'set_preview'
+        elif command == 'dashboard_set_program_me':
+            ok, err = await sync_to_async(dashboard_switching.dispatch_me_program, thread_sensitive=False)(
+                self.connection, data)
+            logged_command = 'set_program'
+        elif command == 'dashboard_auto_me':
+            ok, err = await sync_to_async(dashboard_switching.dispatch_me_auto, thread_sensitive=False)(
+                self.connection, data)
+            logged_command = 'auto'
+        elif command == 'dashboard_set_transition_style':
+            ok, err = await sync_to_async(dashboard_switching.dispatch_me_transition_style, thread_sensitive=False)(
+                self.connection, data)
+            logged_command = 'set_transition_style'
+        elif command in ('dashboard_set_transition_rate', 'dashboard_set_transition_layer'):
+            change_rate = command == 'dashboard_set_transition_rate'
+            ok, err = await sync_to_async(dashboard_switching.dispatch_me_transition_setup, thread_sensitive=False)(
+                self.connection, data, change_rate=change_rate)
+            logged_command = 'set_transition_rate' if change_rate else 'set_next_transition_layers'
+        elif command == 'dashboard_cut_me':
+            ok, err = await sync_to_async(dashboard_switching.dispatch_me_cut, thread_sensitive=False)(
+                self.connection, data)
+            logged_command = 'cut'
+        elif command == 'dashboard_cut_aux':
+            ok, err = await sync_to_async(dashboard_switching.dispatch_aux_cut, thread_sensitive=False)(
+                self.connection, data)
+            logged_command = 'set_aux_output'
+        elif command == 'dashboard_toggle_usk':
+            ok, err = await sync_to_async(dashboard_switching.dispatch_usk_toggle, thread_sensitive=False)(
+                self.connection, data)
+            logged_command = 'toggle_usk'
+        elif command == 'dashboard_toggle_dsk':
+            ok, err = await sync_to_async(dashboard_switching.dispatch_dsk_toggle, thread_sensitive=False)(
+                self.connection, data)
+            logged_command = 'toggle_dsk'
+        else:
+            ok, err = await sync_to_async(dispatch_command, thread_sensitive=False)(
+                self.connection, command, data, self._audio_mixer())
+            logged_command = command
 
         if not ok:
             logger.warning(f"Command {command} failed: {err}")
-            await self.send_json({'type': 'error', 'message': err or f'Failed to execute {command}'})
+            await self.send_json({'type': 'error', 'command': command,
+                                  'output_id': data.get('output_id'),
+                                  'group_id': data.get('group_id'),
+                                  'aux_channel': data.get('aux_channel'),
+                                  'key_index': data.get('key_index'),
+                                  'dsk': data.get('dsk'),
+                                  'message': err or f'Failed to execute {command}'})
             return
 
         # Activity log: discrete actions immediately, slider drags coalesced
         # into one settled row (see _record_atem_command).
-        self._record_atem_command(command, data)
+        self._record_atem_command(logged_command, data)
 
     # ---- Activity logging of control commands ----
 
@@ -684,6 +869,7 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
     async def stop_monitoring(self):
         """Stop state polling."""
         self.is_monitoring = False
+        self._detach_macro_playback_listener()
         task, self.monitoring_task = self.monitoring_task, None
         if task is None or task.done():
             return
@@ -766,7 +952,12 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
 
                 # Get current state
                 t0 = time.monotonic()
+                self._sync_macro_playback_listener()
                 current_state = await sync_to_async(self.build_full_state, thread_sensitive=False)(self.connection)
+                current_state['dashboardSafety'] = dashboard_switching.safety_snapshot(self.connection)
+                current_state['dashboardDevice'] = dashboard_config.identity_snapshot(self.connection)
+                saved_config = await self._ensure_dashboard_config()
+                current_state['dashboardRouting'] = await self._project_dashboard_routes(current_state, saved_config)
                 t_build = time.monotonic() - t0
 
                 # ATEM-side reachability transition: atemwire's protocol clears
@@ -805,6 +996,8 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
                             logger.warning(f"failed to send disconnect notice: {e}")
                     elif not was_atem_reachable and atem_reachable:
                         logger.info("ATEM reachable again; notifying frontend")
+                        saved_config = await self._ensure_dashboard_config(force_reload=True)
+                        current_state['dashboardRouting'] = await self._project_dashboard_routes(current_state, saved_config)
                         try:
                             await self.send_json({
                                 'type': 'connection_status',
@@ -875,6 +1068,60 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
                 'message': 'ATEM monitoring failed; disconnected',
             })
 
+    def _sync_macro_playback_listener(self):
+        protocol = getattr(self.connection, 'protocol', None)
+        if self._macro_playback_listener and self._macro_playback_listener[0] is protocol:
+            return
+        self._detach_macro_playback_listener()
+        if protocol is None:
+            return
+
+        playback = None
+
+        def observe(status):
+            nonlocal playback
+            active = _active_macro_number(status)
+            sequence = playback['sequence'] if playback else 0
+            last_started = playback['lastStartedNumber'] if playback else None
+            if active is not None and (not playback or active != playback['activeNumber']):
+                sequence += 1
+                last_started = active
+            # A macro can start and finish between polls, even if it is the
+            # same slot as last time. Keep its start in the next idle snapshot.
+            playback = {'activeNumber': active, 'sequence': sequence, 'lastStartedNumber': last_started}
+
+        handler = protocol.on(MACRO_PLAYBACK_EVENT, observe)
+        self._macro_playback_listener = (protocol, handler, lambda: playback)
+
+    def _detach_macro_playback_listener(self):
+        listener, self._macro_playback_listener = self._macro_playback_listener, None
+        if listener:
+            protocol, handler, _ = listener
+            protocol.off(MACRO_PLAYBACK_EVENT, handler)
+
+    def build_full_state(self, connection):
+        state = super().build_full_state(connection)
+        if state['is_connected']:
+            # Classic's macros grid uses placeholder slots. The dashboard needs
+            # the observed, populated slots across the entire ATEM macro bank.
+            mx = connection.mixerstate or {}
+            saved = []
+            for index in sorted(mx.get('macro-properties') or {}):
+                entry = macro_entry(mx, index)
+                if entry['is_used']:
+                    number = index + 1  # execute_macro takes a one-based slot.
+                    saved.append({'number': number, 'name': entry['name'].strip() or f'Macro {number}'})
+            state['dashboardMacros'] = saved
+            status = mx.get('macro-play-status')
+            listener = self._macro_playback_listener
+            observed = listener[2]() if listener and listener[0] is getattr(connection, 'protocol', None) else None
+            state['dashboardMacroPlayback'] = (observed if status is not None and observed else {
+                'activeNumber': _active_macro_number(status),
+                'sequence': observed['sequence'] if observed else 0,
+                'lastStartedNumber': None,
+            })
+        return state
+
     def _calculate_poll_interval(self, current_state, consecutive_no_changes):
         """
         Determine polling interval based on current activity level.
@@ -936,6 +1183,104 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
     # WebSocket Helpers
     # =========================================================================
 
+    @staticmethod
+    def _dashboard_config_group_name(device_id):
+        return f'dashboard_cfg_{device_id}'
+
+    async def _ensure_dashboard_config(self, force_reload=False):
+        """Load the active device's config once and subscribe to revisions."""
+        try:
+            device_id = dashboard_config.device_id_from_connection(self.connection)
+        except dashboard_config.DashboardConfigError:
+            return None
+
+        if device_id != self._dashboard_device_id:
+            if self._dashboard_config_group:
+                try:
+                    await self.channel_layer.group_discard(
+                        self._dashboard_config_group, self.channel_name)
+                except Exception:
+                    logger.warning('Could not leave prior dashboard config group', exc_info=True)
+            self._dashboard_device_id = device_id
+            self._dashboard_config_group = self._dashboard_config_group_name(device_id)
+            self._dashboard_config = None
+            try:
+                await self.channel_layer.group_add(self._dashboard_config_group, self.channel_name)
+            except Exception:
+                # Revision CAS still protects writes if this deployment's
+                # channel backend cannot deliver group notifications.
+                logger.warning('Could not join dashboard config revision group', exc_info=True)
+
+        if force_reload or self._dashboard_config is None:
+            self._dashboard_config = await sync_to_async(
+                dashboard_config.get_config, thread_sensitive=True)(device_id, self.current_ip)
+        return self._dashboard_config
+
+    async def _project_dashboard_routes(self, state, saved_config):
+        fresh = state.get('is_connected') is True and state['dashboardSafety'].get('fresh') is True
+        mixerstate = getattr(self.connection, 'mixerstate', None)
+        projection = dashboard_ownership.project_routes(
+            mixerstate, saved_config, state_fresh=fresh,
+            retired_channels=dashboard_config.pending_primary_retirements(self.connection, saved_config))
+        if not fresh or not saved_config or not projection['supersededVirtualOutputIds']:
+            return projection
+        try:
+            result = await sync_to_async(dashboard_config.reconcile_primary_assignments, thread_sensitive=True)(
+                self.connection, saved_config, self.current_ip)
+        except dashboard_config.DashboardConfigError:
+            logger.warning('Could not reconcile saved virtual output ownership', exc_info=True)
+            return projection
+        if not result:
+            return projection
+        self._dashboard_config, retired = result
+        if retired:
+            await self._broadcast_dashboard_config_revision(self._dashboard_config, retired)
+            await self.send_json({'type': 'dashboard_primary_destinations_reconciled', 'outputs': retired})
+        return dashboard_ownership.project_routes(
+            getattr(self.connection, 'mixerstate', None), self._dashboard_config,
+            state_fresh=dashboard_switching.state_is_fresh(self.connection),
+            retired_channels=dashboard_config.pending_primary_retirements(self.connection, self._dashboard_config))
+
+    async def _broadcast_dashboard_config_revision(self, config, retired=None):
+        group = self._dashboard_config_group
+        if not group:
+            return
+        try:
+            await self.channel_layer.group_send(group, {
+                'type': 'dashboard_config_changed',
+                'device_id': config['deviceId'],
+                'revision': config['revision'],
+                'sender': self.channel_name,
+                'retired': retired,
+            })
+        except Exception:
+            # Saving already succeeded. A missing push notification is visible
+            # as an absent revision event; the next CAS still rejects stale data.
+            logger.warning('Dashboard config saved but revision broadcast failed', exc_info=True)
+
+    async def dashboard_config_changed(self, event):
+        """Refresh and notify another session after a device config update."""
+        if event.get('sender') == self.channel_name:
+            return
+        if event.get('device_id') != self._dashboard_device_id:
+            return
+        try:
+            current = await self._ensure_dashboard_config(force_reload=True)
+        except dashboard_config.DashboardConfigError:
+            return
+        if not current or current['revision'] < event.get('revision', 0):
+            return
+        await self.send_json({
+            'type': 'dashboard_config_changed',
+            'deviceId': current['deviceId'],
+            'revision': current['revision'],
+            'config': current['config'],
+        })
+        if event.get('retired'):
+            await self.send_json({'type': 'dashboard_primary_destinations_reconciled',
+                                  'outputs': event['retired']})
+        await self.send_current_state()
+
     async def send_current_state(self):
         """Fetch and send current ATEM state to client."""
         try:
@@ -947,7 +1292,12 @@ class ATEMConsumer(ATEMConnectionLoggingMixin, ATEMStateMixin, AsyncWebsocketCon
                 })
                 return
 
+            self._sync_macro_playback_listener()
             state = await sync_to_async(self.build_full_state, thread_sensitive=False)(self.connection)
+            state['dashboardSafety'] = dashboard_switching.safety_snapshot(self.connection)
+            state['dashboardDevice'] = dashboard_config.identity_snapshot(self.connection)
+            saved_config = await self._ensure_dashboard_config()
+            state['dashboardRouting'] = await self._project_dashboard_routes(state, saved_config)
 
             if state.get('is_connected'):
                 await self.send_json({

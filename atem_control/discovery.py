@@ -110,6 +110,7 @@ class _AtemListener:
         key = props.get('unique id') or addrs[0]
         with _registry_lock:
             _registry[key] = {
+                'unique_id': props.get('unique id', ''),
                 'ip': addrs[0],
                 'name': friendly or addrs[0],
                 'model': props.get('name', ''),
@@ -162,7 +163,8 @@ def discovered_atems() -> list[dict]:
     ``{'ip', 'name', 'model', 'source': 'mdns'}``."""
     with _registry_lock:
         out = [
-            {'ip': e['ip'], 'name': e['name'], 'model': e['model'], 'source': 'mdns'}
+            {'ip': e['ip'], 'name': e['name'], 'model': e['model'],
+             'unique_id': e.get('unique_id') or '', 'source': 'mdns'}
             for e in _registry.values()
         ]
     out.sort(key=lambda e: (e['name'] or e['ip']).lower())

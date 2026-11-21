@@ -82,6 +82,8 @@ def test_macro_and_aux():
     assert A.summarize('execute_macro', {'macro_number': 3}) == 'Ran macro 3'
     mx = _mx({3010: 'MP1'})
     assert A.summarize('set_aux_output', {'aux': 0, 'source': 3010}, mx) == 'Aux 1 → MP1'
+    assert A.summarize('set_aux_output', {'aux_channel': 2, 'input_source': 3010}, mx) == 'Aux 3 → MP1'
+    assert A.summarize('set_aux_output', {}, mx) == 'Aux → unknown source'
 
 
 def test_settled_slider_generic_summary():

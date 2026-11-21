@@ -167,16 +167,15 @@ def _format_save_timestamp() -> str:
     24-hour: ``2026-04-29_14-30-15``
     12-hour: ``2026-04-29_2-30-15-PM`` (no leading zero on hour, dash
              before AM/PM so the whole string stays filesystem-safe).
-    ``%-I`` strips the leading zero on the hour and is GNU strftime —
-    fine on Linux/Docker; would need a manual conversion if this ever
-    runs on Windows.
+    Format the unpadded 12-hour value directly so it also works on Windows.
     """
     from atem_control import hooks
-    fmt = ('%Y-%m-%d_%H-%M-%S' if hooks.get().time_format_24h()
-           else '%Y-%m-%d_%-I-%M-%S-%p')
     # Studio wall time (settings.TIME_ZONE), not the container clock —
     # the containers run UTC, which put filenames hours off local.
-    return timezone.localtime().strftime(fmt)
+    now = timezone.localtime()
+    if hooks.get().time_format_24h():
+        return now.strftime('%Y-%m-%d_%H-%M-%S')
+    return f'{now:%Y-%m-%d}_{now.hour % 12 or 12}-{now:%M-%S-%p}'
 
 
 def _resolve_atem_db_name(ip: str) -> str:

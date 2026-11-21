@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% load static static_v %}
 
-{% block title %}ATEM Control Panel{% endblock %}
+{% block title %}ATEM Control Panel - {{ app_title }}{% endblock %}
 
 {% block extra_css %}
 <link rel="stylesheet" href="{% static_v 'css/atem_control.css' %}">
@@ -84,6 +84,7 @@ style attribute and undo x-show. {% endcomment %}
         
 {% include 'control/_header.html' %}
 
+{% block switcher_surface %}
         <!-- M/E selector (Stage 4A) — only rendered on multi-M/E units, so
              single-M/E switchers look exactly as before. Buttons switch
              which M/E the per-M/E surfaces (buses, transition, USKs, FtB)
@@ -388,6 +389,7 @@ style attribute and undo x-show. {% endcomment %}
 {% include 'control/_fade_to_black.html' %}
             </div>
         </div>
+{% endblock %}
     </div>
     </div>
     <!-- End of main ATEM content -->
@@ -819,6 +821,10 @@ style attribute and undo x-show. {% endcomment %}
                     </div>
                 </div>
             </div>
+            <footer class="flex-shrink-0 border-t border-base-300 px-4 py-3 text-xs text-base-content/70">
+                <h3 class="font-bold mb-1">{{ app_title }} <span class="font-mono font-normal text-base-content/60">v{{ app_version }}</span></h3>
+                <p>{% include "brand/_upstream_credit.html" %}</p>
+            </footer>
         </div>
     </div>
 </div>

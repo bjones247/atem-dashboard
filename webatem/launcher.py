@@ -51,6 +51,7 @@ import webbrowser
 from pathlib import Path
 
 APP_NAME = 'WebATEM'
+DISPLAY_NAME = 'webATEM.vs'
 BUNDLE_ID = 'com.webatem.app'
 
 
@@ -464,8 +465,8 @@ class _Supervisor:
         if current[0] is not None:
             if port != wanted:
                 who = first_reason.split('in use by ', 1)[1] if first_reason and 'in use by ' in first_reason else None
-                notes.append(f'Port {wanted} is in use by {who}, so WebATEM is on port {port} this time.' if who
-                             else f'Port {wanted} was in use, so WebATEM is on port {port} this time.')
+                notes.append(f'Port {wanted} is in use by {who}, so the server is on port {port} this time.' if who
+                             else f'Port {wanted} was in use, so the server is on port {port} this time.')
             self.host, self.port = host, port
             print(f'{APP_NAME} listening on {host}:{port}' + (' (and on 127.0.0.1)' if host not in self.ANY else ''), flush=True)
             self.startup_note = ' '.join(notes) or None
@@ -599,13 +600,13 @@ def _on_ui_thread(fn) -> None:
     fn()
 
 
-_LOADING_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>WebATEM</title>
+_LOADING_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>webATEM.vs</title>
 <style>html,body{height:100%;margin:0;background:#0E0F10;color:#7E8386;font:13px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .c{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px}
 .w{font:800 26px Archivo,-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,sans-serif;letter-spacing:-.03em;color:#EDEDEA}.w span{font-weight:400;color:#9A9E9F}
 .s{width:22px;height:22px;border:2px solid #26292C;border-top-color:#7E8386;border-radius:50%;animation:r 1s linear infinite}
 @keyframes r{to{transform:rotate(360deg)}}</style></head>
-<body><div class="c"><img src="data:image/png;base64,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" width="56" height="56" alt=""><div class="w"><span>web</span>ATEM</div><div class="s"></div><div>starting…</div></div></body></html>"""
+<body><div class="c"><img src="data:image/png;base64,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" width="56" height="56" alt=""><div class="w"><span>web</span>ATEM.vs</div><div class="s"></div><div>starting…</div></div></body></html>"""
 
 
 def _window_process(url: str, hidden: bool = False) -> None:
@@ -670,7 +671,7 @@ def _window_process(url: str, hidden: bool = False) -> None:
     # Companion's launcher window is its own panel: no title bar, no
     # minimise / close buttons — it is shown and hidden from the menu bar
     # (tray) and its own Hide button, and dragged by its body.
-    window = webview.create_window(APP_NAME, html=_LOADING_HTML, js_api=Api(), width=520, height=700,
+    window = webview.create_window(DISPLAY_NAME, html=_LOADING_HTML, js_api=Api(), width=520, height=700,
                                    resizable=False, frameless=True, easy_drag=True, hidden=hidden)
     if os.name == 'nt':
         # No taskbar button: the app lives in the notification area. Set
@@ -941,7 +942,7 @@ def _run_tray(supervisor, controller, window, uninstall_requested=None, updater=
 
     def shown_address(item=None):
         local, lan = _urls(supervisor.host, supervisor.port)
-        return f'{APP_NAME} is running at {lan or local}' if supervisor.running else not_running()
+        return f'{DISPLAY_NAME} is running at {lan or local}' if supervisor.running else not_running()
 
     def not_running(item=None):
         return 'Not running — ' + (supervisor.last_error or supervisor.startup_note or 'choose a network interface')
@@ -990,7 +991,7 @@ def _run_tray(supervisor, controller, window, uninstall_requested=None, updater=
             Menu.SEPARATOR,
             MenuItem('Quit', quit_app),
         )
-    icon = pystray.Icon(APP_NAME, _tray_image(), APP_NAME, menu)
+    icon = pystray.Icon(APP_NAME, _tray_image(), DISPLAY_NAME, menu)
     if sys.platform == 'darwin':
         _mac_menu_bar_icon(icon)
     supervisor.on_change = icon.update_menu
@@ -1012,7 +1013,7 @@ def _run_tray(supervisor, controller, window, uninstall_requested=None, updater=
         if not supervisor.decided.wait(90) or supervisor.last_error:
             try:
                 if getattr(icon, 'HAS_NOTIFICATION', False):
-                    icon.notify(f'{APP_NAME} is not running: {supervisor.last_error}', APP_NAME)
+                    icon.notify(f'{DISPLAY_NAME} is not running: {supervisor.last_error}', DISPLAY_NAME)
             except Exception:
                 pass
 
@@ -1122,10 +1123,12 @@ def main() -> None:
     from webatem import uninstall, updates
     uninstall.write_pid()                   # so `webatem --uninstall` can stop this copy first
     uninstall_requested = threading.Event()
-    updates.clear_downloads()               # last time's update has been installed
-    updater = updates.Updater(enabled=lambda: srv.load()['check_updates'])
-    controller.update_status = updater.status
-    updater.start()
+    updater = None
+    if updates.feed_url():
+        updates.clear_downloads()           # last time's update has been installed
+        updater = updates.Updater(enabled=lambda: srv.load()['check_updates'])
+        controller.update_status = updater.status
+        updater.start()
     window = _WindowChild(supervisor) if has_window else None
     if window is not None:
         window.start(hidden=bool(cfg.get('start_minimized')) or autostarted)

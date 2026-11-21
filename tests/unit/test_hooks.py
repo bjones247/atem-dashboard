@@ -123,7 +123,7 @@ def test_pages_take_what_the_host_supplies(client, host_hooks):
 
 @pytest.mark.django_db
 def test_the_host_can_refuse_every_endpoint(client, host_hooks):
-    for path in ('/atem/', '/atem/control/', '/atem/api/status/', '/atem/api/lookup-name/', '/atem/device-info/',
+    for path in ('/atem/', '/atem/control/', '/atem/live/', '/atem/api/status/', '/atem/api/lookup-name/', '/atem/device-info/',
                  '/atem/hyperdeck/state/', '/atem/profile/save_dialog_init/'):
         assert client.get(path + '?deny=1').status_code == 403, path
     assert client.post('/atem/media-pool-upload/?deny=1').status_code == 403

@@ -1,0 +1,18 @@
+{% extends "control.html" %}
+{% load static_v %}
+
+{% block title %}Virtual Switchers - {{ app_title }}{% endblock %}
+
+{% block extra_css %}
+{{ block.super }}
+{% include 'dashboard/_styles.html' %}
+{% endblock %}
+
+{% block switcher_surface %}
+{% include 'dashboard/_surface.html' %}
+{% endblock %}
+
+{% block control_extra %}
+{{ block.super }}
+<script src="{% static_v 'js/production_dashboard.js' %}"></script>
+{% endblock %}

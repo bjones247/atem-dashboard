@@ -7,7 +7,10 @@ staticfiles/
 .env
 db.sqlite3
 .pytest_cache/
+.pytest-*/
+tests/.pytest_codex_*/
 *.egg-info/
+.venv/
 
 # Frontend build
 node_modules/

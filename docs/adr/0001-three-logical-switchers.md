@@ -1,0 +1,39 @@
+# ADR 0001: Three logical switchers with dynamic physical outputs
+
+**Date:** November 17, 2026
+
+**Status:** Accepted; Milestone 3A implementation is authorized through checkpoint review
+
+**Supersedes:** Blueprint v0.5's three fixed physical OUT 1–3 panel model and old Milestone 3 settings/Master CUT scope
+
+## Context
+
+Milestone 1 and 2 presented three physical output panels. Actual reference hardware showed OUT 1 and OUT 2 both carrying the same M/E Program feed, while OUT 3 carried an independent AUX route. Two panels therefore appeared to be separate switchers but controlled one M/E engine. The fixed three-output layout also hid other discovered destinations and tied a switching workflow to connector numbers. Existing WebATEM connection management, state discovery, and command paths remain useful; the operator-facing model and assignment system need to change.
+
+## Decision
+
+The dashboard presents **Primary Switcher** as the actual hardware M/E 1, **Virtual Switcher 1** and **Virtual Switcher 2** as persistent logical groups that can each own zero or more physical AUX outputs, and **Unswitched Outputs** for remaining destinations. A Custom Name changes the display name only. Fresh M/E Program routes determine Primary destinations and supersede saved virtual membership. A mixed virtual group has no single live Program source. A deliberate CUT or TAKE ALL can align its outputs to the staged source after per-output validation. One M/E command controls the shared engine. Virtual actions may need one command per physical destination.
+
+Operator assignment is an explicit, confirmed operation. Assigning Primary routes an eligible output to the discovered M/E Program feed. Releasing Primary routes the output to verified **Color Bars**. Missing or unroutable Bars and an active transition block release. The default minimum policy protects the final Primary destination from dashboard removal. A first virtual assignment with no saved target keeps the current verified feed. Releasing a virtual output changes saved membership and preserves its route.
+
+Persist group assignments, queued Previews, Program targets, custom names, and preferences in revisioned backend storage keyed only by the connected ATEM's protocol `WhoI.device_id`. The dashboard supports one active ATEM at a time; missing or malformed protocol identity blocks config access, with no IP/name/model/mDNS fallback or pairing workflow. Compare-and-swap revisions protect edits across tabs. Use existing pooled WebATEM state and command paths, with backend preflight and hardware-observed confirmation. Replace the outgoing `CUT ALL` concept with **TAKE ALL**, kept disabled until checkpoint 3D and separately approved.
+
+## Consequences and boundaries
+
+- Milestone 1 remains historical read-only work. Milestone 2 remains the switching infrastructure foundation, but its old UI layout is superseded. Individual AUX switching was observed working on physical hardware; the M/E CUT and USK follow-up corrections await controlled retest.
+- Milestone 3 is split into reviewed checkpoints: 3A state/persistence, 3B UI, 3C assignment/individual control, 3D TAKE ALL. The previous Milestone 3 settings scope moves to later work. The independent SDI video phase remains deferred.
+- An observed external M/E Program route immediately supersedes the virtual claim. Retire that claim through revision-checked settings and preserve the hardware route. An ordinary external source change keeps membership and shows a warning beside CUT.
+- Multi-output operations are not atomic or frame-synchronous. Confirm each route and report partial or unconfirmed outcomes; never auto-retry uncertain writes.
+- Do not treat model counts, source IDs, or connector mappings as protocol discovery. The operator has now specified one installation convention for this ATEM 1 M/E Constellation 4K: physical OUT n is configured to use AUX n, addressed by protocol index n−1. This convention is applied only when topology reports exactly six AUX channels.
+- Milestone 3A uses `AuxS`/`CAuS` indices internally and projects OUT 1–6 labels from the approved installation convention. The protocol surface does not independently report physical SDI output routing or verify that each connector remains configured to its matching AUX bus; reconcile external setup changes manually before enabling writes.
+- Revision changes broadcast through the configured Channels layer. The repository currently uses `InMemoryChannelLayer` and documents a single Uvicorn worker; multi-worker notification requires shared Channels infrastructure. Database compare-and-swap still rejects stale configuration writes. Cross-process hardware-command coordination is a later 3C prerequisite, before route-changing controls are enabled.
+- The installed transition reader can supply safe-looking defaults when no transition packet has arrived. Milestone 2.1 added a distinct completeness signal and fail-closed CUT guard; the hardware follow-up corrected an overstrict residual-frame-count check. New M/E operations must preserve those checks and undergo controlled validation.
+- Stock `/atem/control/`, the shared ATEM pool/WebSocket, Windows UDP patch, and existing WebATEM capabilities remain protected.
+
+## Alternatives considered
+
+Keeping three fixed physical panels would require special cases whenever two or more panels mirror one M/E and would leave additional outputs outside the dashboard. Treating each M/E-fed output as an independent switcher would issue duplicate engine commands and misrepresent hardware state. Automatically correcting saved group routes after external changes would override another operator's deliberate live action. The selected model reflects actual hardware ownership and requires explicit changes.
+
+## Verification still needed
+
+Confirm `WhoI.device_id` stability across reboot and IP changes on deployed hardware/firmware, and whether the independent mDNS TXT `unique id` is the same value. Preserve the installed OUT-to-AUX convention and identify the M/E Program output when source labels are customized. Also verify direct-source availability, raw transition completeness, keyer/AUTO/WIPE behavior, and shared Channels/command coordination for any multi-worker deployment. Hardware tests require isolated destinations and explicit operator approval. The detailed rules and acceptance criteria are in [Blueprint v0.7](../ATEM_Control_Dashboard_Blueprint.md).
